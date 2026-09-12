@@ -2,6 +2,14 @@
 
 Kotoconn is a programmable proxy.
 
+## Dependencies
+
+Don't make re-inventing the wheel as primary consideration. Import well-maintained dependencies for:
+
+- reducing boilerplate code
+- complex features: cross-platform support, cross-language interop, network protocols
+- performce- or security-critical logic
+
 ## Documentation
 
 See `docs/adr` for design decisions.
