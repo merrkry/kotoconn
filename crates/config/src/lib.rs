@@ -1,14 +1,20 @@
+mod config;
+mod dialer;
 mod dns;
 mod flow;
-mod resource;
+mod inbound;
+mod outbound;
+mod resolve;
 mod route;
 mod target;
 
-pub use dns::{DnsAnswer, ResolvedAddress};
-pub use flow::{DomainFact, DomainSource, Flow, TransportProtocol};
-pub use resource::{
-    Config, OutboundConfig, OutboundId, ResolverConfig, ResolverId, ResolverTransport,
-    RuleSetConfig, RuleSetId,
-};
-pub use route::RouteDecision;
+pub use config::Config;
+pub use dialer::{DialerConfig, DialerId};
+pub use dns::{DnsHandlerId, DnsHandlerResult, DnsRequest, DnsResponse};
+pub use flow::{Flow, TransportProtocol};
+pub use inbound::{DirectInboundConfig, InboundConfig, InboundId, InboundImpl};
+pub use outbound::{DirectOutboundConfig, OutboundConfig, OutboundImpl, Socks5OutboundConfig};
+pub use resolve::ResolveHandlerId;
+pub use route::{RouteDecision, RoutingHandlerId};
+pub use std::net::IpAddr;
 pub use target::Target;

@@ -1,16 +1,15 @@
-use std::{net::IpAddr, time::Duration};
+use std::num::NonZeroU64;
 
-use crate::ResolverId;
+pub use hickory_proto::op::{DnsRequest, DnsResponse};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedAddress {
-    pub address: IpAddr,
-    pub ttl: Duration,
-}
+// Receives a DnsRequest and returns a DnsHandlerResult.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DnsHandlerId(pub NonZeroU64);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DnsAnswer {
-    pub resolver: ResolverId,
-    pub name: String,
-    pub addresses: Vec<ResolvedAddress>,
+// A handler exception is an execution error, not Drop.
+#[derive(Debug, Clone)]
+pub enum DnsHandlerResult {
+    Response(DnsResponse),
+    Drop,
 }

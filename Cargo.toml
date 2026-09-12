@@ -6,3 +6,6 @@ resolver = "3"
 version = "0.1.0"
 edition = "2024"
 publish = false
+
+[workspace.dependencies]
+hickory-proto = { version = "0.26", default-features = false }
