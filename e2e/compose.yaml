@@ -1,0 +1,32 @@
+services:
+  echo:
+    image: docker.io/library/python:3.13.7-slim-bookworm@sha256:781449467ffb6f04218f09b1ecdcdc7d22b289ee5da9ec498b024e24ad7a6db7
+    command: [python, -u, /tests/traffic.py, serve]
+    volumes:
+      - ./traffic.py:/tests/traffic.py:ro
+    healthcheck:
+      test: [CMD, python, /tests/traffic.py, ready]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+  kotoconn:
+    image: ${KOTOCONN_IMAGE:?Build the E2E image first}
+    volumes:
+      - ${CASE_DIR:?}/kotoconn:/config:ro
+  gateway:
+    image: ${KOTOCONN_IMAGE}
+    volumes:
+      - ${CASE_DIR}/gateway:/config:ro
+    profiles: [nested]
+  peer:
+    image: ghcr.io/sagernet/sing-box:v1.14.0@sha256:b3e323c8ebf7ddbf90ef610139bcbe84173acfcc92341c02195007c75f29b652
+    command: [run, -c, /config/peer.json]
+    volumes:
+      - ${CASE_DIR}:/config:ro
+  entry:
+    image: ghcr.io/sagernet/sing-box:v1.14.0@sha256:b3e323c8ebf7ddbf90ef610139bcbe84173acfcc92341c02195007c75f29b652
+    command: [run, -c, /config/entry.json]
+    volumes:
+      - ${CASE_DIR}:/config:ro
+# No published ports, host networking, shared volumes or fixed container names.
+# Compose allocates a separate network for each project.
