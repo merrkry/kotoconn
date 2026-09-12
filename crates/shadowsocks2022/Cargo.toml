@@ -1,0 +1,20 @@
+[package]
+name = "kotoconn-shadowsocks2022"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+kotoconn-config.workspace = true
+anyhow.workspace = true
+futures-util.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+shadowsocks.workspace = true
+shadowsocks-service.workspace = true
+bytes.workspace = true
+rand.workspace = true
+kotoconn-protocol.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

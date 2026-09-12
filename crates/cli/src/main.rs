@@ -52,7 +52,7 @@ async fn run(Cli { command }: Cli) -> Result<()> {
                 result = Daemon::start(config, Duration::from_secs(shutdown_timeout)) => result?,
             };
             eprintln!(
-                "Policy ready: {} inbounds, {} dialers. Protocol I/O is not implemented yet.",
+                "Daemon ready: {} inbounds, {} dialers.",
                 daemon.policy().config().inbounds.len(),
                 daemon.policy().config().dialers.len()
             );

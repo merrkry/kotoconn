@@ -18,3 +18,6 @@ pub use resolve::ResolveHandlerId;
 pub use route::{RouteDecision, RoutingHandlerId};
 pub use std::net::IpAddr;
 pub use target::Target;
+
+pub use inbound::{HttpInboundConfig, Shadowsocks2022InboundConfig, Socks5InboundConfig};
+pub use outbound::{HttpOutboundConfig, Shadowsocks2022OutboundConfig};

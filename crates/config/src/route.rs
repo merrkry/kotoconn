@@ -14,5 +14,6 @@ pub struct RoutingHandlerId(pub NonZeroU64);
 #[ts(type = "{ readonly __brand: unique symbol }")]
 pub enum RouteDecision {
     Route { dialer: DialerId, target: Target },
+    Udp { dialer: DialerId },
     Reject,
 }

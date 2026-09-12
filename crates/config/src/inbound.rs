@@ -1,3 +1,9 @@
+mod shadowsocks2022;
+pub use shadowsocks2022::Shadowsocks2022InboundConfig;
+mod socks5;
+pub use socks5::Socks5InboundConfig;
+mod http;
+pub use http::HttpInboundConfig;
 mod direct;
 
 use std::{num::NonZeroU64, time::Duration};
@@ -23,5 +29,8 @@ pub struct InboundConfig {
 #[derive(Debug, Clone, PartialEq, Eq, ts_rs::TS)]
 #[ts(type = "{ readonly __brand: unique symbol }")]
 pub enum InboundImpl {
+    Shadowsocks2022(Shadowsocks2022InboundConfig),
+    Socks5(Socks5InboundConfig),
+    Http(HttpInboundConfig),
     Direct(DirectInboundConfig),
 }

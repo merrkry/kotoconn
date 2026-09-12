@@ -105,6 +105,10 @@ api! {
             .into())
         }
 
+        fn route_udp(self, dialer: Dialer) -> Decision {
+            Ok(config::RouteDecision::Udp { dialer: dialer.value }.into())
+        }
+
         fn reject(self) -> Decision {
             Ok(config::RouteDecision::Reject.into())
         }
@@ -115,6 +119,26 @@ api! {
 
         fn drop(self) -> DnsResult {
             Ok(config::DnsHandlerResult::Drop.into())
+        }
+
+        fn http_inbound(self, options: HttpInboundConfig) -> InboundImpl {
+            Ok(config::InboundImpl::Http(options.into()).into())
+        }
+
+        fn socks5_inbound(self, options: Socks5InboundConfig) -> InboundImpl {
+            Ok(config::InboundImpl::Socks5(options.into()).into())
+        }
+
+        fn shadowsocks2022_inbound(self, options: Shadowsocks2022InboundConfig) -> InboundImpl {
+            Ok(config::InboundImpl::Shadowsocks2022(options.into()).into())
+        }
+
+        fn http_outbound(self, options: HttpOutboundConfig) -> OutboundImpl {
+            Ok(config::OutboundImpl::Http(options.into()).into())
+        }
+
+        fn shadowsocks2022_outbound(self, options: Shadowsocks2022OutboundConfig) -> OutboundImpl {
+            Ok(config::OutboundImpl::Shadowsocks2022(options.into()).into())
         }
 
         fn direct_inbound(self, options: DirectInboundConfig) -> InboundImpl {

@@ -79,14 +79,25 @@ impl Script {
     }
 
     pub async fn route(&self, id: RoutingHandlerId, flow: Flow) -> Result<RouteDecision, Error> {
-        self.with(async |ctx| {
-            let function = get(&loader::host(&ctx)?.borrow().routing.borrow(), id.0)?;
-            Ok(host::RoutingHandler::new(function)
-                .call(data::Flow::from(flow))
-                .await?
-                .value)
-        })
-        .await
+        let protocol = flow.protocol;
+        let decision = self
+            .with(async |ctx| {
+                let function = get(&loader::host(&ctx)?.borrow().routing.borrow(), id.0)?;
+                Ok(host::RoutingHandler::new(function)
+                    .call(data::Flow::from(flow))
+                    .await?
+                    .value)
+            })
+            .await?;
+        match (&decision, protocol) {
+            (RouteDecision::Route { .. }, TransportProtocol::Udp) => Err(Error(
+                "UDP routing must use route_udp; target override is not supported".into(),
+            )),
+            (RouteDecision::Udp { .. }, TransportProtocol::Tcp) => {
+                Err(Error("TCP routing must use route".into()))
+            }
+            _ => Ok(decision),
+        }
     }
 
     pub async fn resolve(&self, id: ResolveHandlerId, name: &str) -> Result<Vec<IpAddr>, Error> {

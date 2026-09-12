@@ -10,13 +10,17 @@ use tokio::{
 };
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 
+mod network;
 mod source;
+pub use network::{SessionHandle, SessionId};
 
 // Bound both queued and executing calls. Awaiting admission provides backpressure.
 const CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
+    #[error("network: {0}")]
+    Network(String),
     #[error("configuration: {0}")]
     Config(String),
     #[error("policy service is closed")]
@@ -97,6 +101,7 @@ impl Policy {
 pub struct Daemon {
     policy: Policy,
     worker: Worker,
+    network: network::Network,
 }
 
 struct Worker {
@@ -179,14 +184,42 @@ impl Daemon {
             Ok(config) => config,
             Err(_) => return Err(worker.wait().await.err().unwrap_or(Error::Closed)),
         };
+        let policy = Policy {
+            commands,
+            stopping: worker.stopping.clone(),
+            config,
+        };
+        let network = network::Network::start(
+            policy.clone(),
+            worker.stopping.clone(),
+            worker.force.clone(),
+        )
+        .await?;
         Ok(Self {
-            policy: Policy {
-                commands,
-                stopping: worker.stopping.clone(),
-                config,
-            },
+            policy,
             worker,
+            network,
         })
+    }
+
+    /// Actual bound addresses, including OS-assigned ports.
+    pub fn listen_addresses(&self) -> &std::collections::HashMap<InboundId, std::net::SocketAddr> {
+        &self.network.addresses
+    }
+
+    pub async fn sessions(&self) -> anyhow::Result<Vec<SessionHandle>> {
+        self.network.sessions.list().await
+    }
+
+    pub fn client_control(
+        &self,
+        id: DialerId,
+        protocol: TransportProtocol,
+    ) -> Option<kotoconn_protocol::Scope> {
+        self.network
+            .clients
+            .get(&id)
+            .map(|client| client.control(protocol))
     }
 
     pub fn policy(&self) -> &Policy {
@@ -201,7 +234,20 @@ impl Daemon {
 
     /// Also reports worker failures before a shutdown request.
     pub async fn wait(&self) -> Result<Shutdown, Error> {
-        self.worker.wait().await
+        match tokio::try_join!(self.worker.wait(), self.network.wait()) {
+            Ok((policy, network)) => Ok(
+                if policy == Shutdown::TimedOut || network == Shutdown::TimedOut {
+                    Shutdown::TimedOut
+                } else {
+                    Shutdown::Drained
+                },
+            ),
+            Err(error) => {
+                self.policy.stopping.cancel();
+                self.worker.force.cancel();
+                Err(error)
+            }
+        }
     }
 }
 

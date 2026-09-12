@@ -6,12 +6,16 @@ Run the example from the repository root:
 cargo run -p kotoconn-cli -- run --config packages/api/examples/policy.ts
 ```
 
-`Daemon::start(path, shutdown_timeout)` reads the policy and its imports, evaluates it, and seals registration. CLI only supplies the path. `start_with_sources` accepts an independent source provider for embedding and tests. Protocol listeners and forwarding are not implemented yet; the example does not open port 8080.
+`Daemon::start(path, shutdown_timeout)` reads the policy and its imports, evaluates it, and seals registration. CLI only supplies the path. `start_with_sources` accepts an independent source provider for embedding and tests. All configured listeners bind before startup returns. The example opens HTTP CONNECT, SOCKS5 and Shadowsocks 2022 listeners. `listen_addresses()` reports actual addresses, including OS-assigned ports.
 
 Native components call handlers through the cloneable `daemon.policy()` handle. Its methods use shared references, and configuration access returns an immutable startup snapshot. One dedicated thread polls the JS handler futures; native work runs on Tokio's multi-thread runtime. See [the threading decision](../../docs/adr/0003-single-thread-policy-and-shared-handles.md).
 
-Ctrl+C and Unix SIGTERM stop admission. Accepted calls and pending native promises drain until `--shutdown-timeout` expires, then remaining work is cancelled and running JS is interrupted. Expiry makes the CLI exit with an error. `Daemon::shutdown(&self)` is idempotent; dropping the owner requests immediate cancellation.
+Ctrl+C and Unix SIGTERM stop admission. Accepted calls, pending native promises and TCP sessions drain until `--shutdown-timeout` expires, then remaining work is cancelled and running JS is interrupted. Expiry makes the CLI exit with an error. `Daemon::shutdown(&self)` is idempotent; dropping the owner requests immediate cancellation.
 
 Cancelling a lookup stops waiting for its result; an OS resolver call may continue in Tokio's blocking pool. After daemon cleanup, CLI shuts down the runtime without waiting for such calls.
 
 Module names stay relative to the entry file's parent directory. Daemon reads only requested files and rejects paths, including symlinks, that leave that directory. It does not resolve npm packages; `@kotoconn/bindings` is provided natively. Startup transpiles TypeScript but does not run `tsc`; workspace checks typecheck the example separately.
+
+TCP and UDP clients expose independent close handles through `client_control`. `sessions()` returns stable session handles with `close()` and `wait()` methods. These are control capabilities; no hot-switching policy is imposed. Sessions run in independent Tokio tasks. See ADRs 0004–0008 for carrier capabilities, resolution, UDP lifetime, admission and protocol scope.
+
+Shadowsocks uses the single-user AES-128-GCM 2022 method in this version. The example key is public test data, not a deployment credential. HTTP supports CONNECT only; SOCKS5 supports CONNECT and UDP ASSOCIATE without authentication. UDP session routing uses `route_udp` and cannot override the destination. `lookup` uses system DNS; the I/O carrier itself never resolves domain targets.

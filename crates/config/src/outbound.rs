@@ -1,3 +1,7 @@
+mod shadowsocks2022;
+pub use shadowsocks2022::Shadowsocks2022OutboundConfig;
+mod http;
+pub use http::HttpOutboundConfig;
 mod direct;
 mod socks5;
 
@@ -15,6 +19,8 @@ pub struct OutboundConfig {
 #[derive(Debug, Clone, PartialEq, Eq, ts_rs::TS)]
 #[ts(type = "{ readonly __brand: unique symbol }")]
 pub enum OutboundImpl {
+    Shadowsocks2022(Shadowsocks2022OutboundConfig),
+    Http(HttpOutboundConfig),
     Direct(DirectOutboundConfig),
     Socks5(Socks5OutboundConfig),
 }

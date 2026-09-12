@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/cli", "crates/config", "crates/daemon", "crates/script", "crates/typescript"]
+members = ["crates/protocol", "crates/inbounds", "crates/outbounds", "crates/http", "crates/socks5", "crates/shadowsocks2022", "crates/cli", "crates/config", "crates/daemon", "crates/script", "crates/typescript"]
 resolver = "3"
 
 [workspace.package]
@@ -8,6 +8,20 @@ edition = "2024"
 publish = false
 
 [workspace.dependencies]
+kotoconn-protocol = { path = "crates/protocol" }
+kotoconn-inbounds = { path = "crates/inbounds" }
+kotoconn-outbounds = { path = "crates/outbounds" }
+kotoconn-http = { path = "crates/http" }
+kotoconn-socks5 = { path = "crates/socks5" }
+kotoconn-shadowsocks2022 = { path = "crates/shadowsocks2022" }
+fast-socks5 = "1.0"
+http = "1"
+httparse = "1.10"
+bytes = "1"
+rand = "0.9"
+shadowsocks-service = { version = "1.25", default-features = false, features = ["aead-cipher-2022"] }
+shadowsocks = { version = "1.25", default-features = false, features = ["aead-cipher-2022"] }
+
 hickory-proto = { version = "0.26", default-features = false }
 kotoconn-config = { path = "crates/config" }
 kotoconn-script = { path = "crates/script" }

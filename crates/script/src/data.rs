@@ -107,3 +107,46 @@ impl From<std::net::SocketAddr> for SocketAddr {
         }
     }
 }
+
+#[derive(FromJs, TS, StructuralConvert)]
+#[convert(from(config::HttpInboundConfig), into(config::HttpInboundConfig))]
+#[ts(as = "config::HttpInboundConfig")]
+pub(crate) struct HttpInboundConfig {
+    pub listen: SocketAddr,
+}
+
+#[derive(FromJs, TS, StructuralConvert)]
+#[convert(from(config::Socks5InboundConfig), into(config::Socks5InboundConfig))]
+#[ts(as = "config::Socks5InboundConfig")]
+pub(crate) struct Socks5InboundConfig {
+    pub listen: SocketAddr,
+}
+
+#[derive(FromJs, TS, StructuralConvert)]
+#[convert(
+    from(config::Shadowsocks2022InboundConfig),
+    into(config::Shadowsocks2022InboundConfig)
+)]
+#[ts(as = "config::Shadowsocks2022InboundConfig")]
+pub(crate) struct Shadowsocks2022InboundConfig {
+    pub listen: SocketAddr,
+    pub password: String,
+}
+
+#[derive(FromJs, TS, StructuralConvert)]
+#[convert(from(config::HttpOutboundConfig), into(config::HttpOutboundConfig))]
+#[ts(as = "config::HttpOutboundConfig")]
+pub(crate) struct HttpOutboundConfig {
+    pub server: Target,
+}
+
+#[derive(FromJs, TS, StructuralConvert)]
+#[convert(
+    from(config::Shadowsocks2022OutboundConfig),
+    into(config::Shadowsocks2022OutboundConfig)
+)]
+#[ts(as = "config::Shadowsocks2022OutboundConfig")]
+pub(crate) struct Shadowsocks2022OutboundConfig {
+    pub server: Target,
+    pub password: String,
+}
