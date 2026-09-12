@@ -1,0 +1,25 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", "docker:enableMajor", ":maintainLockFilesWeekly"],
+  "timezone": "Asia/Shanghai",
+  "commitMessagePrefix": "deps:",
+  "packageRules": [
+    {
+      "description": "Match the local pnpm minimum release age.",
+      "matchDatasources": ["npm"],
+      "minimumReleaseAge": "7 days"
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Update versioned Cargo tools installed in Docker builds.",
+      "managerFilePatterns": ["/(^|/)Dockerfile$/"],
+      "matchStrings": [
+        "cargo install (?<depName>[a-zA-Z0-9_-]+) --version (?<currentValue>[0-9]+\\.[0-9]+\\.[0-9]+)"
+      ],
+      "datasourceTemplate": "crate",
+      "versioningTemplate": "semver"
+    }
+  ]
+}
