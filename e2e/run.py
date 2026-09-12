@@ -29,6 +29,9 @@ def sing_protocol(kind, server=None):
             result["version"] = "5"
     else:
         result.update(listen="0.0.0.0", listen_port=1080)
+        # Replies include 8 KiB datagrams, larger than a Docker bridge MTU.
+        if kind != "http":
+            result["udp_fragment"] = True
     if kind == "shadowsocks2022":
         result.update(method="2022-blake3-aes-128-gcm", password=KEY)
     return result
@@ -39,7 +42,8 @@ def sing_config(inbounds, outbound):
         "log": {"level": "info"},
         "dns": {"servers": [{"type": "local", "tag": "local"}]},
         "inbounds": inbounds,
-        "outbounds": [dict(outbound, tag="out")],
+        # sing-box disables UDP fragmentation by default on outbound sockets.
+        "outbounds": [dict(outbound, tag="out", udp_fragment=True)],
         "route": {"final": "out", "default_domain_resolver": "local"},
     }
 

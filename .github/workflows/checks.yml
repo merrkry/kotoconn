@@ -46,3 +46,8 @@ jobs:
       # TypeScript checks generate bindings with Cargo and reuse the build above.
       - name: Check TypeScript
         run: pnpm run check
+      # rust-cache probes both directories without awaiting missing-path errors.
+      # Remove after https://github.com/Swatinem/rust-cache/pull/387 is released.
+      - name: Prepare nested test directories for cache cleanup
+        if: always()
+        run: mkdir -p target/tests/target target/tests/trybuild
