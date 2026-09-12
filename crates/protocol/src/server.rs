@@ -15,6 +15,7 @@ pub trait Handler: Send + Sync {
     /// A protocol association can contain multiple destination-specific sessions.
     fn udp(&self, packets: Datagram) -> BoxFuture<'_, Result<()>>;
 }
+
 #[derive(Clone)]
 pub struct ServerContext {
     pub handler: Arc<dyn Handler>,
@@ -22,10 +23,12 @@ pub struct ServerContext {
     pub stopping: CancellationToken,
     pub udp_idle_timeout: Duration,
 }
+
 pub struct BoundServer {
     pub local_addr: SocketAddr,
     pub run: BoxFuture<'static, Result<()>>,
 }
+
 pub trait Server: Send + Sync {
     fn bind(
         &self,
@@ -51,6 +54,7 @@ where
             _ = context.scope.cancelled() => return Ok(()),
             permit = admission.clone().acquire_owned() => permit?,
         };
+
         tokio::select! {
             biased;
             _ = context.stopping.cancelled() => return Ok(()),

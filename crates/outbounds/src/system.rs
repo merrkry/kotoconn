@@ -6,11 +6,13 @@ use tokio::net::{TcpStream, UdpSocket};
 pub struct System {
     scope: Scope,
 }
+
 impl System {
     pub fn new(scope: Scope) -> Self {
         Self { scope }
     }
 }
+
 impl Carrier for System {
     fn capabilities(&self) -> Capabilities {
         Capabilities::BOTH
@@ -44,14 +46,24 @@ impl Carrier for System {
                     tokio::select! {
                         received = socket.recv(&mut buffer) => {
                             match received {
-                                Ok(n) => { let _ = driver.tx.try_send(Packet { target: target.clone(), payload: buffer[..n].to_vec() }); }
+                                Ok(n) => {
+                                    let _ = driver
+                                        .tx
+                                        .try_send(Packet { target: target.clone(), payload: buffer[..n].to_vec() });
+                                }
                                 Err(error) => eprintln!("UDP receive: {error}"),
                             }
                         }
                         packet = driver.rx.recv() => {
                             let Some(packet) = packet else { return Ok(()); };
-                            if packet.target != target { anyhow::bail!("datagram target differs from connected target"); }
-                            if let Err(error) = socket.send(&packet.payload).await { eprintln!("UDP send: {error}"); }
+
+                            if packet.target != target {
+                                anyhow::bail!("datagram target differs from connected target");
+                            }
+
+                            if let Err(error) = socket.send(&packet.payload).await {
+                                eprintln!("UDP send: {error}");
+                            }
                         }
                     }
                 }
@@ -60,8 +72,10 @@ impl Carrier for System {
         })
     }
 }
+
 /// Temporary DNS implementation for policies that use the system resolver.
 pub struct SystemResolver;
+
 impl Resolver for SystemResolver {
     fn resolve(&self, name: String) -> BoxFuture<'_, Result<Vec<std::net::IpAddr>>> {
         Box::pin(async move {

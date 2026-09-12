@@ -12,6 +12,7 @@ pub struct Client {
     pub endpoint: Endpoint,
     pub carrier: Arc<dyn Carrier>,
 }
+
 impl p::Client for Client {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
@@ -55,6 +56,7 @@ impl p::Client for Client {
 }
 
 pub struct Server;
+
 impl p::Server for Server {
     fn bind(
         &self,
@@ -69,28 +71,39 @@ impl p::Server for Server {
                 run: Box::pin(async move {
                     let handler = context.handler.clone();
                     accept_loop(listener, context, move |stream, _, _, scope| {
-                    let handler = handler.clone();
-                    async move {
-                        let mut stream = BufReader::new(stream);
-                        let request = header(&mut stream).await?;
-                        let destination = match destination(&request) {
-                            Ok(destination) => destination,
-                            Err(error) => {
-                                stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
-                                return Err(error);
-                            }
-                        };
-                        // This acknowledges admission to Kotoconn, independently of routing.
-                        stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
-                        stream.flush().await?;
-                        handler.tcp(destination, Box::pin(stream), scope).await
-                    }
-                }).await
+                        let handler = handler.clone();
+
+                        async move {
+                            let mut stream = BufReader::new(stream);
+                            let request = header(&mut stream).await?;
+
+                            let destination = match destination(&request) {
+                                Ok(destination) => destination,
+                                Err(error) => {
+                                    stream
+                                        .write_all(
+                                            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                        )
+                                        .await?;
+                                    return Err(error);
+                                }
+                            };
+
+                            // This acknowledges admission to Kotoconn, independently of routing.
+                            stream
+                                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                                .await?;
+                            stream.flush().await?;
+                            handler.tcp(destination, Box::pin(stream), scope).await
+                        }
+                    })
+                    .await
                 }),
             })
         })
     }
 }
+
 fn authority(target: &Target) -> Result<String> {
     let text = match target {
         Target::Ip { address, port } => SocketAddr::new(*address, *port).to_string(),
@@ -99,6 +112,7 @@ fn authority(target: &Target) -> Result<String> {
     parse_authority(&text)?;
     Ok(text)
 }
+
 fn parse_authority(value: &str) -> Result<Target> {
     if let Ok(address) = value.parse::<SocketAddr>() {
         return Ok(p::target(address));
@@ -115,6 +129,7 @@ fn parse_authority(value: &str) -> Result<Target> {
             .ok_or_else(|| anyhow::anyhow!("CONNECT requires a port"))?,
     })
 }
+
 fn destination(header: &[u8]) -> Result<Target> {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut request = httparse::Request::new(&mut headers);
@@ -122,6 +137,7 @@ fn destination(header: &[u8]) -> Result<Target> {
         request.parse(header)?.is_complete(),
         "incomplete HTTP request"
     );
+
     ensure!(
         request.method == Some("CONNECT"),
         "only HTTP CONNECT is supported"
@@ -132,6 +148,7 @@ fn destination(header: &[u8]) -> Result<Target> {
             .ok_or_else(|| anyhow::anyhow!("missing authority"))?,
     )
 }
+
 async fn header(stream: &mut (impl tokio::io::AsyncRead + Unpin)) -> Result<Vec<u8>> {
     let mut result = Vec::new();
     while result.len() < 16 * 1024 {

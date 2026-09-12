@@ -11,7 +11,9 @@ use tokio::{
 };
 
 pub trait Stream: AsyncRead + AsyncWrite + Send {}
+
 impl<T: AsyncRead + AsyncWrite + Send> Stream for T {}
+
 pub type BoxStream = Pin<Box<dyn Stream>>;
 
 #[derive(Debug, Clone)]
@@ -19,6 +21,7 @@ pub struct Packet {
     pub target: Target,
     pub payload: Vec<u8>,
 }
+
 /// Each message is one complete datagram. No framing, mux or retransmission here.
 /// Ingress on a shared socket uses try_send: a full session queue drops that packet.
 pub struct Datagram {
@@ -26,11 +29,13 @@ pub struct Datagram {
     pub rx: mpsc::Receiver<Packet>,
     pub scope: Scope,
 }
+
 impl Drop for Datagram {
     fn drop(&mut self) {
         self.scope.close();
     }
 }
+
 pub fn packet_pair(scope: Scope) -> (Datagram, Datagram) {
     let (a_tx, b_rx) = mpsc::channel(64);
     let (b_tx, a_rx) = mpsc::channel(64);
@@ -66,15 +71,18 @@ pub fn stream_task(
         scope: handle,
     }))
 }
+
 struct OwnedStream {
     inner: tokio::io::DuplexStream,
     scope: Scope,
 }
+
 impl Drop for OwnedStream {
     fn drop(&mut self) {
         self.scope.close();
     }
 }
+
 impl AsyncRead for OwnedStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -84,6 +92,7 @@ impl AsyncRead for OwnedStream {
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
+
 impl AsyncWrite for OwnedStream {
     fn poll_write(
         mut self: Pin<&mut Self>,

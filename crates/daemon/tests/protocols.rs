@@ -11,9 +11,11 @@ use tokio::{
 
 const KEY: &str = "AAECAwQFBgcICQoLDA0ODw==";
 const LIMIT: Duration = Duration::from_secs(20);
+
 fn direct() -> OutboundImpl {
     OutboundImpl::Direct(DirectOutboundConfig {})
 }
+
 fn outbound(kind: &str, server: Target) -> OutboundImpl {
     match kind {
         "http" => OutboundImpl::Http(HttpOutboundConfig { server }),
@@ -25,9 +27,11 @@ fn outbound(kind: &str, server: Target) -> OutboundImpl {
         _ => unreachable!(),
     }
 }
+
 async fn daemon() -> Result<Daemon> {
     daemon_with_idle(10000).await
 }
+
 async fn daemon_with_idle(idle: u32) -> Result<Daemon> {
     let source = format!(
         r#"
@@ -48,6 +52,7 @@ async fn daemon_with_idle(idle: u32) -> Result<Daemon> {
     )
     .await?)
 }
+
 fn address(daemon: &Daemon, kind: &str) -> Target {
     let id = daemon
         .policy()
@@ -66,6 +71,7 @@ fn address(daemon: &Daemon, kind: &str) -> Target {
         .0;
     target(daemon.listen_addresses()[id])
 }
+
 async fn echoes(scope: &Scope) -> Result<(Target, Target)> {
     let tcp = TcpListener::bind("127.0.0.1:0").await?;
     let udp = UdpSocket::bind("127.0.0.1:0").await?;
@@ -92,6 +98,7 @@ async fn echoes(scope: &Scope) -> Result<(Target, Target)> {
     })?;
     Ok(addresses)
 }
+
 async fn tcp_roundtrip(client: &dyn Carrier, target: Target) -> Result<()> {
     let mut stream = client.tcp(target).await?;
     let mut greeting = [0; 5];
@@ -112,6 +119,7 @@ async fn tcp_roundtrip(client: &dyn Carrier, target: Target) -> Result<()> {
     assert_eq!(response, payload);
     Ok(())
 }
+
 async fn udp_roundtrip(client: &dyn Carrier, target: Target) -> Result<()> {
     let mut connection = client.udp(target.clone()).await?;
     for payload in [vec![], vec![42], (0..8192).map(|n| n as u8).collect()] {
@@ -404,7 +412,11 @@ async fn shadowsocks_udp_rejects_tampering_and_replay_before_routing() -> Result
 async fn capability_checks_and_udp_policy_contract_reject_invalid_requests() -> Result<()> {
     tokio::time::timeout(LIMIT, async {
         let scope = Scope::new();
-        let http: Arc<dyn Carrier> = Arc::new(Clients::new(outbound("http", target("127.0.0.1:1".parse()?)), Arc::new(System::new(scope.clone())), Arc::new(SystemResolver))?);
+        let http: Arc<dyn Carrier> = Arc::new(Clients::new(
+            outbound("http", target("127.0.0.1:1".parse()?)),
+            Arc::new(System::new(scope.clone())),
+            Arc::new(SystemResolver),
+        )?);
         let socks = Clients::new(outbound("socks5", target("127.0.0.1:1".parse()?)), http, Arc::new(SystemResolver))?;
         assert!(socks.capabilities().tcp);
         assert!(!socks.capabilities().udp);
@@ -418,7 +430,17 @@ async fn capability_checks_and_udp_policy_contract_reject_invalid_requests() -> 
         "#;
         let daemon = Daemon::start_with_sources("main.ts".into(), HashMap::from([("main.ts".into(), source.into())]), Duration::from_secs(1)).await?;
         let handler = *daemon.policy().config().routing_handlers.iter().next().unwrap();
-        let error = daemon.policy().route(handler, Flow { protocol: TransportProtocol::Udp, dest: target("127.0.0.1:2".parse()?) }).await.unwrap_err();
+        let error = daemon
+            .policy()
+            .route(
+                handler,
+                Flow {
+                    protocol: TransportProtocol::Udp,
+                    dest: target("127.0.0.1:2".parse()?),
+                },
+            )
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("route_udp"));
         daemon.shutdown().await?;
         scope.close(); scope.wait().await;

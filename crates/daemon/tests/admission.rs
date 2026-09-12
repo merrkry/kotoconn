@@ -8,6 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 struct Inspect(tokio::sync::mpsc::UnboundedSender<Target>);
+
 impl Handler for Inspect {
     fn tcp(
         &self,

@@ -8,6 +8,7 @@ use tokio::{
 };
 
 pub struct Server(pub Target);
+
 impl p::Server for Server {
     fn bind(
         &self,
@@ -40,16 +41,19 @@ impl p::Server for Server {
         })
     }
 }
+
 struct Association {
     tx: mpsc::Sender<Packet>,
     scope: Scope,
     active: tokio::time::Instant,
 }
+
 impl Drop for Association {
     fn drop(&mut self) {
         self.scope.close();
     }
 }
+
 async fn udp(socket: UdpSocket, target: Target, context: ServerContext) -> Result<()> {
     let mut peers = HashMap::<SocketAddr, Association>::new();
     let (responses, mut replies) = mpsc::channel::<(SocketAddr, Packet)>(64);
@@ -69,15 +73,20 @@ async fn udp(socket: UdpSocket, target: Target, context: ServerContext) -> Resul
             received = socket.recv_from(&mut buffer) => {
                 let (n, peer) = received?;
                 if !peers.contains_key(&peer) {
-                    if peers.len() >= 4096 { continue; }
+                    if peers.len() >= 4096 {
+                        continue;
+                    }
+
                     let scope = context.scope.child();
                     let (association, mut driver) = packet_pair(scope.clone());
                     let tx = driver.tx.clone();
                     let handler = context.handler.clone();
                     let responses = responses.clone();
+
                     scope.spawn(async move {
                         let work = handler.udp(association);
                         tokio::pin!(work);
+
                         loop {
                             tokio::select! {
                                 result = &mut work => return result,
@@ -88,17 +97,32 @@ async fn udp(socket: UdpSocket, target: Target, context: ServerContext) -> Resul
                             }
                         }
                     })?;
-                    peers.insert(peer, Association { tx, scope, active: tokio::time::Instant::now() });
+
+                    peers.insert(
+                        peer,
+                        Association {
+                            tx,
+                            scope,
+                            active: tokio::time::Instant::now(),
+                        },
+                    );
                 }
+
                 let association = peers.get_mut(&peer).expect("inserted association");
                 association.active = tokio::time::Instant::now();
-                let _ = association.tx.try_send(Packet { target: target.clone(), payload: buffer[..n].to_vec() });
+                let _ = association.tx.try_send(Packet {
+                    target: target.clone(),
+                    payload: buffer[..n].to_vec(),
+                });
             }
             reply = replies.recv() => {
                 let Some((peer, packet)) = reply else { return Ok(()); };
                 if let Some(association) = peers.get_mut(&peer) {
                     association.active = tokio::time::Instant::now();
-                    if let Err(error) = socket.send_to(&packet.payload, peer).await { eprintln!("direct UDP reply: {error}"); }
+
+                    if let Err(error) = socket.send_to(&packet.payload, peer).await {
+                        eprintln!("direct UDP reply: {error}");
+                    }
                 }
             }
         }

@@ -228,8 +228,9 @@ api! {
                     }
                 }
                 Ok::<_, std::io::Error>(result)
-            }).await?
-                .map_err(|error| invalid(error.to_string()))?;
+            })
+            .await?
+            .map_err(|error| invalid(error.to_string()))?;
             Ok(addresses.into_iter().map(Into::into).collect())
         }
     }

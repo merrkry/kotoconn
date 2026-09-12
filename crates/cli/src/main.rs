@@ -43,6 +43,7 @@ async fn run(Cli { command }: Cli) -> Result<()> {
         } => {
             let signal = shutdown_signal();
             tokio::pin!(signal);
+
             let daemon = tokio::select! {
                 biased;
                 result = &mut signal => {

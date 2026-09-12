@@ -17,6 +17,7 @@ use tokio::{
 pub struct Server {
     crypto: Arc<Crypto>,
 }
+
 impl Server {
     pub fn new(password: &str) -> Result<Self> {
         Ok(Self {
@@ -24,6 +25,7 @@ impl Server {
         })
     }
 }
+
 impl p::Server for Server {
     fn bind(
         &self,
@@ -65,6 +67,7 @@ impl p::Server for Server {
         })
     }
 }
+
 struct Association {
     peer: SocketAddr,
     server: u64,
@@ -74,11 +77,13 @@ struct Association {
     tx: mpsc::Sender<Packet>,
     scope: Scope,
 }
+
 impl Drop for Association {
     fn drop(&mut self) {
         self.scope.close();
     }
 }
+
 async fn udp(socket: UdpSocket, context: ServerContext, crypto: Arc<Crypto>) -> Result<()> {
     let mut associations = HashMap::<u64, Association>::new();
     let (responses, mut replies) = mpsc::channel::<(u64, Packet)>(64);
@@ -97,18 +102,35 @@ async fn udp(socket: UdpSocket, context: ServerContext, crypto: Arc<Crypto>) -> 
             }
             received = socket.recv_from(&mut buffer) => {
                 let (n, peer) = received?;
-                let Ok((n, destination, Some(ctrl))) = decrypt_client_payload(&crypto.context, METHOD, crypto.config.key(), &mut buffer[..n], None) else { continue; };
+                let Ok((n, destination, Some(ctrl))) =
+                    decrypt_client_payload(
+                        &crypto.context,
+                        METHOD,
+                        crypto.config.key(),
+                        &mut buffer[..n],
+                        None,
+                    )
+                else {
+                    continue;
+                };
+
                 let id = ctrl.client_session_id;
+
                 if !associations.contains_key(&id) {
-                    if associations.len() >= 4096 { continue; }
+                    if associations.len() >= 4096 {
+                        continue;
+                    }
+
                     let scope = context.scope.child();
                     let (connection, mut driver) = packet_pair(scope.clone());
                     let tx = driver.tx.clone();
                     let handler = context.handler.clone();
                     let responses = responses.clone();
+
                     scope.spawn(async move {
                         let work = handler.udp(connection);
                         tokio::pin!(work);
+
                         loop {
                             tokio::select! {
                                 result = &mut work => return result,
@@ -119,26 +141,63 @@ async fn udp(socket: UdpSocket, context: ServerContext, crypto: Arc<Crypto>) -> 
                             }
                         }
                     })?;
-                    associations.insert(id, Association { peer, server: rand::random(), packet: 0, window: PacketWindowFilter::new(), active: Instant::now(), tx, scope });
+
+                    associations.insert(
+                        id,
+                        Association {
+                            peer,
+                            server: rand::random(),
+                            packet: 0,
+                            window: PacketWindowFilter::new(),
+                            active: Instant::now(),
+                            tx,
+                            scope,
+                        },
+                    );
                 }
+
                 let association = associations.get_mut(&id).expect("inserted association");
-                if !association.window.validate_packet_id(ctrl.packet_id, PACKET_LIMIT) { continue; }
+                if !association
+                    .window
+                    .validate_packet_id(ctrl.packet_id, PACKET_LIMIT)
+                {
+                    continue;
+                }
+
                 // Authenticated packets permit source address migration.
                 association.peer = peer;
                 association.active = Instant::now();
-                let _ = association.tx.try_send(Packet { target: from_address(destination), payload: buffer[..n].to_vec() });
+                let _ = association.tx.try_send(Packet {
+                    target: from_address(destination),
+                    payload: buffer[..n].to_vec(),
+                });
             }
             response = replies.recv() => {
                 let Some((id, packet)) = response else { return Ok(()); };
                 let Some(association) = associations.get_mut(&id) else { continue; };
                 association.packet += 1;
-                if association.packet >= PACKET_LIMIT { associations.remove(&id); continue; }
+                if association.packet >= PACKET_LIMIT {
+                    associations.remove(&id);
+                    continue;
+                }
+
                 let mut wire = BytesMut::new();
-                encrypt_server_payload(&crypto.context, METHOD, crypto.config.key(), &address(packet.target), &control(id, association.server, association.packet), &packet.payload, &mut wire);
+                encrypt_server_payload(
+                    &crypto.context,
+                    METHOD,
+                    crypto.config.key(),
+                    &address(packet.target),
+                    &control(id, association.server, association.packet),
+                    &packet.payload,
+                    &mut wire,
+                );
+
                 if wire.len() <= 65507
-                    && let Err(error) = socket.send_to(&wire, association.peer).await {
+                    && let Err(error) = socket.send_to(&wire, association.peer).await
+                {
                     eprintln!("Shadowsocks UDP reply: {error}");
                 }
+
                 association.active = Instant::now();
             }
         }

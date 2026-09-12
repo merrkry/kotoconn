@@ -10,6 +10,7 @@ pub struct Client {
     pub endpoint: Endpoint,
     pub carrier: Arc<dyn Carrier>,
 }
+
 impl p::Client for Client {
     fn capabilities(&self) -> Capabilities {
         let lower = self.carrier.capabilities();

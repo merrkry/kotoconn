@@ -33,8 +33,10 @@ pub(super) async fn connect(
         failed: false,
         verified: false,
     };
+
     let mut header = BytesMut::new();
     address(target).write_to_buf(&mut header);
+
     let padding = rand::random_range(1..=900);
     header.put_u16(padding);
     let start = header.len();
@@ -44,12 +46,14 @@ pub(super) async fn connect(
     stream.flush().await?;
     Ok(Box::pin(stream))
 }
+
 struct Encrypted {
     stream: CryptoStream<BoxStream>,
     context: SharedContext,
     failed: bool,
     verified: bool,
 }
+
 impl AsyncRead for Encrypted {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -89,6 +93,7 @@ impl AsyncRead for Encrypted {
         Poll::Ready(Ok(()))
     }
 }
+
 impl AsyncWrite for Encrypted {
     fn poll_write(
         mut self: Pin<&mut Self>,

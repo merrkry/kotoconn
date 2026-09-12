@@ -106,6 +106,7 @@ mod checked_number {
             let number = value
                 .as_number()
                 .ok_or_else(|| invalid("expected a number"))?;
+
             if !number.is_finite()
                 || number.fract() != 0.0
                 || number < 0.0
@@ -117,6 +118,7 @@ mod checked_number {
         }
     }
 }
+
 pub(crate) use checked_number_byte::Byte;
 pub(crate) use checked_number_milliseconds::Milliseconds;
 pub(crate) use checked_number_port::Port;
@@ -159,12 +161,14 @@ mod tests {
             ctx.globals().set("ipv4", IpAddr::from(ipv4)).unwrap();
             ctx.globals().set("same", IpAddr::from(ipv4)).unwrap();
             ctx.globals().set("ipv6", IpAddr::from(ipv6)).unwrap();
+
             ctx.globals().set("domain", Target::from(config::Target::Domain {
                 name: "test.invalid".into(), port: 443,
             })).unwrap();
             ctx.globals().set("target", Target::from(config::Target::Ip {
                 address: ipv6, port: 53,
             })).unwrap();
+
             ctx.eval::<(), _>(r#"
                 'use strict';
                 if (ipv4.version !== 4 || ipv6.version !== 6) throw Error('family');

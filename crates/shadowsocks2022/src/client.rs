@@ -12,6 +12,7 @@ pub struct Client {
     carrier: Arc<dyn Carrier>,
     crypto: Arc<Crypto>,
 }
+
 impl Client {
     pub fn new(endpoint: Endpoint, carrier: Arc<dyn Carrier>, password: &str) -> Result<Self> {
         Ok(Self {
@@ -21,6 +22,7 @@ impl Client {
         })
     }
 }
+
 impl p::Client for Client {
     fn capabilities(&self) -> Capabilities {
         self.carrier.capabilities()
@@ -47,26 +49,72 @@ impl p::Client for Client {
                 let client_id = rand::random();
                 let mut packet_id = 0;
                 let mut windows = HashMap::<u64, PacketWindowFilter>::new();
+
                 loop {
                     tokio::select! {
                         received = transport.rx.recv() => {
                             let Some(mut received) = received else { return Ok(()); };
-                            let Ok((n, destination, Some(ctrl))) = decrypt_server_payload(&crypto.context, METHOD, crypto.config.key(), &mut received.payload) else { continue; };
+                            let Ok((n, destination, Some(ctrl))) =
+                                decrypt_server_payload(
+                                    &crypto.context,
+                                    METHOD,
+                                    crypto.config.key(),
+                                    &mut received.payload,
+                                )
+                            else {
+                                continue;
+                            };
+
                             if ctrl.client_session_id != client_id { continue; }
+
                             // Bound authenticated server rotations per association.
-                            if windows.len() >= 1024 && !windows.contains_key(&ctrl.server_session_id) { continue; }
-                            if !windows.entry(ctrl.server_session_id).or_default().validate_packet_id(ctrl.packet_id, PACKET_LIMIT) { continue; }
+                            if windows.len() >= 1024 && !windows.contains_key(&ctrl.server_session_id) {
+                                continue;
+                            }
+
+                            if !windows
+                                .entry(ctrl.server_session_id)
+                                .or_default()
+                                .validate_packet_id(ctrl.packet_id, PACKET_LIMIT)
+                            {
+                                continue;
+                            }
+
                             received.payload.truncate(n);
-                            let _ = driver.tx.try_send(Packet { target: from_address(destination), payload: received.payload });
+
+                            let _ = driver
+                                .tx
+                                .try_send(Packet { target: from_address(destination), payload: received.payload });
                         }
                         packet = driver.rx.recv() => {
                             let Some(packet) = packet else { return Ok(()); };
                             packet_id += 1;
                             ensure!(packet_id < PACKET_LIMIT, "Shadowsocks packet counter exhausted");
+
                             let mut wire = BytesMut::new();
-                            encrypt_client_payload(&crypto.context, METHOD, crypto.config.key(), &address(packet.target), &control(client_id, 0, packet_id), &[], &packet.payload, &mut wire);
-                            if wire.len() > 65507 { continue; }
-                            if matches!(transport.tx.try_send(Packet { target: endpoint.clone(), payload: wire.to_vec() }), Err(tokio::sync::mpsc::error::TrySendError::Closed(_))) {
+
+                            encrypt_client_payload(
+                                &crypto.context,
+                                METHOD,
+                                crypto.config.key(),
+                                &address(packet.target),
+                                &control(client_id, 0, packet_id),
+                                &[],
+                                &packet.payload,
+                                &mut wire,
+                            );
+
+                            if wire.len() > 65507 {
+                                continue;
+                            }
+
+                            if matches!(
+                                transport.tx.try_send(Packet {
+                                    target: endpoint.clone(),
+                                    payload: wire.to_vec(),
+                                }),
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+                            ) {
                                 return Ok(());
                             }
                         }

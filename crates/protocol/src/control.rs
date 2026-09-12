@@ -9,11 +9,13 @@ pub struct Scope {
     token: CancellationToken,
     trackers: Arc<Vec<TaskTracker>>,
 }
+
 impl Default for Scope {
     fn default() -> Self {
         Self::new()
     }
 }
+
 impl Scope {
     pub fn new() -> Self {
         let tracker = TaskTracker::new();

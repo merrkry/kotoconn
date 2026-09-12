@@ -17,10 +17,12 @@ use std::net::SocketAddr;
 
 const METHOD: CipherKind = CipherKind::AEAD2022_BLAKE3_AES_128_GCM;
 const PACKET_LIMIT: u64 = u64::MAX - (1 << 13);
+
 struct Crypto {
     context: SharedContext,
     config: ServerConfig,
 }
+
 impl Crypto {
     fn new(password: &str, side: ServerType) -> Result<Self> {
         // The library requires a server address to derive protocol configuration;
@@ -31,18 +33,21 @@ impl Crypto {
         })
     }
 }
+
 fn address(value: Target) -> Address {
     match value {
         Target::Ip { address, port } => Address::SocketAddress(SocketAddr::new(address, port)),
         Target::Domain { name, port } => Address::DomainNameAddress(name, port),
     }
 }
+
 fn from_address(value: Address) -> Target {
     match value {
         Address::SocketAddress(value) => target(value),
         Address::DomainNameAddress(name, port) => Target::Domain { name, port },
     }
 }
+
 fn control(client: u64, server: u64, packet: u64) -> UdpSocketControlData {
     let mut result = UdpSocketControlData::default();
     result.client_session_id = client;

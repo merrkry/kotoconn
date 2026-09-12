@@ -16,6 +16,7 @@ pub struct Clients {
     tcp: Scope,
     udp: Scope,
 }
+
 impl Clients {
     pub fn new(
         config: OutboundImpl,
@@ -48,6 +49,7 @@ impl Clients {
             )?),
             OutboundImpl::Direct(_) => Arc::new(Direct(carrier)),
         };
+
         Ok(Self {
             tcp: scope.child(),
             udp: scope.child(),
@@ -62,6 +64,7 @@ impl Clients {
         }
     }
 }
+
 impl Carrier for Clients {
     fn capabilities(&self) -> Capabilities {
         self.protocol.capabilities()
@@ -90,8 +93,10 @@ impl Carrier for Clients {
             let (user, mut driver) = packet_pair(scope.clone());
             let protocol = self.protocol.clone();
             let connection_scope = scope.clone();
+
             scope.spawn(async move {
                 let mut transport = protocol.udp(target, connection_scope.child()).await?;
+
                 // Independent forwarding futures avoid blocking replies on a full
                 // request queue, while retaining bounded backpressure in each direction.
                 let outgoing = async {
@@ -112,7 +117,9 @@ impl Carrier for Clients {
         })
     }
 }
+
 struct Direct(Arc<dyn Carrier>);
+
 impl Client for Direct {
     fn capabilities(&self) -> Capabilities {
         self.0.capabilities()

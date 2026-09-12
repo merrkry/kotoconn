@@ -24,6 +24,7 @@ pub(crate) struct Network {
     failure: tokio::sync::watch::Receiver<Option<String>>,
     _registry: AbortOnDropHandle<()>,
 }
+
 impl Network {
     pub async fn start(
         policy: Policy,
@@ -121,6 +122,7 @@ impl Network {
         }
     }
 }
+
 impl Drop for Network {
     fn drop(&mut self) {
         self.scope.close();
@@ -131,11 +133,13 @@ struct PolicyResolver {
     policy: Policy,
     id: ResolveHandlerId,
 }
+
 impl Resolver for PolicyResolver {
     fn resolve(&self, name: String) -> BoxFuture<'_, Result<Vec<IpAddr>>> {
         Box::pin(async move { Ok(self.policy.resolve(self.id, name).await?) })
     }
 }
+
 fn build_clients(policy: &Policy, scope: Scope) -> Result<HashMap<DialerId, Arc<Clients>>> {
     let definitions = &policy.config().dialers;
     for (id, config) in definitions {
@@ -183,6 +187,7 @@ fn build_clients(policy: &Policy, scope: Scope) -> Result<HashMap<DialerId, Arc<
     }
     Ok(clients)
 }
+
 #[derive(Clone)]
 struct SessionHandler {
     policy: Policy,
@@ -191,6 +196,7 @@ struct SessionHandler {
     sessions: sessions::Sessions,
     idle: std::time::Duration,
 }
+
 impl p::Handler for SessionHandler {
     fn tcp(
         &self,

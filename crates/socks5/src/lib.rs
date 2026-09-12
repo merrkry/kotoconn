@@ -14,18 +14,21 @@ fn address(value: Target) -> TargetAddr {
         Target::Domain { name, port } => TargetAddr::Domain(name, port),
     }
 }
+
 fn from_address(value: TargetAddr) -> Target {
     match value {
         TargetAddr::Ip(value) => target(value),
         TargetAddr::Domain(name, port) => Target::Domain { name, port },
     }
 }
+
 fn encode(packet: Packet) -> Result<Vec<u8>> {
     let mut wire = fast_socks5::new_udp_header(address(packet.target))?;
     wire.extend(packet.payload);
     ensure!(wire.len() <= 65507, "SOCKS datagram too large");
     Ok(wire)
 }
+
 async fn decode(wire: &[u8]) -> Result<Packet> {
     ensure!(
         wire.len() >= 4 && wire[..2] == [0, 0],

@@ -55,9 +55,11 @@ impl rquickjs::loader::Resolver for Resolver {
             match component {
                 Component::Normal(part) => components.push(part.to_string_lossy().into_owned()),
                 Component::CurDir => {}
+
                 Component::ParentDir if !components.is_empty() => {
                     components.pop();
                 }
+
                 _ => {
                     return Err(rquickjs::Error::new_resolving_message(
                         base,

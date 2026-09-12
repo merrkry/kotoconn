@@ -16,6 +16,7 @@ pub struct Capabilities {
     pub tcp: bool,
     pub udp: bool,
 }
+
 impl Capabilities {
     pub const BOTH: Self = Self {
         tcp: true,
@@ -59,11 +60,13 @@ pub trait Client: Send + Sync {
 pub trait Resolver: Send + Sync {
     fn resolve(&self, name: String) -> BoxFuture<'_, Result<Vec<std::net::IpAddr>>>;
 }
+
 #[derive(Clone)]
 pub struct Endpoint {
     pub address: Target,
     pub resolver: Arc<dyn Resolver>,
 }
+
 impl Endpoint {
     pub async fn resolve(&self) -> Result<Target> {
         match &self.address {
@@ -91,6 +94,7 @@ pub fn socket_addr(target: &Target) -> Result<SocketAddr> {
         }
     }
 }
+
 pub fn target(address: SocketAddr) -> Target {
     Target::Ip {
         address: address.ip(),

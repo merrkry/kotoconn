@@ -9,6 +9,7 @@ struct Entry {
     scope: Scope,
     generation: u64,
 }
+
 impl Drop for Entry {
     fn drop(&mut self) {
         self.scope.close();
@@ -19,6 +20,7 @@ pub(super) async fn association(handler: SessionHandler, mut packets: Datagram) 
     let mut sessions = HashMap::<Target, Entry>::new();
     let (completed, mut completions) = mpsc::unbounded_channel();
     let mut generation = 0;
+
     loop {
         tokio::select! {
             biased;
@@ -29,9 +31,19 @@ pub(super) async fn association(handler: SessionHandler, mut packets: Datagram) 
             packet = packets.rx.recv() => {
                 let Some(packet) = packet else { return Ok(()); };
                 let target = packet.target.clone();
-                if sessions.get(&target).is_some_and(|entry| entry.scope.is_closed()) { sessions.remove(&target); }
+
+                if sessions
+                    .get(&target)
+                    .is_some_and(|entry| entry.scope.is_closed())
+                {
+                    sessions.remove(&target);
+                }
+
                 if !sessions.contains_key(&target) {
-                    if sessions.len() >= 1024 { continue; }
+                    if sessions.len() >= 1024 {
+                        continue;
+                    }
+
                     generation += 1;
                     let scope = packets.scope.child();
                     let (tx, rx) = mpsc::channel(64);
@@ -40,19 +52,33 @@ pub(super) async fn association(handler: SessionHandler, mut packets: Datagram) 
                     let done = completed.clone();
                     let destination = target.clone();
                     let control = scope.clone();
+
                     scope.spawn(async move {
-                        let result = control.run(session(instance, destination.clone(), rx, replies, control.clone())).await;
+                        let result =
+                            control
+                                .run(session(
+                                    instance,
+                                    destination.clone(),
+                                    rx,
+                                    replies,
+                                    control.clone(),
+                                ))
+                                .await;
                         control.close();
                         let _ = done.send((destination, generation));
+
                         result
                     })?;
+
                     sessions.insert(target.clone(), Entry { tx, scope, generation });
                 }
+
                 let _ = sessions[&target].tx.try_send(packet);
             }
         }
     }
 }
+
 async fn session(
     handler: SessionHandler,
     destination: Target,
@@ -76,10 +102,13 @@ async fn session(
                 },
             )
             .await?;
+
         let RouteDecision::Udp { dialer } = decision else {
             bail!("UDP session rejected");
         };
+
         let client = handler.clients.get(&dialer).context("unknown dialer")?;
+
         client
             .control(TransportProtocol::Udp)
             .run(async {
@@ -91,6 +120,7 @@ async fn session(
                     }
                     Ok::<(), anyhow::Error>(())
                 };
+
                 let backward = async {
                     while let Some(packet) = outgoing.rx.recv().await {
                         // Reply address is protocol metadata; there is no target rewrite.
@@ -115,7 +145,11 @@ async fn until_idle(timeout: std::time::Duration, mut activity: watch::Receiver<
         let deadline = *activity.borrow_and_update() + timeout;
         tokio::select! {
             biased;
-            changed = activity.changed() => { if changed.is_err() { return; } }
+            changed = activity.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
             _ = tokio::time::sleep_until(deadline) => return,
         }
     }
