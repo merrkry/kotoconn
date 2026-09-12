@@ -169,7 +169,7 @@ async fn udp(socket: UdpSocket, context: ServerContext, crypto: Arc<Crypto>) -> 
                 association.active = Instant::now();
                 let _ = association.tx.try_send(Packet {
                     target: from_address(destination),
-                    payload: buffer[..n].to_vec(),
+                    payload: buffer[..n].to_vec().into(),
                 });
             }
             response = replies.recv() => {

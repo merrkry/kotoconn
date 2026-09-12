@@ -127,7 +127,7 @@ async fn udp_roundtrip(client: &dyn Carrier, target: Target) -> Result<()> {
             .tx
             .send(Packet {
                 target: target.clone(),
-                payload: payload.clone(),
+                payload: payload.clone().into(),
             })
             .await?;
         let response = connection.rx.recv().await.unwrap();
@@ -252,7 +252,7 @@ async fn sessions_split_by_destination_and_close_without_killing_association() -
                 .tx
                 .send(Packet {
                     target: destination.clone(),
-                    payload: vec![1],
+                    payload: vec![1].into(),
                 })
                 .await?;
             assert_eq!(association.rx.recv().await.unwrap().target, *destination);
@@ -267,7 +267,7 @@ async fn sessions_split_by_destination_and_close_without_killing_association() -
             .tx
             .send(Packet {
                 target: b.clone(),
-                payload: vec![2],
+                payload: vec![2].into(),
             })
             .await?;
         assert_eq!(association.rx.recv().await.unwrap().payload, vec![2]);
@@ -282,7 +282,7 @@ async fn sessions_split_by_destination_and_close_without_killing_association() -
             .tx
             .send(Packet {
                 target: a.clone(),
-                payload: vec![3],
+                payload: vec![3].into(),
             })
             .await?;
         assert_eq!(association.rx.recv().await.unwrap().payload, vec![3]);
@@ -324,7 +324,7 @@ async fn lower_tcp_close_ends_socks_udp_control_but_not_sibling_udp() -> Result<
             .tx
             .send(Packet {
                 target: target.clone(),
-                payload: vec![1],
+                payload: vec![1].into(),
             })
             .await?;
         association.rx.recv().await.unwrap();

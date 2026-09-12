@@ -1480,6 +1480,7 @@ name = "kotoconn-protocol"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "futures-util",
  "kotoconn-config",
  "tokio",
@@ -1538,6 +1539,7 @@ name = "kotoconn-tun"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "futures-util",
  "kotoconn-config",
  "kotoconn-protocol",

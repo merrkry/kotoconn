@@ -112,7 +112,7 @@ async fn udp(socket: UdpSocket, target: Target, context: ServerContext) -> Resul
                 association.active = tokio::time::Instant::now();
                 let _ = association.tx.try_send(Packet {
                     target: target.clone(),
-                    payload: buffer[..n].to_vec(),
+                    payload: buffer[..n].to_vec().into(),
                 });
             }
             reply = replies.recv() => {

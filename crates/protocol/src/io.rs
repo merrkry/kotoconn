@@ -1,5 +1,6 @@
 use crate::{Scope, Target};
 use anyhow::Result;
+use bytes::Bytes;
 use std::{
     future::Future,
     pin::Pin,
@@ -19,7 +20,8 @@ pub type BoxStream = Pin<Box<dyn Stream>>;
 #[derive(Debug, Clone)]
 pub struct Packet {
     pub target: Target,
-    pub payload: Vec<u8>,
+    /// Shared ownership lets ingress retain resource accounting through routing queues.
+    pub payload: Bytes,
 }
 
 /// Each message is one complete datagram. No framing, mux or retransmission here.

@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+bytes.workspace = true
 futures-util.workspace = true
 kotoconn-protocol.workspace = true
 kotoconn-config.workspace = true

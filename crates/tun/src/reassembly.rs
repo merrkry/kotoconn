@@ -4,9 +4,15 @@ use crate::device::Device;
 use smoltcp::{
     iface::{Config, Interface, SocketHandle, SocketSet},
     socket::raw,
-    wire::{HardwareAddress, IpVersion},
+    wire::{HardwareAddress, IpVersion, Ipv4FragKey, Ipv4Packet},
 };
+use std::{collections::BTreeMap, time::Duration};
 use tokio::time::Instant;
+
+struct HeaderLimit {
+    length: usize,
+    expires: Instant,
+}
 
 pub(crate) struct Ipv4Reassembly {
     epoch: Instant,
@@ -14,6 +20,7 @@ pub(crate) struct Ipv4Reassembly {
     device: Device,
     sockets: SocketSet<'static>,
     raw: SocketHandle,
+    headers: BTreeMap<Ipv4FragKey, HeaderLimit>,
 }
 
 impl Default for Ipv4Reassembly {
@@ -36,12 +43,26 @@ impl Default for Ipv4Reassembly {
             device,
             sockets,
             raw,
+            headers: BTreeMap::new(),
         }
     }
 }
 
 impl Ipv4Reassembly {
     pub fn process(&mut self, data: &[u8], now: Instant) -> Option<Vec<u8>> {
+        let packet = Ipv4Packet::new_checked(data).ok()?;
+        let key = packet.get_key();
+        self.headers.retain(|_, header| header.expires > now);
+        if !self.headers.contains_key(&key)
+            && self.headers.len() >= smoltcp::config::REASSEMBLY_BUFFER_COUNT
+        {
+            return None;
+        }
+        let header = self.headers.entry(key).or_insert(HeaderLimit {
+            length: 20,
+            expires: now + Duration::from_secs(60),
+        });
+        header.length = header.length.max(usize::from(packet.header_len()));
         let now =
             smoltcp::time::Instant::from_micros(now.duration_since(self.epoch).as_micros() as i64);
         self.iface.poll_maintenance(now);
@@ -49,10 +70,11 @@ impl Ipv4Reassembly {
         self.iface
             .poll_ingress_single(now, &mut self.device, &mut self.sockets);
         self.device.outgoing.clear();
-        self.sockets
-            .get_mut::<raw::Socket>(self.raw)
-            .recv()
-            .ok()
-            .map(<[u8]>::to_vec)
+        let assembled = self.sockets.get_mut::<raw::Socket>(self.raw).recv().ok()?;
+        // Raw sockets re-emit a 20-byte header, dropping IPv4 options. Retain
+        // only header metadata to enforce the original 65535-byte IP limit;
+        // smoltcp still owns all fragment storage and reassembly decisions.
+        let header = self.headers.remove(&key)?;
+        (assembled.len() - 20 + header.length <= 65535).then(|| assembled.to_vec())
     }
 }

@@ -76,7 +76,7 @@ impl p::Client for Client {
                             let Some(packet) = packet else { return Ok(()); };
                             match encode(packet) {
                                 Ok(payload) => {
-                                    if matches!(transport.tx.try_send(Packet { target: relay.clone(), payload }), Err(tokio::sync::mpsc::error::TrySendError::Closed(_))) {
+                                    if matches!(transport.tx.try_send(Packet { target: relay.clone(), payload: payload.into() }), Err(tokio::sync::mpsc::error::TrySendError::Closed(_))) {
                                         return Ok(());
                                     }
                                 },

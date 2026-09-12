@@ -53,13 +53,14 @@ impl p::Client for Client {
                 loop {
                     tokio::select! {
                         received = transport.rx.recv() => {
-                            let Some(mut received) = received else { return Ok(()); };
+                            let Some(received) = received else { return Ok(()); };
+                            let mut payload = Vec::from(received.payload);
                             let Ok((n, destination, Some(ctrl))) =
                                 decrypt_server_payload(
                                     &crypto.context,
                                     METHOD,
                                     crypto.config.key(),
-                                    &mut received.payload,
+                                    &mut payload,
                                 )
                             else {
                                 continue;
@@ -80,11 +81,11 @@ impl p::Client for Client {
                                 continue;
                             }
 
-                            received.payload.truncate(n);
+                            payload.truncate(n);
 
                             let _ = driver
                                 .tx
-                                .try_send(Packet { target: from_address(destination), payload: received.payload });
+                                .try_send(Packet { target: from_address(destination), payload: payload.into() });
                         }
                         packet = driver.rx.recv() => {
                             let Some(packet) = packet else { return Ok(()); };
@@ -111,7 +112,7 @@ impl p::Client for Client {
                             if matches!(
                                 transport.tx.try_send(Packet {
                                     target: endpoint.clone(),
-                                    payload: wire.to_vec(),
+                                    payload: wire.freeze(),
                                 }),
                                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
                             ) {

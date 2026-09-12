@@ -1,6 +1,9 @@
 //! Each connection owns its smoltcp state and timer. Applications exchange bytes
 //! through bounded Tokio buffers; no lock protects a protocol state machine.
-use crate::{device::Device, packet::Flow};
+use crate::{
+    device::{Device, Transmit},
+    packet::Flow,
+};
 use smoltcp::{
     iface::{Config, Interface, SocketSet},
     socket::tcp::{self, State},
@@ -125,7 +128,7 @@ pub(crate) struct Connection {
 pub(crate) fn connection(
     flow: Flow,
     mtu: usize,
-    output: mpsc::Sender<Vec<u8>>,
+    output: mpsc::Sender<Transmit>,
     stopping: tokio_util::sync::CancellationToken,
 ) -> Connection {
     let (packets, mut incoming) = mpsc::channel::<QueuedPacket>(32);
@@ -182,10 +185,19 @@ pub(crate) fn connection(
         let mut drop_seen = false;
         let mut turns = 0;
         let mut stop_seen = false;
+        let mut handshake_started = false;
         loop {
             let now = smoltcp::time::Instant::from_micros(epoch.elapsed().as_micros() as i64);
             iface.poll(now, &mut device, &mut sockets);
             let socket = sockets.get_mut::<tcp::Socket>(handle);
+            if socket.state() == State::SynReceived {
+                handshake_started = true;
+            }
+            // A smoltcp listener returns to Listen on an aborted handshake. This
+            // driver represents one connection, so that transition ends it.
+            if handshake_started && socket.state() == State::Listen {
+                socket.abort();
+            }
             if matches!(socket.state(), State::Established | State::CloseWait)
                 && let Some((tx, stream)) = admission.take()
                 && tx.send(stream).is_err()
@@ -197,7 +209,7 @@ pub(crate) fn connection(
             {
                 while let Some(packet) = device.outgoing.pop_front() {
                     output
-                        .send(packet)
+                        .send(Transmit::Packet(packet))
                         .await
                         .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
                 }
@@ -229,7 +241,7 @@ pub(crate) fn connection(
                     sockets.get_mut::<tcp::Socket>(handle).abort();
                 }
                 permit = output.reserve(), if !device.outgoing.is_empty() => {
-                    permit.map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?.send(device.outgoing.pop_front().unwrap());
+                    permit.map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?.send(Transmit::Packet(device.outgoing.pop_front().unwrap()));
                 }
                 packet = incoming.recv(), if device.incoming.is_none() && device.outgoing.len() < 32 => {
                     match packet { Some(packet) => device.incoming = Some(packet.bytes), None => return Err(reset_error()) }

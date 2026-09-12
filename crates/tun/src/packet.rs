@@ -72,7 +72,14 @@ struct FragmentKey {
     source: IpAddress,
     destination: IpAddress,
     id: u32,
-    protocol: IpProtocol,
+}
+
+#[derive(Clone, Copy)]
+struct Fragment {
+    id: u32,
+    offset: usize,
+    more: bool,
+    prefix_len: usize,
 }
 
 struct Assembly {
@@ -80,6 +87,7 @@ struct Assembly {
     ranges: smoltcp::storage::Assembler,
     data: Vec<u8>,
     protocol: IpProtocol,
+    prefix_len: usize,
     total: Option<usize>,
     poisoned: bool,
 }
@@ -114,7 +122,7 @@ impl Decoder {
                 let packet = Ipv4Packet::new_checked(data).ok()?;
                 let repr = Ipv4Repr::parse(&packet, &ChecksumCapabilities::default()).ok()?;
                 // Source routing is deliberately outside this unicast proxy's policy.
-                if !ipv4_options(&data[20..packet.header_len() as usize]) || data[6] & 0x80 != 0 {
+                if !ipv4_options(&data[20..packet.header_len() as usize]) {
                     return None;
                 }
                 let fragment = (packet.more_frags() || packet.frag_offset() != 0).then_some((
@@ -123,8 +131,7 @@ impl Decoder {
                     packet.more_frags(),
                 ));
                 if let Some((_, offset, more)) = fragment {
-                    if packet.dont_frag()
-                        || packet.payload().is_empty()
+                    if packet.payload().is_empty()
                         || offset + packet.payload().len() > 65515
                         || (more && !packet.payload().len().is_multiple_of(8))
                     {
@@ -148,14 +155,13 @@ impl Decoder {
         if !unicast(ip.src_addr()) || !unicast(ip.dst_addr()) || ip.hop_limit() == 0 {
             return None;
         }
-        let payload = if let Some((id, offset, more)) = fragment {
+        let payload = if let Some(fragment) = fragment {
             let key = FragmentKey {
                 source: ip.src_addr(),
                 destination: ip.dst_addr(),
-                id,
-                protocol: IpProtocol::Ipv6Frag,
+                id: fragment.id,
             };
-            self.reassemble(key, ip.next_header(), offset, more, payload, now)?
+            self.reassemble(key, ip.next_header(), fragment, payload, now)?
         } else {
             payload.to_vec()
         };
@@ -167,11 +173,16 @@ impl Decoder {
         &mut self,
         key: FragmentKey,
         protocol: IpProtocol,
-        offset: usize,
-        more: bool,
+        fragment: Fragment,
         data: &[u8],
         now: Instant,
     ) -> Option<Vec<u8>> {
+        let Fragment {
+            offset,
+            more,
+            prefix_len,
+            ..
+        } = fragment;
         self.expire(now);
         if !self.fragments.contains_key(&key) && self.fragments.len() >= MAX_DATAGRAMS {
             return None;
@@ -181,6 +192,7 @@ impl Decoder {
             ranges: smoltcp::storage::Assembler::new(),
             data: Vec::new(),
             protocol,
+            prefix_len,
             total: None,
             poisoned: false,
         });
@@ -189,7 +201,9 @@ impl Decoder {
         }
         let end = offset + data.len();
         if data.is_empty()
-            || end > 65535
+            || end > 65535 - prefix_len
+            || prefix_len != assembly.prefix_len
+            || (offset == 0 && !complete_transport_header(protocol, data))
             || protocol != assembly.protocol
             || (more && !data.len().is_multiple_of(8))
             || assembly
@@ -221,7 +235,7 @@ impl Decoder {
     }
 }
 
-fn unicast(address: IpAddress) -> bool {
+pub(crate) fn unicast(address: IpAddress) -> bool {
     match address {
         IpAddress::Ipv4(ip) => {
             !ip.is_unspecified()
@@ -257,12 +271,11 @@ fn ipv4_options(mut options: &[u8]) -> bool {
     true
 }
 
-type Fragment = Option<(u32, usize, bool)>;
-
 fn ipv6_extensions(
     mut protocol: IpProtocol,
     mut payload: &[u8],
-) -> Option<(IpProtocol, &[u8], Fragment)> {
+) -> Option<(IpProtocol, &[u8], Option<Fragment>)> {
+    let initial_len = payload.len();
     // A finite chain bounds CPU even for tiny extension headers. Unsupported
     // routing/security extensions are filtered before transport admission.
     for index in 0..8 {
@@ -287,9 +300,6 @@ fn ipv6_extensions(
                 let header = payload.get(..8)?;
                 let fragment = Ipv6FragmentHeader::new_checked(&header[2..]).ok()?;
                 let fragment = Ipv6FragmentRepr::parse(&fragment).ok()?;
-                if header[1] != 0 || header[3] & 6 != 0 {
-                    return None;
-                }
                 protocol = IpProtocol::from(header[0]);
                 // Require an upper-layer header directly after the fragment header.
                 if !matches!(
@@ -305,7 +315,12 @@ fn ipv6_extensions(
                 return Some((
                     protocol,
                     &payload[8..],
-                    (offset != 0 || more).then_some((id, offset, more)),
+                    (offset != 0 || more).then_some(Fragment {
+                        id,
+                        offset,
+                        more,
+                        prefix_len: initial_len - payload.len(),
+                    }),
                 ));
             }
             IpProtocol::Tcp | IpProtocol::Udp | IpProtocol::Icmpv6 => {
@@ -315,4 +330,14 @@ fn ipv6_extensions(
         }
     }
     None
+}
+
+// RFC 7112: the first IPv6 fragment must contain the complete transport header.
+// TCP options belong to that header; UDP/ICMP need their fixed eight bytes.
+fn complete_transport_header(protocol: IpProtocol, data: &[u8]) -> bool {
+    match protocol {
+        IpProtocol::Tcp => TcpPacket::new_checked(data).is_ok(),
+        IpProtocol::Udp | IpProtocol::Icmpv6 => data.len() >= 8,
+        _ => false,
+    }
 }

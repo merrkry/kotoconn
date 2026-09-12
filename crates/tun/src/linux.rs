@@ -58,25 +58,19 @@ pub fn bind(options: TunInboundConfig, context: ServerContext) -> Result<BoundTu
     let mut ipv4 = false;
     for address in options.addresses {
         ensure!(
-            !address.address.is_unspecified() && !address.address.is_multicast(),
+            crate::packet::unicast(address.address.into()),
             "TUN address must be unicast"
         );
         ensure!(addresses.insert(address.address), "duplicate TUN address");
         match address.address {
             IpAddr::V4(ip) => {
                 ensure!(!ipv4, "TUN supports one IPv4 interface address");
-                ensure!(
-                    address.prefix <= 32 && !ip.is_broadcast(),
-                    "invalid TUN IPv4 address or prefix"
-                );
+                ensure!(address.prefix <= 32, "invalid TUN IPv4 address or prefix");
                 ipv4 = true;
                 builder = builder.ipv4(ip, address.prefix, None);
             }
             IpAddr::V6(ip) => {
-                ensure!(
-                    address.prefix <= 128 && ip.to_ipv4_mapped().is_none(),
-                    "invalid TUN IPv6 address or prefix"
-                );
+                ensure!(address.prefix <= 128, "invalid TUN IPv6 address or prefix");
                 builder = builder.ipv6(ip, address.prefix);
             }
         }

@@ -2,7 +2,19 @@ use smoltcp::{
     phy::{self, DeviceCapabilities, Medium},
     time::Instant,
 };
-use std::collections::VecDeque;
+use std::{collections::VecDeque, net::SocketAddr};
+
+/// TCP already produced an IP packet. UDP is packetized by the endpoint so
+/// all associations share the same fragment identification state.
+#[derive(Debug)]
+pub(crate) enum Transmit {
+    Packet(Vec<u8>),
+    Datagram {
+        source: SocketAddr,
+        destination: SocketAddr,
+        payload: bytes::Bytes,
+    },
+}
 
 /// One ingress packet and bounded egress storage. The TCP driver waits for
 /// egress capacity before polling again when the device cannot transmit.

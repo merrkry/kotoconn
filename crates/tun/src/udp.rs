@@ -18,6 +18,7 @@ pub(crate) struct Encoder {
     sockets: SocketSet<'static>,
     raw: SocketHandle,
     mtu: usize,
+    ipv6_id: u32,
 }
 
 impl Encoder {
@@ -39,6 +40,7 @@ impl Encoder {
             sockets,
             raw,
             mtu,
+            ipv6_id: rand::random(),
         }
     }
 
@@ -106,7 +108,8 @@ impl Encoder {
             unreachable!()
         };
         let size = (self.mtu - 48) / 8 * 8;
-        let id = rand::random();
+        let id = self.ipv6_id;
+        self.ipv6_id = self.ipv6_id.wrapping_add(1);
         let chunks = packet.payload.chunks(size);
         let count = chunks.len();
         Some(
@@ -135,8 +138,6 @@ impl Encoder {
 pub(crate) fn reply_flow(flow: Flow, source: SocketAddr) -> Option<(SocketAddr, SocketAddr)> {
     // Outbound reply metadata selects the wire source. It must be usable in the
     // client's address family; a domain cannot be put into an IP header.
-    (source.is_ipv4() == flow.source.is_ipv4()
-        && !source.ip().is_unspecified()
-        && !source.ip().is_multicast())
-    .then_some((source, flow.source))
+    (source.is_ipv4() == flow.source.is_ipv4() && crate::packet::unicast(source.ip().into()))
+        .then_some((source, flow.source))
 }

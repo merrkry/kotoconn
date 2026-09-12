@@ -77,7 +77,7 @@ fn decoded(bytes: &[u8]) -> Packet {
 fn udp_roundtrips_empty_and_fragmented_datagrams_in_both_families() {
     for ipv6 in [false, true] {
         let flow = flow(ipv6);
-        for size in [0, 1, 1232, 4096, 65507] {
+        for size in [0, 1, 1232, 4096, if ipv6 { 65527 } else { 65507 }] {
             let payload: Vec<_> = (0..size).map(|i| (i % 251) as u8).collect();
             let mut encoder = udp::Encoder::new(1280);
             let mut packets = encoder
@@ -212,7 +212,7 @@ async fn accepted(
 ) -> (
     tcp::Stream,
     mpsc::Sender<tcp::QueuedPacket>,
-    mpsc::Receiver<Vec<u8>>,
+    mpsc::Receiver<device::Transmit>,
     tokio::task::JoinHandle<io::Result<()>>,
     i32,
 ) {
@@ -223,7 +223,7 @@ async fn accepted(
         .send(segment(flow(ipv6), 100, None, TcpControl::Syn, &[]))
         .await
         .unwrap();
-    let synack = decoded(&replies.recv().await.unwrap());
+    let synack = decoded(&replies.recv().await.unwrap().packet());
     let (_, repr) = synack.tcp().unwrap();
     assert_eq!(repr.control, TcpControl::Syn);
     assert_eq!(repr.ack_number, Some(TcpSeqNumber(101)));
@@ -268,7 +268,7 @@ async fn tcp_admits_without_application_io_and_preserves_half_close() {
         stream.shutdown().await.unwrap();
         let mut response = Vec::new();
         loop {
-            let packet = decoded(&replies.recv().await.unwrap());
+            let packet = decoded(&replies.recv().await.unwrap().packet());
             let (_, repr) = packet.tcp().unwrap();
             response.extend_from_slice(repr.payload);
             let fin = repr.control == TcpControl::Fin;
@@ -293,7 +293,7 @@ async fn tcp_drop_aborts_and_remote_reset_is_an_io_error() {
     drop(stream);
     let mut reset = false;
     while let Some(packet) = replies.recv().await {
-        reset |= decoded(&packet).tcp().unwrap().1.control == TcpControl::Rst;
+        reset |= decoded(&packet.packet()).tcp().unwrap().1.control == TcpControl::Rst;
     }
     assert!(reset);
     assert_eq!(
@@ -330,8 +330,8 @@ async fn tcp_retransmits_without_caller_polling_and_cancelled_admission_releases
         .send(segment(flow(false), 100, None, TcpControl::Syn, &[]))
         .await
         .unwrap();
-    let first = decoded(&replies.recv().await.unwrap());
-    let second = decoded(&replies.recv().await.unwrap());
+    let first = decoded(&replies.recv().await.unwrap().packet());
+    let second = decoded(&replies.recv().await.unwrap().packet());
     assert_eq!(first.payload, second.payload);
     drop(conn.accepted);
     assert_eq!(
@@ -362,5 +362,174 @@ fn udp_zero_checksum_is_only_valid_for_ipv4_and_source_port_may_be_omitted() {
         assert_eq!(decoded(&bytes).udp().unwrap().0.source.port(), 0);
         UdpPacket::new_unchecked(&mut bytes[offset..]).set_checksum(0);
         assert_eq!(decoded(&bytes).udp().is_some(), !ipv6);
+    }
+}
+
+impl device::Transmit {
+    fn packet(self) -> Vec<u8> {
+        match self {
+            Self::Packet(packet) => packet,
+            Self::Datagram { .. } => panic!("expected TCP packet"),
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn reset_during_handshake_releases_state_without_waiting_for_a_timeout() {
+    let (output, mut replies) = mpsc::channel(128);
+    let conn = tcp::connection(flow(false), 1280, output, CancellationToken::new());
+    let driver = tokio::spawn(conn.driver);
+    conn.packets
+        .send(segment(flow(false), 100, None, TcpControl::Syn, &[]))
+        .await
+        .unwrap();
+    let synack = decoded(&replies.recv().await.unwrap().packet());
+    let seq = (synack.tcp().unwrap().1.seq_number + 1).0;
+    let before = Instant::now();
+    conn.packets
+        .send(segment(flow(false), 101, Some(seq), TcpControl::Rst, &[]))
+        .await
+        .unwrap();
+    assert!(conn.accepted.await.is_err());
+    assert!(driver.await.unwrap().is_err());
+    assert_eq!(Instant::now(), before);
+    assert!(
+        replies.try_recv().is_err(),
+        "RST must not elicit another RST"
+    );
+}
+
+fn ipv6_fragment(
+    bytes: &[u8],
+    protocol: IpProtocol,
+    offset: usize,
+    more: bool,
+    id: u32,
+) -> Vec<u8> {
+    let flow = flow(true);
+    let repr = Ipv6Repr {
+        src_addr: match flow.source.ip() {
+            std::net::IpAddr::V6(ip) => ip,
+            _ => unreachable!(),
+        },
+        dst_addr: match flow.destination.ip() {
+            std::net::IpAddr::V6(ip) => ip,
+            _ => unreachable!(),
+        },
+        next_header: IpProtocol::Ipv6Frag,
+        payload_len: bytes.len() + 8,
+        hop_limit: 64,
+    };
+    let mut packet = vec![0; 48 + bytes.len()];
+    repr.emit(&mut Ipv6Packet::new_unchecked(&mut packet));
+    packet[40] = u8::from(protocol);
+    Ipv6FragmentRepr {
+        frag_offset: (offset / 8) as u16,
+        more_frags: more,
+        ident: id,
+    }
+    .emit(&mut Ipv6FragmentHeader::new_unchecked(&mut packet[42..48]));
+    packet[48..].copy_from_slice(bytes);
+    packet
+}
+
+#[test]
+fn ipv6_first_fragment_requires_the_complete_tcp_header_and_reserved_bits_are_ignored() {
+    let syn = segment(flow(true), 100, None, TcpControl::Syn, &[]);
+    let tcp = &syn.bytes[40..];
+    let mut decoder = Decoder::default();
+    let now = Instant::now();
+    assert!(
+        decoder
+            .decode(&ipv6_fragment(&tcp[..8], IpProtocol::Tcp, 0, true, 1), now)
+            .is_none()
+    );
+    assert!(
+        decoder
+            .decode(&ipv6_fragment(&tcp[8..], IpProtocol::Tcp, 8, false, 1), now)
+            .is_none()
+    );
+    let mut atomic = ipv6_fragment(tcp, IpProtocol::Tcp, 0, false, 2);
+    atomic[41] = 0xff;
+    atomic[43] |= 6;
+    assert!(decoder.decode(&atomic, now).unwrap().tcp().is_some());
+}
+
+#[test]
+fn ipv6_reassembly_capacity_expires_and_malformed_input_does_not_panic() {
+    let mut decoder = Decoder::default();
+    let now = Instant::now();
+    for id in 0..64 {
+        assert!(
+            decoder
+                .decode(&ipv6_fragment(&[0; 8], IpProtocol::Udp, 0, true, id), now)
+                .is_none()
+        );
+    }
+    let first = ipv6_fragment(&[0; 8], IpProtocol::Udp, 0, true, 64);
+    let last = ipv6_fragment(&[0; 8], IpProtocol::Udp, 8, false, 64);
+    assert!(decoder.decode(&first, now).is_none());
+    assert!(decoder.decode(&last, now).is_none());
+    decoder.expire(now + Duration::from_secs(60));
+    assert!(
+        decoder
+            .decode(&first, now + Duration::from_secs(60))
+            .is_none()
+    );
+    assert!(
+        decoder
+            .decode(&last, now + Duration::from_secs(60))
+            .is_some()
+    );
+    // Exercise all lengths and version nibbles with a reproducible corpus.
+    for length in 0..512 {
+        for version in 0..16 {
+            let mut bytes: Vec<u8> = (0..length).map(|i| (i * 31 + length) as u8).collect();
+            if let Some(first) = bytes.first_mut() {
+                *first = version << 4 | (*first & 15);
+            }
+            if let Some(packet) = decoder.decode(&bytes, now + Duration::from_secs(60)) {
+                match packet.ip.next_header() {
+                    IpProtocol::Tcp => {
+                        let _ = packet.tcp();
+                    }
+                    IpProtocol::Udp => {
+                        let _ = packet.udp();
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn ipv4_reassembly_accounts_for_options_in_the_original_size_limit() {
+    let flow = flow(false);
+    for size in [4096, 65507] {
+        let mut packets = udp::Encoder::new(1280)
+            .encode(flow.source, flow.destination, &vec![7; size])
+            .unwrap();
+        packets[0].splice(20..20, [1, 1, 1, 1]);
+        let len = packets[0].len();
+        let mut first = Ipv4Packet::new_unchecked(&mut packets[0]);
+        first.set_header_len(24);
+        first.set_total_len(len as u16);
+        first.fill_checksum();
+        for reverse in [false, true] {
+            let mut decoder = Decoder::default();
+            let now = Instant::now();
+            let mut complete = None;
+            if reverse {
+                packets.reverse();
+            }
+            for packet in &packets {
+                complete = decoder.decode(packet, now).or(complete);
+            }
+            assert_eq!(complete.is_some(), size == 4096);
+            if let Some(packet) = complete {
+                assert_eq!(packet.udp().unwrap().1, vec![7; size]);
+            }
+        }
     }
 }

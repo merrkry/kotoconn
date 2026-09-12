@@ -12,6 +12,7 @@ use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 
 mod network;
 mod source;
+pub use kotoconn_inbounds::InboundAddress;
 pub use network::{SessionHandle, SessionId};
 
 // Bound both queued and executing calls. Awaiting admission provides backpressure.
@@ -208,9 +209,7 @@ impl Daemon {
     }
 
     /// Bound socket addresses and TUN interface names, indexed by inbound.
-    pub fn inbound_addresses(
-        &self,
-    ) -> &std::collections::HashMap<InboundId, kotoconn_inbounds::InboundAddress> {
+    pub fn inbound_addresses(&self) -> &std::collections::HashMap<InboundId, InboundAddress> {
         &self.network.inbound_addresses
     }
 
