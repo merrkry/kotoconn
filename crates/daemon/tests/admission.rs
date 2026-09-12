@@ -37,22 +37,22 @@ async fn inbound_admission_allows_inspection_and_preserves_domain_target() -> Re
         let scope = Scope::new();
         let stopping = CancellationToken::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let (address, server) =
-            kotoconn_inbounds::build(kotoconn_config::InboundImpl::Http(HttpInboundConfig {
+        let bound = kotoconn_inbounds::bind(
+            kotoconn_config::InboundImpl::Http(HttpInboundConfig {
                 listen: "127.0.0.1:0".parse()?,
-            }))?;
-        let bound = server
-            .bind(
-                address,
-                ServerContext {
-                    handler: Arc::new(Inspect(tx)),
-                    scope: scope.clone(),
-                    stopping,
-                    udp_idle_timeout: Duration::from_secs(30),
-                },
-            )
-            .await?;
-        let address = target(bound.local_addr);
+            }),
+            ServerContext {
+                handler: Arc::new(Inspect(tx)),
+                scope: scope.clone(),
+                stopping,
+                udp_idle_timeout: Duration::from_secs(30),
+            },
+        )
+        .await?;
+        let kotoconn_inbounds::InboundAddress::Socket(address) = bound.address else {
+            panic!("HTTP must bind a socket");
+        };
+        let address = target(address);
         scope.spawn(bound.run)?;
         let client = Clients::new(
             kotoconn_config::OutboundImpl::Http(kotoconn_config::HttpOutboundConfig {

@@ -207,6 +207,13 @@ impl Daemon {
         &self.network.addresses
     }
 
+    /// Bound socket addresses and TUN interface names, indexed by inbound.
+    pub fn inbound_addresses(
+        &self,
+    ) -> &std::collections::HashMap<InboundId, kotoconn_inbounds::InboundAddress> {
+        &self.network.inbound_addresses
+    }
+
     pub async fn sessions(&self) -> anyhow::Result<Vec<SessionHandle>> {
         self.network.sessions.list().await
     }

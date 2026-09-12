@@ -3,12 +3,33 @@ mod direct;
 use anyhow::Result;
 use kotoconn_config::InboundImpl;
 pub use kotoconn_http as http;
-use kotoconn_protocol::Server;
+use kotoconn_protocol::{Server, ServerContext};
 pub use kotoconn_shadowsocks2022 as shadowsocks2022;
 pub use kotoconn_socks5 as socks5;
 use std::{net::SocketAddr, sync::Arc};
 
-pub fn build(config: InboundImpl) -> Result<(SocketAddr, Arc<dyn Server>)> {
+/// A bound inbound need not be an IP listener.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InboundAddress {
+    Socket(SocketAddr),
+    Tun(String),
+}
+
+pub struct BoundInbound {
+    pub address: InboundAddress,
+    pub run: futures_util::future::BoxFuture<'static, Result<()>>,
+}
+
+pub async fn bind(config: InboundImpl, context: ServerContext) -> Result<BoundInbound> {
+    let (address, server) = build(config)?;
+    let bound = server.bind(address, context).await?;
+    Ok(BoundInbound {
+        address: InboundAddress::Socket(bound.local_addr),
+        run: bound.run,
+    })
+}
+
+fn build(config: InboundImpl) -> Result<(SocketAddr, Arc<dyn Server>)> {
     Ok(match config {
         InboundImpl::Http(options) => (options.listen, Arc::new(http::Server)),
         InboundImpl::Socks5(options) => (options.listen, Arc::new(socks5::Server)),
