@@ -1,0 +1,20 @@
+[package]
+name = "kotoconn-tun"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+futures-util.workspace = true
+kotoconn-protocol.workspace = true
+rand.workspace = true
+smoltcp.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+tokio-util.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tun-rs.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
