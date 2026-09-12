@@ -11,5 +11,8 @@ mod udp;
 mod endpoint;
 pub use endpoint::{PacketIo, run};
 
+mod linux;
+pub use linux::{BoundTun, bind};
+
 #[cfg(test)]
 mod tests;

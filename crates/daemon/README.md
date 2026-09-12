@@ -6,11 +6,11 @@ Run the example from the repository root:
 cargo run -p kotoconn-cli -- run --config packages/api/examples/policy.ts
 ```
 
-`Daemon::start(path, shutdown_timeout)` reads the policy and its imports, evaluates it, and seals registration. CLI only supplies the path. `start_with_sources` accepts an independent source provider for embedding and tests. All configured listeners bind before startup returns. The example opens HTTP CONNECT, SOCKS5 and Shadowsocks 2022 listeners. `listen_addresses()` reports actual addresses, including OS-assigned ports.
+`Daemon::start(path, shutdown_timeout)` reads the policy and its imports, evaluates it, and seals registration. CLI only supplies the path. `start_with_sources` accepts an independent source provider for embedding and tests. All configured listeners bind before startup returns. The example opens HTTP CONNECT, SOCKS5 and Shadowsocks 2022 listeners. `listen_addresses()` reports actual socket addresses, including OS-assigned ports. `inbound_addresses()` also reports TUN interface names. See the [Linux TUN inbound](../tun/README.md) for configuration and routing.
 
 Native components call handlers through the cloneable `daemon.policy()` handle. Its methods use shared references, and configuration access returns an immutable startup snapshot. One dedicated thread polls the JS handler futures; native work runs on Tokio's multi-thread runtime. See [the threading decision](../../docs/adr/0003-single-thread-policy-and-shared-handles.md).
 
-Ctrl+C and Unix SIGTERM stop admission. Accepted calls, pending native promises and TCP sessions drain until `--shutdown-timeout` expires, then remaining work is cancelled and running JS is interrupted. Expiry makes the CLI exit with an error. `Daemon::shutdown(&self)` is idempotent; dropping the owner requests immediate cancellation.
+Ctrl+C and Unix SIGTERM stop admission. Accepted calls, pending native promises and TCP sessions drain until `--shutdown-timeout` expires, then remaining work is cancelled and running JS is interrupted. Expiry makes the CLI exit with an error. `Daemon::stop()` requests shutdown synchronously; `wait()` observes completion. `shutdown(&self)` combines both and is idempotent; dropping the owner requests immediate cancellation.
 
 Cancelling a lookup stops waiting for its result; an OS resolver call may continue in Tokio's blocking pool. After daemon cleanup, CLI shuts down the runtime without waiting for such calls.
 

@@ -346,3 +346,21 @@ impl std::ops::Deref for tcp::QueuedPacket {
         &self.bytes
     }
 }
+
+#[test]
+fn udp_zero_checksum_is_only_valid_for_ipv4_and_source_port_may_be_omitted() {
+    for ipv6 in [false, true] {
+        let flow = flow(ipv6);
+        let mut bytes = udp::Encoder::new(1280)
+            .encode(flow.source, flow.destination, b"test")
+            .unwrap()
+            .remove(0);
+        let offset = if ipv6 { 40 } else { 20 };
+        let mut udp = UdpPacket::new_unchecked(&mut bytes[offset..]);
+        udp.set_src_port(0);
+        udp.fill_checksum(&flow.source.ip().into(), &flow.destination.ip().into());
+        assert_eq!(decoded(&bytes).udp().unwrap().0.source.port(), 0);
+        UdpPacket::new_unchecked(&mut bytes[offset..]).set_checksum(0);
+        assert_eq!(decoded(&bytes).udp().is_some(), !ipv6);
+    }
+}

@@ -40,6 +40,11 @@ impl Packet {
 
     pub fn udp(&self) -> Option<(Flow, &[u8])> {
         let packet = UdpPacket::new_checked(&self.payload[..]).ok()?;
+        // smoltcp 0.14's verify_checksum accepts zero for both address families.
+        // RFC 8200 section 8.1 forbids it for ordinary UDP over IPv6.
+        if matches!(self.ip, IpRepr::Ipv6(_)) && packet.checksum() == 0 {
+            return None;
+        }
         UdpRepr::parse(
             &packet,
             &self.ip.src_addr(),

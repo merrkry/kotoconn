@@ -21,16 +21,7 @@ pub struct BoundInbound {
 }
 
 pub async fn bind(config: InboundImpl, context: ServerContext) -> Result<BoundInbound> {
-    let (address, server) = build(config)?;
-    let bound = server.bind(address, context).await?;
-    Ok(BoundInbound {
-        address: InboundAddress::Socket(bound.local_addr),
-        run: bound.run,
-    })
-}
-
-fn build(config: InboundImpl) -> Result<(SocketAddr, Arc<dyn Server>)> {
-    Ok(match config {
+    let (address, server): (SocketAddr, Arc<dyn Server>) = match config {
         InboundImpl::Http(options) => (options.listen, Arc::new(http::Server)),
         InboundImpl::Socks5(options) => (options.listen, Arc::new(socks5::Server)),
         InboundImpl::Shadowsocks2022(options) => (
@@ -38,5 +29,17 @@ fn build(config: InboundImpl) -> Result<(SocketAddr, Arc<dyn Server>)> {
             Arc::new(shadowsocks2022::Server::new(&options.password)?),
         ),
         InboundImpl::Direct(options) => (options.listen, Arc::new(direct::Server(options.target))),
+        InboundImpl::Tun(options) => {
+            let bound = kotoconn_tun::bind(options, context)?;
+            return Ok(BoundInbound {
+                address: InboundAddress::Tun(bound.name),
+                run: bound.run,
+            });
+        }
+    };
+    let bound = server.bind(address, context).await?;
+    Ok(BoundInbound {
+        address: InboundAddress::Socket(bound.local_addr),
+        run: bound.run,
     })
 }

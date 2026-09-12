@@ -1455,6 +1455,7 @@ dependencies = [
  "kotoconn-protocol",
  "kotoconn-shadowsocks2022",
  "kotoconn-socks5",
+ "kotoconn-tun",
  "tokio",
  "tokio-util",
 ]
@@ -1538,8 +1539,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures-util",
+ "kotoconn-config",
  "kotoconn-protocol",
  "rand 0.9.5",
+ "rustix",
  "smoltcp",
  "tokio",
  "tokio-util",

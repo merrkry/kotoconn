@@ -11,6 +11,7 @@ publish = false
 kotoconn-tun = { path = "crates/tun" }
 smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-tcp-cubic", "socket-raw", "proto-ipv4-fragmentation", "reassembly-buffer-count-16", "assembler-max-segment-count-32", "fragmentation-buffer-size-65536"] }
 tun-rs = { version = "2.8.9", features = ["async_tokio"] }
+rustix = { version = "1", features = ["net"] }
 kotoconn-protocol = { path = "crates/protocol" }
 kotoconn-inbounds = { path = "crates/inbounds" }
 kotoconn-outbounds = { path = "crates/outbounds" }

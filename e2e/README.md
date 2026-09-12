@@ -25,3 +25,16 @@ in those logs to identify leftover Compose resources.
 
 When changing coverage, see [run.py](run.py) for scenarios and
 [traffic.py](traffic.py) for traffic assertions and sing-box limitations.
+
+Linux TUN tests run the real CLI against the kernel TCP/IP stack in a separate
+network namespace. They cover IPv4/IPv6, fragmented UDP, concurrent TCP, half-close,
+server-first traffic, malformed packets and device cleanup on shutdown:
+
+```sh
+cargo build -p kotoconn-cli
+python3 e2e/tun.py
+```
+
+This suite needs `unshare`, `iproute2`, and either unprivileged user namespaces or
+root. It does not change the parent network namespace. See
+[the TUN documentation](../crates/tun/README.md) for its supported protocol scope.

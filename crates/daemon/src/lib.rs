@@ -233,9 +233,14 @@ impl Daemon {
         &self.policy
     }
 
+    /// Request admission shutdown without waiting for accepted sessions to drain.
+    pub fn stop(&self) {
+        self.policy.stopping.cancel();
+    }
+
     /// Idempotent; cancellation of this future does not cancel the shutdown request.
     pub async fn shutdown(&self) -> Result<Shutdown, Error> {
-        self.policy.stopping.cancel();
+        self.stop();
         self.wait().await
     }
 

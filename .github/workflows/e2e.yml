@@ -34,6 +34,13 @@ jobs:
           cache-to: type=gha,scope=kotoconn-e2e,mode=max
       - name: Run E2E suites
         run: python3 e2e/run.py
+      - name: Run Linux TUN E2E suite
+        run: |
+          mkdir -p target/e2e/tun
+          tun_container=$(docker create kotoconn-e2e:local)
+          trap 'docker rm -f "$tun_container"' EXIT
+          docker cp "$tun_container:/usr/local/bin/kotoconn" target/e2e/kotoconn
+          sudo python3 e2e/tun.py --binary target/e2e/kotoconn --output target/e2e/tun
       - uses: actions/upload-artifact@v4
         # Upload diagnostic logs even if tests fail or the run is cancelled.
         if: always()

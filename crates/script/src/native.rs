@@ -93,7 +93,7 @@ impl Target {
 }
 
 // QuickJS integer conversions truncate, so validate configuration numbers first.
-#[duplicate::duplicate_item(Wrapper Native; [Port] [u16]; [Milliseconds] [u32]; [Byte] [u8];)]
+#[duplicate::duplicate_item(Wrapper Native; [Port] [u16]; [Milliseconds] [u32]; [Byte] [u8]; [Mtu] [u16];)]
 mod checked_number {
     use super::*;
 
@@ -121,6 +121,7 @@ mod checked_number {
 
 pub(crate) use checked_number_byte::Byte;
 pub(crate) use checked_number_milliseconds::Milliseconds;
+pub(crate) use checked_number_mtu::Mtu;
 pub(crate) use checked_number_port::Port;
 
 pub(crate) fn invalid(message: impl Into<String>) -> rquickjs::Error {

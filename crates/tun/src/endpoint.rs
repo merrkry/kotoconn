@@ -141,7 +141,6 @@ async fn dispatch<D: PacketIo>(
             }
             len = poll_fn(|cx| device.poll_recv(cx, &mut buffer)) => {
                 let len = len?;
-                ensure!(len != 0, "TUN device closed");
                 let Some(packet) = decoder.decode(&buffer[..len], Instant::now()) else { continue; };
                 match packet.ip.next_header() {
                     IpProtocol::Tcp => {
@@ -238,15 +237,13 @@ async fn udp_replies(
         let Some(packets) = encoder.encode(source, destination, &packet.payload) else {
             continue;
         };
-        let mut sent = false;
-        for packet in packets {
-            if output.try_send(packet).is_ok() {
-                sent = true;
-            }
+        // This wait belongs to one association, not shared ingress. Reserve a
+        // whole datagram so a busy TCP flow cannot drop only its later fragments.
+        let permits = output.reserve_many(packets.len()).await?;
+        for (permit, packet) in permits.zip(packets) {
+            permit.send(packet);
         }
-        if sent {
-            activity.send_replace(Instant::now());
-        }
+        activity.send_replace(Instant::now());
     }
     Ok(())
 }
@@ -258,5 +255,54 @@ async fn until_idle(mut activity: watch::Receiver<Instant>, idle: std::time::Dur
             _ = tokio::time::sleep_until(deadline) => return,
             result = activity.changed() => { if result.is_err() { return; } },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn fragmented_udp_reply_waits_for_capacity_without_losing_fragments() {
+        let flow = Flow {
+            source: "[fd00::2]:12345".parse().unwrap(),
+            destination: "[2001:db8::1]:443".parse().unwrap(),
+        };
+        let (output, mut packets) = mpsc::channel(3);
+        output.send(vec![99]).await.unwrap();
+        let scope = Scope::new();
+        let (association, driver) = p::packet_pair(scope);
+        let (activity, clock) = watch::channel(Instant::now());
+        association
+            .tx
+            .send(p::Packet {
+                target: p::target(flow.destination),
+                payload: vec![7; 2500],
+            })
+            .await
+            .unwrap();
+        let replies = udp_replies(flow, driver, output, 1280, activity);
+        tokio::pin!(replies);
+        tokio::select! {
+            biased;
+            result = &mut replies => panic!("reply worker ended: {result:?}"),
+            _ = std::future::ready(()) => {},
+        }
+        assert!(!clock.has_changed().unwrap());
+        assert_eq!(packets.try_recv().unwrap(), vec![99]);
+        tokio::select! {
+            biased;
+            result = &mut replies => panic!("reply worker ended: {result:?}"),
+            _ = std::future::ready(()) => {},
+        }
+        let mut decoder = Decoder::default();
+        let mut completed = None;
+        for _ in 0..3 {
+            completed = decoder
+                .decode(&packets.try_recv().unwrap(), Instant::now())
+                .or(completed);
+        }
+        assert_eq!(completed.unwrap().udp().unwrap().1, vec![7; 2500]);
+        assert!(clock.has_changed().unwrap());
     }
 }
