@@ -13,6 +13,9 @@ ts-rs.workspace = true
 structural-convert.workspace = true
 duplicate.workspace = true
 derive_more.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
 
 [dev-dependencies]
 trybuild.workspace = true
+hickory-proto.workspace = true

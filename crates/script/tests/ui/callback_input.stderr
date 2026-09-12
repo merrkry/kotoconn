@@ -6,11 +6,18 @@ error[E0308]: mismatched types
   |                      |
   |                      arguments to this method are incorrect
   |
+help: the return type of this call is `bool` due to the type of the argument passed
+ --> tests/ui/callback_input.rs:5:13
+  |
+5 |     let _ = callback.call(true);
+  |             ^^^^^^^^^^^^^^----^
+  |                           |
+  |                           this argument influences the return type of `call`
 note: method defined here
  --> tests/ui/../../src/handler.rs
   |
-  |     pub fn call(self, input: Input) -> Result<Output> {
-  |            ^^^^       ------------
+  |     pub async fn call(self, input: Input) -> Result<Output> {
+  |                  ^^^^       ------------
 help: try using a conversion method
   |
 5 |     let _ = callback.call(true.to_string());

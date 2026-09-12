@@ -141,9 +141,43 @@ mod tests {
                 ctx.eval::<Milliseconds, _>("4294967295").unwrap().0,
                 u32::MAX
             );
+            assert!(ctx.eval::<Byte, _>("256").is_err());
+            assert!(ctx.eval::<Milliseconds, _>("4294967296").is_err());
             for source in ["-1", "1.5", "65536", "NaN", "Infinity", "'80'", "null"] {
                 assert!(ctx.eval::<Port, _>(source).is_err(), "{source}");
             }
+        });
+    }
+
+    #[test]
+    fn native_ip_and_target_views_preserve_identity_and_readonly_properties() {
+        let runtime = Runtime::new().unwrap();
+        let context = Context::full(&runtime).unwrap();
+        context.with(|ctx| {
+            let ipv4: config::IpAddr = "127.0.0.1".parse().unwrap();
+            let ipv6: config::IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+            ctx.globals().set("ipv4", IpAddr::from(ipv4)).unwrap();
+            ctx.globals().set("same", IpAddr::from(ipv4)).unwrap();
+            ctx.globals().set("ipv6", IpAddr::from(ipv6)).unwrap();
+            ctx.globals().set("domain", Target::from(config::Target::Domain {
+                name: "test.invalid".into(), port: 443,
+            })).unwrap();
+            ctx.globals().set("target", Target::from(config::Target::Ip {
+                address: ipv6, port: 53,
+            })).unwrap();
+            ctx.eval::<(), _>(r#"
+                'use strict';
+                if (ipv4.version !== 4 || ipv6.version !== 6) throw Error('family');
+                if (!ipv4.equals(same) || ipv4.equals(ipv6)) throw Error('identity');
+                if (ipv4.toString() !== '127.0.0.1') throw Error('display');
+                if (domain.domain !== 'test.invalid' || domain.ip !== undefined || domain.port !== 443) throw Error('domain');
+                if (target.domain !== undefined || !target.ip.equals(ipv6) || target.port !== 53) throw Error('target');
+                for (const [value, key] of [[ipv4, 'version'], [target, 'port']]) {
+                    let rejected = false;
+                    try { value[key] = 0; } catch { rejected = true; }
+                    if (!rejected) throw Error('writable native property');
+                }
+            "#).unwrap();
         });
     }
 }

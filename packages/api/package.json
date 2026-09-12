@@ -10,7 +10,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc -p examples/tsconfig.json"
   },
   "dependencies": {
     "@kotoconn/bindings": "workspace:*"

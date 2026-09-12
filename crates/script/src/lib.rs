@@ -6,10 +6,13 @@ mod handler;
 mod host;
 mod loader;
 mod native;
+mod task;
 mod types;
 
+pub use loader::ModuleSource;
+
 use kotoconn_config::*;
-use rquickjs::{CatchResultExt, Context, Function, Module, Runtime};
+use rquickjs::{AsyncContext, AsyncRuntime, CatchResultExt, Function, Module};
 use std::{collections::HashMap, num::NonZeroU64};
 
 #[derive(Debug, thiserror::Error)]
@@ -17,79 +20,120 @@ use std::{collections::HashMap, num::NonZeroU64};
 pub struct Error(String);
 
 /// A loaded policy and its JS functions. This runtime stays on its owning thread.
-/// Promises may use the QuickJS job queue; native asynchronous I/O is not installed.
+/// All access must be polled on that thread; the daemon supplies the Send + Sync handle.
 pub struct Script {
     // Context and its traced host/functions must be freed before the runtime.
-    context: Context,
-    _runtime: Runtime,
+    context: AsyncContext,
+    runtime: AsyncRuntime,
 }
 
 impl Script {
     /// Load an entry module and its dependencies from explicit, relative module names.
     /// Configuration registration closes when top-level evaluation finishes.
-    pub fn load(entry: &str, sources: HashMap<String, String>) -> Result<Self, Error> {
-        let runtime = Runtime::new().map_err(js_error)?;
-        runtime.set_loader(loader::Resolver, loader::Loader(sources));
-        let context = Context::full(&runtime).map_err(js_error)?;
+    pub async fn load(entry: &str, sources: HashMap<String, String>) -> Result<Self, Error> {
+        Self::load_with_interrupt(entry, sources, || false).await
+    }
 
-        context.with(|ctx| {
-            (|| {
-                let module =
-                    Module::declare_def::<loader::Native, _>(ctx.clone(), loader::MODULE_NAME)?;
-                module.eval()?.1.finish::<()>()?;
-                Module::import(&ctx, entry)?.finish::<()>()?;
-                loader::host(&ctx)?.borrow_mut().seal();
-                Ok::<_, rquickjs::Error>(())
-            })()
-            .catch(&ctx)
+    /// Interrupts must be signalled from outside the JS thread, including during startup.
+    /// The callback must not block or enter QuickJS.
+    pub async fn load_with_interrupt(
+        entry: &str,
+        sources: impl ModuleSource + 'static,
+        interrupt: impl FnMut() -> bool + 'static,
+    ) -> Result<Self, Error> {
+        let runtime = AsyncRuntime::new().map_err(js_error)?;
+        runtime
+            .set_interrupt_handler(Some(Box::new(interrupt)))
+            .await;
+        runtime
+            .set_loader(loader::Resolver, loader::Loader(sources))
+            .await;
+        let context = AsyncContext::full(&runtime).await.map_err(js_error)?;
+
+        context
+            .async_with(async |ctx| {
+                (async {
+                    let module =
+                        Module::declare_def::<loader::Native, _>(ctx.clone(), loader::MODULE_NAME)?;
+                    module.eval()?.1.into_future::<()>().await?;
+                    Module::import(&ctx, entry)?.into_future::<()>().await?;
+                    loader::host(&ctx)?.borrow().seal();
+                    Ok::<_, rquickjs::Error>(())
+                })
+                .await
+                .catch(&ctx)
+                .map_err(js_error)
+            })
+            .await?;
+
+        Ok(Self { context, runtime })
+    }
+
+    pub async fn config(&self) -> Result<Config, Error> {
+        self.context
+            .with(|ctx| {
+                Ok::<_, rquickjs::Error>(loader::host(&ctx)?.borrow().config.borrow().clone())
+            })
+            .await
             .map_err(js_error)
-        })?;
-
-        Ok(Self {
-            context,
-            _runtime: runtime,
-        })
     }
 
-    pub fn config(&self) -> Result<Config, Error> {
-        self.with(|ctx| Ok(loader::host(ctx)?.borrow().config.clone()))
-    }
-
-    pub fn route(&self, id: RoutingHandlerId, flow: Flow) -> Result<RouteDecision, Error> {
-        self.with(|ctx| {
-            let function = get(&loader::host(ctx)?.borrow().routing, id.0)?;
+    pub async fn route(&self, id: RoutingHandlerId, flow: Flow) -> Result<RouteDecision, Error> {
+        self.with(async |ctx| {
+            let function = get(&loader::host(&ctx)?.borrow().routing.borrow(), id.0)?;
             Ok(host::RoutingHandler::new(function)
-                .call(data::Flow::from(flow))?
+                .call(data::Flow::from(flow))
+                .await?
                 .value)
         })
+        .await
     }
 
-    pub fn resolve(&self, id: ResolveHandlerId, name: &str) -> Result<Vec<IpAddr>, Error> {
-        self.with(|ctx| {
-            let function = get(&loader::host(ctx)?.borrow().resolving, id.0)?;
+    pub async fn resolve(&self, id: ResolveHandlerId, name: &str) -> Result<Vec<IpAddr>, Error> {
+        self.with(async |ctx| {
+            let function = get(&loader::host(&ctx)?.borrow().resolving.borrow(), id.0)?;
             Ok(host::ResolveHandler::new(function)
-                .call(name.to_owned())?
+                .call(name.to_owned())
+                .await?
                 .into_iter()
                 .map(Into::into)
                 .collect())
         })
+        .await
     }
 
-    pub fn dns(&self, id: DnsHandlerId, request: DnsRequest) -> Result<DnsHandlerResult, Error> {
-        self.with(|ctx| {
-            let function = get(&loader::host(ctx)?.borrow().dns, id.0)?;
+    pub async fn dns(
+        &self,
+        id: DnsHandlerId,
+        request: DnsRequest,
+    ) -> Result<DnsHandlerResult, Error> {
+        self.with(async |ctx| {
+            let function = get(&loader::host(&ctx)?.borrow().dns.borrow(), id.0)?;
             Ok(host::DnsHandler::new(function)
-                .call(native::Request::from(request))?
+                .call(native::Request::from(request))
+                .await?
                 .value)
         })
+        .await
     }
 
-    fn with<T>(
+    async fn with<T: 'static>(
         &self,
-        f: impl for<'js> FnOnce(&rquickjs::Ctx<'js>) -> rquickjs::Result<T>,
+        f: impl for<'js> AsyncFnOnce(rquickjs::Ctx<'js>) -> rquickjs::Result<T>,
     ) -> Result<T, Error> {
         self.context
-            .with(|ctx| f(&ctx).catch(&ctx).map_err(js_error))
+            .async_with(async |ctx| f(ctx.clone()).await.catch(&ctx).map_err(js_error))
+            .await
+    }
+
+    /// Drive native futures started by JS even when no handler call is waiting.
+    pub async fn idle(&self) {
+        self.runtime.idle().await;
+    }
+
+    /// Continuously drive detached JS promises while the daemon waits for requests.
+    pub async fn drive(&self) {
+        self.runtime.drive().await;
     }
 }
 
@@ -109,3 +153,7 @@ fn js_error(error: impl std::fmt::Display) -> Error {
 pub fn typescript_declarations() -> String {
     types::declarations()
 }
+
+#[cfg(test)]
+#[path = "tests/runtime.rs"]
+mod tests;

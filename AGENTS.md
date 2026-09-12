@@ -2,6 +2,10 @@
 
 Kotoconn is a programmable proxy.
 
+## Correctness
+
+Time limits are allowed only when interacting with external systems, such as subprocesses, OS I/O, or user code. Fixed delays or timeout lengths must not express ordering dependencies. Use explicit synchronization or observable completion instead, so code and tests remain correct under parallel execution and varying scheduling speeds.
+
 ## Dependencies
 
 Don't make re-inventing the wheel as primary consideration. Import well-maintained dependencies for:

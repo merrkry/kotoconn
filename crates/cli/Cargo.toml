@@ -1,0 +1,15 @@
+[package]
+name = "kotoconn-cli"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kotoconn"
+path = "src/main.rs"
+
+[dependencies]
+kotoconn-daemon.workspace = true
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true

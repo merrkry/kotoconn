@@ -7,3 +7,6 @@ publish.workspace = true
 [dependencies]
 oxc.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+rquickjs.workspace = true

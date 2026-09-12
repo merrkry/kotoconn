@@ -72,9 +72,23 @@ impl rquickjs::loader::Resolver for Resolver {
     }
 }
 
-pub(crate) struct Loader(pub HashMap<String, String>);
+/// Supplies source text for a normalized, relative module name.
+/// The embedding application owns file access and other source policies.
+pub trait ModuleSource {
+    fn read(&mut self, name: &str) -> std::io::Result<String>;
+}
 
-impl rquickjs::loader::Loader for Loader {
+impl ModuleSource for HashMap<String, String> {
+    fn read(&mut self, name: &str) -> std::io::Result<String> {
+        self.get(name).cloned().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "module was not supplied")
+        })
+    }
+}
+
+pub(crate) struct Loader<S>(pub S);
+
+impl<S: ModuleSource> rquickjs::loader::Loader for Loader<S> {
     fn load<'js>(
         &mut self,
         ctx: &Ctx<'js>,
@@ -83,10 +97,10 @@ impl rquickjs::loader::Loader for Loader {
     ) -> Result<Module<'js>> {
         let source = self
             .0
-            .get(name)
-            .ok_or_else(|| rquickjs::Error::new_loading_message(name, "module was not supplied"))?;
+            .read(name)
+            .map_err(|error| rquickjs::Error::new_loading_message(name, error.to_string()))?;
 
-        let source = kotoconn_typescript::transpile(name, source)
+        let source = kotoconn_typescript::transpile(name, &source)
             .map_err(|error| rquickjs::Error::new_loading_message(name, error.to_string()))?;
 
         Module::declare(ctx.clone(), name, source)

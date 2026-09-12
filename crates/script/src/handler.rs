@@ -29,9 +29,10 @@ impl<'js, Input: rquickjs::IntoJs<'js>, Output: FromJs<'js>> Handler<'js, Input,
         }
     }
 
-    pub fn call(self, input: Input) -> Result<Output> {
+    pub async fn call(self, input: Input) -> Result<Output> {
         self.function
             .call::<_, rquickjs::promise::MaybePromise>((input,))?
-            .finish()
+            .into_future()
+            .await
     }
 }

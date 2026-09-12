@@ -1,9 +1,9 @@
 #[path = "support/types.rs"]
 mod types;
 
-use rquickjs::{CatchResultExt, Class, Context, FromJs, Module, Runtime};
+use rquickjs::{CatchResultExt, Context, FromJs, Runtime};
 use std::num::NonZeroU64;
-use types::{Options, Reference, Reply, Service, handler::Handler, model};
+use types::{Options, Reference, Reply, handler::Handler, model};
 
 #[test]
 fn nested_options_and_native_references_convert_without_serializing_ids() {
@@ -62,94 +62,38 @@ fn nested_options_and_native_references_convert_without_serializing_ids() {
     });
 }
 
-#[test]
-fn generated_method_signatures_match_plain_objects_and_callbacks() {
-    let runtime = Runtime::new().unwrap();
-    let context = Context::full(&runtime).unwrap();
+#[tokio::test]
+async fn typed_callbacks_accept_sync_results_and_reject_invalid_results() {
+    let runtime = rquickjs::AsyncRuntime::new().unwrap();
+    let context = rquickjs::AsyncContext::full(&runtime).await.unwrap();
 
-    context.with(|ctx| {
-        let service = Class::instance(
-            ctx.clone(),
-            Service {
-                callbacks: Vec::new(),
-            },
-        )
-        .unwrap();
-        ctx.globals().set("service", service.clone()).unwrap();
-
-        let source = kotoconn_typescript::transpile(
-            "case.ts",
-            r#"
-            type Item = { label: string; count: number };
-
-            const reply: Item = service.echo({ label: 'value', count: 42 });
-            if (reply.label !== 'value' || reply.count !== 42) throw Error('echo');
-
-            const count = service.count({
-                details: { label: '', enabled: true },
-                parent: null,
-                values: [1, 2]
-            });
-            if (count !== 2) throw Error('options');
-
-            service.register(async (input: Item): Promise<Item> => {
-                await Promise.resolve();
-
-                return { label: input.label, count: input.count + 1 };
-            });
-        "#,
-        )
-        .unwrap();
-        Module::evaluate(ctx.clone(), "case.ts", source)
-            .unwrap()
-            .finish::<()>()
-            .catch(&ctx)
-            .unwrap();
-
-        let callback = service.borrow().callbacks[0].clone();
-        let result = Handler::<Reply, Reply>::new(callback)
-            .call(Reply {
-                label: "result".into(),
-                count: 41,
-            })
-            .unwrap();
-        assert_eq!(
-            result,
-            Reply {
-                label: "result".into(),
-                count: 42
+    context
+        .async_with(async |ctx| {
+            for source in [
+                "() => { throw Error('failure'); }",
+                "() => 'wrong result'",
+                "async () => 'wrong result'",
+                "() => ({ count: 42 })",
+            ] {
+                let function = ctx.eval(source).unwrap();
+                let handler = Handler::<Reply, Reply>::from_js(&ctx, function).unwrap();
+                assert!(
+                    handler
+                        .call(Reply {
+                            label: String::new(),
+                            count: 0
+                        })
+                        .await
+                        .catch(&ctx)
+                        .is_err()
+                );
             }
-        );
-    });
-}
 
-#[test]
-fn callback_exceptions_rejections_and_wrong_result_types_are_errors() {
-    let runtime = Runtime::new().unwrap();
-    let context = Context::full(&runtime).unwrap();
-
-    context.with(|ctx| {
-        for source in [
-            "() => { throw Error('failure'); }",
-            "async () => { throw Error('failure'); }",
-            "() => 'wrong result'",
-        ] {
-            let function = ctx.eval(source).unwrap();
-            let handler = Handler::<Reply, Reply>::from_js(&ctx, function).unwrap();
-            assert!(
-                handler
-                    .call(Reply {
-                        label: String::new(),
-                        count: 0
-                    })
-                    .catch(&ctx)
-                    .is_err()
-            );
-        }
-
-        let handler: Handler<String, String> = ctx.eval("value => value.toUpperCase()").unwrap();
-        assert_eq!(handler.call("test".into()).unwrap(), "TEST");
-    });
+            let handler: Handler<String, String> =
+                ctx.eval("value => value.toUpperCase()").unwrap();
+            assert_eq!(handler.call("test".into()).await.unwrap(), "TEST");
+        })
+        .await;
 }
 
 #[test]

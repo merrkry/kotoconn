@@ -14,6 +14,10 @@ mod api;
 
 #[path = "../../src/handler.rs"]
 pub mod handler;
+
+#[path = "../../src/task.rs"]
+pub mod task;
+
 use api::api;
 use handler::Handler;
 
@@ -102,11 +106,18 @@ pub struct Collections {
 )]
 pub struct NativeUnion;
 
-#[derive(rquickjs::class::Trace, rquickjs::JsLifetime)]
+#[derive(rquickjs::JsLifetime)]
 #[rquickjs::class]
 pub struct Service<'js> {
-    pub callbacks: Vec<rquickjs::Function<'js>>,
+    pub callbacks: std::cell::RefCell<Vec<rquickjs::Function<'js>>>,
 }
+
+impl<'js> rquickjs::class::Trace<'js> for Service<'js> {
+    fn trace<'a>(&self, tracer: rquickjs::class::Tracer<'a, 'js>) {
+        self.callbacks.borrow().trace(tracer);
+    }
+}
+
 api! {
     Service as Service {
         fn count(self, options: Options) -> u32 {
@@ -118,8 +129,26 @@ api! {
         }
 
         fn register(self, handler: Handler<'js, Reply, Reply>) -> u32 {
-            self.callbacks.push(handler.function);
-            Ok(self.callbacks.len().try_into().unwrap())
+            self.callbacks.borrow_mut().push(handler.function);
+            Ok(self.callbacks.borrow().len().try_into().unwrap())
+        }
+    }
+
+    async {
+        fn echo_later(self, reply: Reply) -> Reply {
+            let owner = std::thread::current().id();
+            task::run(async move {
+                assert_ne!(owner, std::thread::current().id());
+                tokio::task::yield_now().await;
+                reply
+            }).await
+        }
+
+        fn fail(self) -> Reply {
+            task::run(async {
+                tokio::task::yield_now().await;
+                Err(rquickjs::Error::new_from_js_message("native", "reply", "native failed"))
+            }).await?
         }
     }
 }

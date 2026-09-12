@@ -23,9 +23,11 @@ export type Cases = [
   Assert<Equal<Mode, "enabled" | "disabled">>,
   Assert<Equal<Extract<Choice, { kind: "pair" }>["value"], [string, number]>>,
   Assert<Equal<Collections["tags"], string[]>>,
+  Assert<Equal<Collections["table"], Record<string, number[]>>>,
   Assert<Equal<Extract<NativeUnion, { version: 6 }>["version"], 6>>,
   Assert<Equal<Parameters<Service["count"]>[0], Options>>,
   Assert<Equal<ReturnType<Service["echo"]>, Reply>>,
+  Assert<Equal<ReturnType<Service["echo_later"]>, Promise<Reply>>>,
   Assert<Equal<Parameters<Service["register"]>[0], Handler<Reply, Reply>>>,
 ];
 
@@ -53,6 +55,12 @@ export function assignments(reference: Reference, other: OtherReference, service
   // @ts-expect-error Callbacks must return their declared result type.
   service.register(() => "wrong result");
 
+  // @ts-expect-error Promise results must match the callback output too.
+  service.register(async () => "wrong result");
+
+  // @ts-expect-error Async methods return a promise, not the resolved object.
+  const reply: Reply = service.echo_later({ label: "pending", count: 0 });
+
   // @ts-expect-error A native reference is not a JavaScript numeric ID.
   options.parent = 1;
 
@@ -61,5 +69,5 @@ export function assignments(reference: Reference, other: OtherReference, service
   // @ts-expect-error Tagged variants must carry the matching payload.
   const wrong: Choice = { kind: "pair", value: { name: "item" } };
 
-  return [choice, wrong];
+  return [choice, wrong, reply];
 }
