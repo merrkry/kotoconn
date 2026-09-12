@@ -1,0 +1,5 @@
+error[E0063]: missing field `added` in initializer of `Model`
+ --> tests/ui/added_field.rs:9:16
+  |
+9 | #[convert(into(Model))]
+  |                ^^^^^ missing `added`

@@ -1,9 +1,9 @@
 [package]
-name = "kotoconn-config"
+name = "kotoconn-typescript"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-hickory-proto.workspace = true
-ts-rs.workspace = true
+oxc.workspace = true
+thiserror.workspace = true

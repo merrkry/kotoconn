@@ -1,0 +1,16 @@
+{
+  "name": "@kotoconn/bindings",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts"
+    }
+  },
+  "scripts": {
+    "generate": "cargo run --quiet -p kotoconn-script --bin generate-types",
+    "typecheck": "tsc --noEmit",
+    "test": "cargo run --quiet -p kotoconn-script --example generate-test-types && tsc -p tests/tsconfig.json",
+    "build": "pnpm run generate"
+  }
+}

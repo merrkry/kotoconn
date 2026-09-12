@@ -1,6 +1,9 @@
 use crate::IpAddr;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, ts_rs::TS)]
+#[ts(
+    type = "{ readonly port: number; readonly domain: string | undefined; readonly ip: IpAddr | undefined; readonly __brand: unique symbol }"
+)]
 pub enum Target {
     Domain { name: String, port: u16 },
     Ip { address: IpAddr, port: u16 },

@@ -1,0 +1,20 @@
+{
+  "name": "kotoconn-workspace",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bindings": "pnpm --filter @kotoconn/bindings run generate",
+    "build": "pnpm -r run build",
+    "format": "oxfmt packages package.json pnpm-workspace.yaml tsconfig.json .oxfmtrc.json .oxlintrc.json",
+    "format:check": "oxfmt --check packages package.json pnpm-workspace.yaml tsconfig.json .oxfmtrc.json .oxlintrc.json",
+    "lint": "oxlint packages",
+    "typecheck": "pnpm run bindings && pnpm -r run typecheck",
+    "test": "pnpm -r --if-present run test",
+    "check": "pnpm run format:check && pnpm run lint && pnpm run build && pnpm -r run typecheck && pnpm run test"
+  },
+  "devDependencies": {
+    "oxfmt": "^0.66.0",
+    "oxlint": "^1.81.0",
+    "typescript": "^7.0.2"
+  }
+}
