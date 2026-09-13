@@ -1,13 +1,13 @@
-mod shadowsocks2022;
-pub use shadowsocks2022::Shadowsocks2022OutboundConfig;
-mod http;
-pub use http::HttpOutboundConfig;
 mod direct;
+mod http;
+mod shadowsocks2022;
 mod socks5;
 
 use crate::ResolveHandlerId;
 
 pub use direct::DirectOutboundConfig;
+pub use http::HttpOutboundConfig;
+pub use shadowsocks2022::Shadowsocks2022OutboundConfig;
 pub use socks5::Socks5OutboundConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq, ts_rs::TS)]

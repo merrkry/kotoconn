@@ -20,7 +20,9 @@ use tokio::{
 };
 
 const MAX_TCP_CONNECTIONS: usize = 256;
+
 const MAX_UDP_ASSOCIATIONS: usize = 128;
+
 const INGRESS_BYTES: usize = 8 * 1024 * 1024;
 
 /// Packet boundaries are preserved. A successful send consumes exactly one IP
@@ -85,14 +87,19 @@ pub async fn run<D: PacketIo>(device: D, mtu: usize, context: ServerContext) -> 
         (1280..=65535).contains(&mtu),
         "TUN MTU must be between 1280 and 65535"
     );
+
     let (output, packets) = mpsc::channel::<Transmit>(128);
     let receive = dispatch(&device, mtu, context.clone(), output);
     let send = transmit(&device, mtu, packets);
+
     tokio::pin!(receive, send);
     tokio::select! {
         biased;
         _ = context.scope.cancelled() => Ok(()),
-        result = &mut receive => { result?; send.await },
+        result = &mut receive => {
+            result?;
+            send.await
+        },
         result = &mut send => result,
     }
 }
@@ -104,6 +111,7 @@ async fn transmit<D: PacketIo>(
 ) -> Result<()> {
     let mut encoder = udp::Encoder::new(mtu);
     let mut turns = 0;
+
     while let Some(item) = input.recv().await {
         let packets = match item {
             Transmit::Packet(packet) => vec![packet],
@@ -118,6 +126,7 @@ async fn transmit<D: PacketIo>(
                 packets
             }
         };
+
         for packet in packets {
             let len = poll_fn(|cx| device.poll_send(cx, &packet)).await?;
             ensure!(len == packet.len(), "partial TUN packet write");
@@ -139,15 +148,19 @@ async fn dispatch<D: PacketIo>(
 ) -> Result<()> {
     let mut tcp = HashMap::<Flow, TcpEntry>::new();
     let mut udp = HashMap::<Flow, UdpEntry>::new();
+
     let mut decoder = Decoder::default();
     let mut rejector = tcp::Rejector::new(mtu);
     let mut buffer = vec![0; 65575];
+
     let (done, mut completed) = mpsc::unbounded_channel();
     let mut generation = 0u64;
     let mut stopping = false;
+
     let tcp_budget = Arc::new(Semaphore::new(INGRESS_BYTES));
     let udp_budget = Arc::new(Semaphore::new(INGRESS_BYTES));
     let mut turns = 0;
+
     loop {
         turns += 1;
         if turns == 64 {
@@ -158,14 +171,22 @@ async fn dispatch<D: PacketIo>(
             return Ok(());
         }
         let expiry = decoder.deadline();
+
         tokio::select! {
             biased;
-            _ = context.stopping.cancelled(), if !stopping => { stopping = true; udp.clear(); }
+            _ = context.stopping.cancelled(), if !stopping => {
+                stopping = true;
+                udp.clear();
+            }
             Some((protocol, flow, id)) = completed.recv() => {
                 match protocol {
-                    Protocol::Tcp if tcp.get(&flow).is_some_and(|e| e.generation == id) => { tcp.remove(&flow); }
-                    Protocol::Udp if udp.get(&flow).is_some_and(|e| e.generation == id) => { udp.remove(&flow); }
-                    _ => {},
+                    Protocol::Tcp if tcp.get(&flow).is_some_and(|e| e.generation == id) => {
+                        tcp.remove(&flow);
+                    }
+                    Protocol::Udp if udp.get(&flow).is_some_and(|e| e.generation == id) => {
+                        udp.remove(&flow);
+                    }
+                    _ => {}
                 }
             }
             _ = async { match expiry { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await } } => {
@@ -174,21 +195,33 @@ async fn dispatch<D: PacketIo>(
             len = poll_fn(|cx| device.poll_recv(cx, &mut buffer)) => {
                 let len = len?;
                 let Some(packet) = decoder.decode(&buffer[..len], Instant::now()) else { continue; };
+
                 match packet.ip.next_header() {
                     IpProtocol::Tcp => {
                         let Some((flow, repr)) = packet.tcp() else { continue; };
-                        if tcp.get(&flow).is_some_and(|e| e.packets.is_closed()) { tcp.remove(&flow); }
+
+                        if tcp.get(&flow).is_some_and(|e| e.packets.is_closed()) {
+                            tcp.remove(&flow);
+                        }
+
                         if !tcp.contains_key(&flow) {
                             if repr.control != TcpControl::Syn || repr.ack_number.is_some() || stopping {
-                                for response in rejector.reject(&packet) { let _ = output.try_send(Transmit::Packet(response)); }
+                                for response in rejector.reject(&packet) {
+                                    let _ = output.try_send(Transmit::Packet(response));
+                                }
                                 continue;
                             }
-                            if tcp.len() >= MAX_TCP_CONNECTIONS { continue; }
+
+                            if tcp.len() >= MAX_TCP_CONNECTIONS {
+                                continue;
+                            }
+
                             generation = generation.checked_add(1).expect("TUN connection generation exhausted");
                             let conn = tcp::connection(flow, mtu, output.clone(), context.stopping.clone());
                             let session = context.scope.child();
                             let handler = context.handler.clone();
                             let admission_scope = session.clone();
+
                             session.spawn(async move {
                                 let stream = conn.accepted.await?;
                                 handler.tcp(p::target(flow.destination), Box::pin(stream), admission_scope).await
@@ -196,24 +229,53 @@ async fn dispatch<D: PacketIo>(
                             // Track FIN/RST cleanup in the session, but only forced listener
                             // cancellation may interrupt the driver while it sends that cleanup.
                             let driver_scope = context.scope.child().tracked_by(&session);
-                            let completion = Completion { tx: done.clone(), protocol: Protocol::Tcp, flow, generation };
+                            let completion = Completion {
+                                tx: done.clone(),
+                                protocol: Protocol::Tcp,
+                                flow,
+                                generation,
+                            };
+
                             driver_scope.spawn(async move {
                                 let _completion = completion;
-                                if conn.driver.await.is_err() { session.close(); }
+                                if conn.driver.await.is_err() {
+                                    session.close();
+                                }
                                 Ok(())
                             })?;
-                            tcp.insert(flow, TcpEntry { packets: conn.packets, generation });
+
+                            tcp.insert(
+                                flow,
+                                TcpEntry {
+                                    packets: conn.packets,
+                                    generation,
+                                },
+                            );
                         }
-                        if let Ok(permit) = tcp_budget.clone().try_acquire_many_owned(packet.ip.buffer_len() as u32) {
-                            let _ = tcp[&flow].packets.try_send(tcp::QueuedPacket { bytes: packet.encode(), _permit: Some(permit) });
+
+                        if let Ok(permit) = tcp_budget
+                            .clone()
+                            .try_acquire_many_owned(packet.ip.buffer_len() as u32)
+                        {
+                            let _ = tcp[&flow].packets.try_send(tcp::QueuedPacket {
+                                bytes: packet.encode(),
+                                _permit: Some(permit),
+                            });
                         }
                     }
                     IpProtocol::Udp if !stopping => {
                         let Some((flow, payload)) = packet.udp() else { continue; };
                         let Some(payload) = budgeted_payload(payload, &udp_budget) else { continue; };
-                        if udp.get(&flow).is_some_and(|e| e.scope.is_closed()) { udp.remove(&flow); }
+
+                        if udp.get(&flow).is_some_and(|e| e.scope.is_closed()) {
+                            udp.remove(&flow);
+                        }
+
                         if !udp.contains_key(&flow) {
-                            if udp.len() >= MAX_UDP_ASSOCIATIONS { continue; }
+                            if udp.len() >= MAX_UDP_ASSOCIATIONS {
+                                continue;
+                            }
+
                             generation = generation.checked_add(1).expect("TUN connection generation exhausted");
                             let scope = context.scope.child();
                             let (association, driver) = p::packet_pair(scope.clone());
@@ -221,11 +283,17 @@ async fn dispatch<D: PacketIo>(
                             let (activity, clock) = watch::channel(Instant::now());
                             let handler = context.handler.clone();
                             let output = output.clone();
-                            let completion = Completion { tx: done.clone(), protocol: Protocol::Udp, flow, generation };
+                            let completion = Completion {
+                                tx: done.clone(),
+                                protocol: Protocol::Udp,
+                                flow,
+                                generation,
+                            };
                             let stopping = context.stopping.clone();
                             let idle = context.udp_idle_timeout;
                             let reply_activity = activity.clone();
                             let control = scope.clone();
+
                             scope.spawn(async move {
                                 let _completion = completion;
                                 let replies = udp_replies(flow, driver, output, reply_activity);
@@ -238,10 +306,27 @@ async fn dispatch<D: PacketIo>(
                                 control.close();
                                 Ok(())
                             })?;
-                            udp.insert(flow, UdpEntry { packets, activity, scope, generation });
+
+                            udp.insert(
+                                flow,
+                                UdpEntry {
+                                    packets,
+                                    activity,
+                                    scope,
+                                    generation,
+                                },
+                            );
                         }
+
                         let entry = &udp[&flow];
-                        if entry.packets.try_send(p::Packet { target: p::target(flow.destination), payload }).is_ok() {
+                        if entry
+                            .packets
+                            .try_send(p::Packet {
+                                target: p::target(flow.destination),
+                                payload,
+                            })
+                            .is_ok()
+                        {
                             entry.activity.send_replace(Instant::now());
                         }
                     }

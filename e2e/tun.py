@@ -3,12 +3,12 @@
 Build with cargo build -p kotoconn-cli, then run python3 e2e/tun.py.
 Only the Python standard library, unshare, and iproute2 are required.
 """
+
 import argparse
 import concurrent.futures
 import errno
 import json
 import os
-from pathlib import Path
 import signal
 import socket
 import struct
@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 MARK = 42
@@ -29,7 +30,9 @@ TRAILER = b"after-half-close\n"
 
 
 def ip(*args):
-    return subprocess.run(["ip", *args], check=True, text=True, capture_output=True, timeout=10).stdout
+    return subprocess.run(
+        ["ip", *args], check=True, text=True, capture_output=True, timeout=10
+    ).stdout
 
 
 class Daemon:
@@ -38,8 +41,17 @@ class Daemon:
         self.condition = threading.Condition()
         self.log = (directory / f"daemon-{deadline}.log").open("w")
         self.process = subprocess.Popen(
-            [str(binary), "run", "--config", str(directory / "main.ts"), "--shutdown-timeout", str(deadline)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            [
+                str(binary),
+                "run",
+                "--config",
+                str(directory / "main.ts"),
+                "--shutdown-timeout",
+                str(deadline),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
         )
         self.reader = threading.Thread(target=self.read, daemon=True)
         self.reader.start()
@@ -67,7 +79,9 @@ class Daemon:
                     raise RuntimeError("daemon exited: " + "".join(self.lines))
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError("daemon did not report " + prefix + ": " + "".join(self.lines))
+                    raise TimeoutError(
+                        "daemon did not report " + prefix + ": " + "".join(self.lines)
+                    )
                 self.condition.wait(remaining)
 
     def stop(self):
@@ -79,7 +93,9 @@ class Daemon:
         self.reader.join(timeout=5)
         self.log.close()
         assert (code != 0) == forced, "".join(self.lines)
-        assert not any(item["ifname"] == NAME for item in json.loads(ip("-j", "link", "show"))), "TUN survived daemon exit"
+        assert not any(
+            item["ifname"] == NAME for item in json.loads(ip("-j", "link", "show"))
+        ), "TUN survived daemon exit"
 
     def close(self):
         if self.process.poll() is None:
@@ -116,7 +132,7 @@ class Echo:
         while not self.stop.is_set():
             try:
                 conn, _ = listener.accept()
-            except socket.timeout:
+            except TimeoutError:
                 continue
             except OSError:
                 return
@@ -138,7 +154,11 @@ class Echo:
                 # Forced daemon shutdown deliberately interrupts a connection.
                 pass
             except OSError as error:
-                if not self.forced or error.errno not in (errno.EPIPE, errno.ECONNRESET, errno.ENOTCONN):
+                if not self.forced or error.errno not in (
+                    errno.EPIPE,
+                    errno.ECONNRESET,
+                    errno.ENOTCONN,
+                ):
                     self.errors.append(str(error))
 
     def datagrams(self, sock):
@@ -148,7 +168,7 @@ class Echo:
                 if data.startswith(b"INVALID"):
                     self.bad.append(data)
                 sock.sendto(data, peer)
-            except socket.timeout:
+            except TimeoutError:
                 continue
             except OSError:
                 return
@@ -159,7 +179,9 @@ class Echo:
             sock.close()
         for thread in self.threads:
             thread.join(timeout=2)
-        assert all(not thread.is_alive() for thread in self.threads), "echo worker did not stop"
+        assert all(not thread.is_alive() for thread in self.threads), (
+            "echo worker did not stop"
+        )
         assert not self.bad, f"malformed datagrams reached outbound: {self.bad}"
         assert not self.errors, self.errors
 
@@ -189,9 +211,11 @@ def tcp_case(family):
     with client(family, socket.SOCK_STREAM) as sock:
         assert read_exact(sock, len(BANNER)) == BANNER
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+
             def write():
                 sock.sendall(payload)
                 sock.shutdown(socket.SHUT_WR)
+
             sent = pool.submit(write)
             received = bytearray()
             while data := sock.recv(65536):
@@ -208,7 +232,9 @@ def udp_case(family):
             try:
                 reply = sock.recv(65536)
             except TimeoutError as error:
-                raise TimeoutError(f"UDP reply timed out: family={family}, size={size}") from error
+                raise TimeoutError(
+                    f"UDP reply timed out: family={family}, size={size}"
+                ) from error
             assert reply == payload, (family, size)
 
 
@@ -216,21 +242,50 @@ def malformed():
     # AF_PACKET delivers frames to the TUN transmit path without repairing IP
     # checksums or rejecting malformed lengths in the kernel first.
     with socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM) as sender:
-        for data in (b"", b"\x45", b"\x60", bytes(64), b"\x4f" + bytes(19), b"\x60\x00\x00\x00\xff\xff" + bytes(34)):
+        for data in (
+            b"",
+            b"\x45",
+            b"\x60",
+            bytes(64),
+            b"\x4f" + bytes(19),
+            b"\x60\x00\x00\x00\xff\xff" + bytes(34),
+        ):
             if data:
                 sender.sendto(data, (NAME, 0x0800 if data[0] >> 4 == 4 else 0x86DD))
-        for family, source, destination in zip((socket.AF_INET, socket.AF_INET6), CLIENT, REMOTE):
+        for family, source, destination in zip(
+            (socket.AF_INET, socket.AF_INET6), CLIENT, REMOTE
+        ):
             payload = b"INVALID-checksum"
             udp = struct.pack("!HHHH", 22222, PORT, 8 + len(payload), 1) + payload
             if family == socket.AF_INET:
-                header = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(udp), 9, 0, 64, 17, 0,
-                                     socket.inet_pton(family, source), socket.inet_pton(family, destination))
+                header = struct.pack(
+                    "!BBHHHBBH4s4s",
+                    0x45,
+                    0,
+                    20 + len(udp),
+                    9,
+                    0,
+                    64,
+                    17,
+                    0,
+                    socket.inet_pton(family, source),
+                    socket.inet_pton(family, destination),
+                )
                 header = header[:10] + struct.pack("!H", checksum(header)) + header[12:]
                 sender.sendto(header + udp, (NAME, 0x0800))
-                sender.sendto(header[:10] + b"\x00\x00" + header[12:] + udp, (NAME, 0x0800))
+                sender.sendto(
+                    header[:10] + b"\x00\x00" + header[12:] + udp, (NAME, 0x0800)
+                )
             else:
-                header = struct.pack("!IHBB16s16s", 6 << 28, len(udp), 17, 64,
-                                     socket.inet_pton(family, source), socket.inet_pton(family, destination))
+                header = struct.pack(
+                    "!IHBB16s16s",
+                    6 << 28,
+                    len(udp),
+                    17,
+                    64,
+                    socket.inet_pton(family, source),
+                    socket.inet_pton(family, destination),
+                )
                 sender.sendto(header + udp, (NAME, 0x86DD))
                 sender.sendto(header + udp[:6] + b"\x00\x00" + udp[8:], (NAME, 0x86DD))
         # A valid UDP checksum does not make overlapping IPv6 fragments valid.
@@ -239,17 +294,27 @@ def malformed():
         payload = b"INVALID-ipv6-overlap" + bytes(1200)
         udp = struct.pack("!HHHH", 22223, PORT, 8 + len(payload), 0) + payload
         pseudo = source + destination + struct.pack("!I3xB", len(udp), 17)
-        udp = udp[:6] + struct.pack("!H", checksum(pseudo + udp) or 0xffff) + udp[8:]
-        for offset, data, more in ((0, udp[:512], 1), (256, udp[256:768], 1), (768, udp[768:], 0)):
-            header = struct.pack("!IHBB16s16s", 6 << 28, len(data) + 8, 44, 64, source, destination)
+        udp = udp[:6] + struct.pack("!H", checksum(pseudo + udp) or 0xFFFF) + udp[8:]
+        for offset, data, more in (
+            (0, udp[:512], 1),
+            (256, udp[256:768], 1),
+            (768, udp[768:], 0),
+        ):
+            header = struct.pack(
+                "!IHBB16s16s", 6 << 28, len(data) + 8, 44, 64, source, destination
+            )
             fragment = struct.pack("!BBHI", 17, 0, offset | more, 12345678)
             sender.sendto(header + fragment + data, (NAME, 0x86DD))
         # SYN+FIN and truncated TCP headers must not create outbound connections.
         for flags, data_offset in ((3, 5), (2, 4)):
-            tcp = struct.pack("!HHIIBBHHH", 22224, PORT, 100, 0, data_offset << 4, flags, 65535, 0, 0)
+            tcp = struct.pack(
+                "!HHIIBBHHH", 22224, PORT, 100, 0, data_offset << 4, flags, 65535, 0, 0
+            )
             pseudo = source + destination + struct.pack("!I3xB", len(tcp), 6)
             tcp = tcp[:16] + struct.pack("!H", checksum(pseudo + tcp)) + tcp[18:]
-            header = struct.pack("!IHBB16s16s", 6 << 28, len(tcp), 6, 64, source, destination)
+            header = struct.pack(
+                "!IHBB16s16s", 6 << 28, len(tcp), 6, 64, source, destination
+            )
             sender.sendto(header + tcp, (NAME, 0x86DD))
         # Deterministic malformed input exercises truncation and unknown header
         # paths without depending on a random seed or expected packet loss.
@@ -263,8 +328,8 @@ def checksum(data):
         data += b"\x00"
     value = sum(struct.unpack(f"!{len(data) // 2}H", data))
     while value >> 16:
-        value = (value & 0xffff) + (value >> 16)
-    return (~value) & 0xffff
+        value = (value & 0xFFFF) + (value >> 16)
+    return (~value) & 0xFFFF
 
 
 def routes():
@@ -276,16 +341,38 @@ def routes():
 
 
 def run(binary, directory):
-    assert os.readlink("/proc/self/ns/net") != os.environ["KOTOCONN_PARENT_NETNS"], "refusing to modify the parent network namespace"
+    assert os.readlink("/proc/self/ns/net") != os.environ["KOTOCONN_PARENT_NETNS"], (
+        "refusing to modify the parent network namespace"
+    )
     ip("link", "set", "lo", "up")
     for address in (*CLIENT, *REMOTE):
         family = "-6" if ":" in address else "-4"
-        ip(family, "addr", "add", address + ("/128" if family == "-6" else "/32"), "dev", "lo", *(["nodad"] if family == "-6" else []))
+        ip(
+            family,
+            "addr",
+            "add",
+            address + ("/128" if family == "-6" else "/32"),
+            "dev",
+            "lo",
+            *(["nodad"] if family == "-6" else []),
+        )
     for family in ("-4", "-6"):
         ip(family, "rule", "add", "priority", "1000", "lookup", "local")
         ip(family, "rule", "del", "priority", "0")
-        ip(family, "rule", "add", "priority", "100", "fwmark", str(MARK), "lookup", "100")
-    (directory / "main.ts").write_text("""import { kotoconn as k } from '@kotoconn/bindings';
+        ip(
+            family,
+            "rule",
+            "add",
+            "priority",
+            "100",
+            "fwmark",
+            str(MARK),
+            "lookup",
+            "100",
+        )
+    (
+        directory / "main.ts"
+    ).write_text("""import { kotoconn as k } from '@kotoconn/bindings';
 const resolver = k.resolve_handler(name => k.lookup(name));
 const direct = k.dialer({dialer: null, outbound: {resolve_handler: resolver, implementation: k.direct_outbound({})}});
 const routing = k.routing_handler(flow => flow.protocol === 'udp' ? k.route_udp(direct) : k.route(direct, flow.dest));
@@ -300,20 +387,36 @@ k.inbound({implementation: k.tun_inbound({name: 'ktest0', mtu: 1280, addresses: 
         routes()
         malformed()
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            jobs = [pool.submit(tcp_case, family) for family in (socket.AF_INET, socket.AF_INET6) for _ in range(3)]
-            jobs += [pool.submit(udp_case, family) for family in (socket.AF_INET, socket.AF_INET6)]
+            jobs = [
+                pool.submit(tcp_case, family)
+                for family in (socket.AF_INET, socket.AF_INET6)
+                for _ in range(3)
+            ]
+            jobs += [
+                pool.submit(udp_case, family)
+                for family in (socket.AF_INET, socket.AF_INET6)
+            ]
             for job in jobs:
                 job.result(timeout=30)
-        print("PASS TUN dual-stack TCP, UDP, fragmentation, server-first and half-close", flush=True)
+        print(
+            "PASS TUN dual-stack TCP, UDP, fragmentation, server-first and half-close",
+            flush=True,
+        )
         with client(socket.AF_INET, socket.SOCK_STREAM) as active:
             assert read_exact(active, len(BANNER)) == BANNER
             daemon.stop()
             active.sendall(b"during-drain")
             active.shutdown(socket.SHUT_WR)
-            assert read_exact(active, len(b"during-drain") + len(TRAILER)) == b"during-drain" + TRAILER
+            assert (
+                read_exact(active, len(b"during-drain") + len(TRAILER))
+                == b"during-drain" + TRAILER
+            )
             assert active.recv(1) == b""
         daemon.finish()
-        print("PASS TUN graceful shutdown retains established connections and removes interface", flush=True)
+        print(
+            "PASS TUN graceful shutdown retains established connections and removes interface",
+            flush=True,
+        )
         daemon = Daemon(binary, directory, deadline=1)
         routes()
         with client(socket.AF_INET6, socket.SOCK_STREAM) as active:
@@ -328,21 +431,34 @@ k.inbound({implementation: k.tun_inbound({name: 'ktest0', mtu: 1280, addresses: 
             daemon.close()
         echo.close()
     assert echo.accepted == 8, f"unexpected TCP admission count: {echo.accepted}"
-    print("PASS malformed ingress did not reach outbound or crash the daemon", flush=True)
+    print(
+        "PASS malformed ingress did not reach outbound or crash the daemon", flush=True
+    )
 
 
 def startup_failure(binary, directory):
     original = (directory / "main.ts").read_text()
-    duplicate = original + """
+    duplicate = (
+        original
+        + """
 k.inbound({implementation: k.tun_inbound({name: 'ktest0', mtu: 1280, addresses: []}),
     routing_handler: routing, udp_idle_timeout: k.timeout(30000)});
 """
+    )
     path = directory / "duplicate.ts"
     path.write_text(duplicate)
-    failed = subprocess.run([str(binary), "run", "--config", str(path)], capture_output=True, text=True, timeout=15)
+    failed = subprocess.run(
+        [str(binary), "run", "--config", str(path)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
     (directory / "startup-failure.log").write_text(failed.stderr)
     assert failed.returncode != 0 and "already exists" in failed.stderr, failed.stderr
-    assert not any(item["ifname"] == NAME for item in json.loads(ip("-j", "link", "show")))
+    assert not any(
+        item["ifname"] == NAME for item in json.loads(ip("-j", "link", "show"))
+    )
     print("PASS failed startup releases already-bound TUN interfaces", flush=True)
 
 
@@ -353,7 +469,9 @@ def main():
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
-    directory = args.output or Path(tempfile.mkdtemp(prefix="tun-", dir=ROOT / "target"))
+    directory = args.output or Path(
+        tempfile.mkdtemp(prefix="tun-", dir=ROOT / "target")
+    )
     directory.mkdir(parents=True, exist_ok=True)
     directory = directory.resolve()
     if args.inside:
@@ -364,7 +482,15 @@ def main():
         command = ["unshare", "--net"]
         if os.getuid() != 0:
             command += ["--user", "--map-root-user"]
-        command += [sys.executable, str(Path(__file__).resolve()), "--inside", "--binary", str(binary), "--output", str(directory)]
+        command += [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--inside",
+            "--binary",
+            str(binary),
+            "--output",
+            str(directory),
+        ]
         subprocess.run(command, env=env, check=True, timeout=120)
 
 

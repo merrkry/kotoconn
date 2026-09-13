@@ -1,6 +1,7 @@
 //! SOCKS5 CONNECT and UDP ASSOCIATE. Association framing stays in this crate.
 mod client;
 mod server;
+
 use anyhow::{Result, ensure};
 pub use client::Client;
 use fast_socks5::util::target_addr::TargetAddr;

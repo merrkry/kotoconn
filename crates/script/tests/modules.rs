@@ -23,6 +23,7 @@ async fn normalizes_imports_and_evaluates_shared_modules_once() {
             .into(),
         ),
     ]);
+
     Script::load("main.ts", sources).await.unwrap();
 }
 
@@ -45,6 +46,7 @@ async fn propagates_module_resolution_syntax_and_execution_errors() {
         )
         .await;
         let error = result.err().expect("expected module loading to fail");
+
         assert!(error.to_string().contains(message), "{error}");
     }
 }
@@ -80,6 +82,7 @@ async fn seals_registration_after_native_await_and_calls_each_handler_family() {
             });
         "#.into()),
     ])).await.unwrap();
+
     let config = script.config().await.unwrap();
     let resolve = *config.resolve_handlers.iter().next().unwrap();
     let routing = *config.routing_handlers.iter().next().unwrap();
@@ -127,6 +130,7 @@ async fn seals_registration_after_native_await_and_calls_each_handler_family() {
         panic!("expected a DNS response")
     };
     assert_eq!(response.to_vec().unwrap()[2] & 0x80, 0x80);
+
     let request = || {
         DnsRequest::new(
             hickory_proto::op::Message::from_vec(&[0; 12]).unwrap(),
@@ -162,6 +166,7 @@ async fn tun_configuration_preserves_native_addresses_and_checks_numeric_ranges(
     )
     .await
     .unwrap();
+
     let config = script.config().await.unwrap();
     let kotoconn_config::InboundImpl::Tun(tun) =
         &config.inbounds.values().next().unwrap().implementation
@@ -175,6 +180,7 @@ async fn tun_configuration_preserves_native_addresses_and_checks_numeric_ranges(
         "192.0.2.1".parse::<std::net::IpAddr>().unwrap()
     );
     assert_eq!(tun.addresses[1].prefix, 126);
+
     for value in ["1.5", "65536", "-1", "NaN", "Infinity", "'1500'"] {
         let bad = source.replace("mtu: 1500", &format!("mtu: {value}"));
         assert!(

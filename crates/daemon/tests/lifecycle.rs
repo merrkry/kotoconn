@@ -51,6 +51,7 @@ async fn shutdown_drains_accepted_calls_and_closes_existing_handles() {
     let daemon = Daemon::start_with_sources("main.ts".into(), sources, TIMEOUT)
         .await
         .unwrap();
+
     let policy = daemon.policy().clone();
     let id = handler(&policy);
     let request = tokio::spawn({
@@ -74,6 +75,7 @@ async fn shutdown_drains_accepted_calls_and_closes_existing_handles() {
         policy.resolve(id, "work".into()).await,
         Err(Error::Closed)
     ));
+
     release.send(()).unwrap();
     assert_eq!(
         tokio::time::timeout(TIMEOUT, shutdown)
@@ -102,6 +104,7 @@ async fn deadline_cancels_unsettled_promises_and_interrupts_running_js() {
         let daemon = start(&source, Duration::from_millis(30)).await;
         let policy = daemon.policy().clone();
         let id = handler(&policy);
+
         let request = policy.resolve(id, "work".into());
         tokio::pin!(request);
         // Poll once to enqueue the call before shutdown, without a scheduling delay.
@@ -126,6 +129,7 @@ async fn file_sources_load_imports_and_preserve_startup_errors() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("policy");
     std::fs::create_dir(&root).unwrap();
+
     let entry = root.join("main.ts");
     std::fs::write(root.join("value.ts"), "export const value: number = 42;").unwrap();
     std::fs::write(

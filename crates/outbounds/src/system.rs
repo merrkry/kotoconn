@@ -17,9 +17,11 @@ impl Carrier for System {
     fn capabilities(&self) -> Capabilities {
         Capabilities::BOTH
     }
+
     fn scope(&self) -> &Scope {
         &self.scope
     }
+
     fn tcp_scoped(&self, target: Target, caller: Scope) -> BoxFuture<'_, Result<BoxStream>> {
         Box::pin(async move {
             let address = socket_addr(&target)?;
@@ -28,9 +30,11 @@ impl Carrier for System {
             })
         })
     }
+
     fn udp_scoped(&self, target: Target, caller: Scope) -> BoxFuture<'_, Result<Datagram>> {
         Box::pin(async move {
             let peer = socket_addr(&target)?;
+
             let socket = UdpSocket::bind(if peer.is_ipv4() {
                 "0.0.0.0:0"
             } else {
@@ -38,10 +42,12 @@ impl Carrier for System {
             })
             .await?;
             socket.connect(peer).await?;
+
             let scope = self.scope.child().tracked_by(&caller);
             let (user, mut driver) = packet_pair(scope.clone());
             scope.spawn(async move {
                 let mut buffer = vec![0; 65536];
+
                 loop {
                     tokio::select! {
                         received = socket.recv(&mut buffer) => {
@@ -49,7 +55,10 @@ impl Carrier for System {
                                 Ok(n) => {
                                     let _ = driver
                                         .tx
-                                        .try_send(Packet { target: target.clone(), payload: buffer[..n].to_vec().into() });
+                                        .try_send(Packet {
+                                            target: target.clone(),
+                                            payload: buffer[..n].to_vec().into(),
+                                        });
                                 }
                                 Err(error) => eprintln!("UDP receive: {error}"),
                             }

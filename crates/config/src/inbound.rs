@@ -1,18 +1,18 @@
-mod shadowsocks2022;
-pub use shadowsocks2022::Shadowsocks2022InboundConfig;
-mod socks5;
-pub use socks5::Socks5InboundConfig;
-mod http;
-pub use http::HttpInboundConfig;
 mod direct;
+mod http;
+mod shadowsocks2022;
+mod socks5;
 mod tun;
-pub use tun::{TunAddress, TunInboundConfig};
 
 use std::{num::NonZeroU64, time::Duration};
 
 use crate::RoutingHandlerId;
 
 pub use direct::DirectInboundConfig;
+pub use http::HttpInboundConfig;
+pub use shadowsocks2022::Shadowsocks2022InboundConfig;
+pub use socks5::Socks5InboundConfig;
+pub use tun::{TunAddress, TunInboundConfig};
 
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ts_rs::TS)]

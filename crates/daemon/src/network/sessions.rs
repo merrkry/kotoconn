@@ -18,6 +18,7 @@ impl SessionHandle {
     pub fn close(&self) {
         self.control.close();
     }
+
     pub async fn wait(&self) {
         self.control.wait().await;
     }
@@ -82,6 +83,7 @@ impl Sessions {
             }
         })
     }
+
     pub(super) async fn register(
         &self,
         destination: Target,
@@ -100,6 +102,7 @@ impl Sessions {
 
         Ok(rx.await?)
     }
+
     pub async fn list(&self) -> Result<Vec<SessionHandle>> {
         let (tx, rx) = oneshot::channel();
 

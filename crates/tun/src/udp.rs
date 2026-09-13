@@ -56,6 +56,7 @@ impl Encoder {
         {
             return None;
         }
+
         let udp = UdpRepr {
             src_port: source.port(),
             dst_port: destination.port(),
@@ -71,6 +72,7 @@ impl Encoder {
             |bytes| bytes.copy_from_slice(payload),
             &ChecksumCapabilities::default(),
         );
+
         let ip = IpRepr::new(
             source_ip,
             destination_ip,
@@ -82,6 +84,7 @@ impl Encoder {
             ip,
             payload: transport,
         };
+
         if packet.ip.buffer_len() <= self.mtu {
             return Some(vec![packet.encode()]);
         }
@@ -104,6 +107,7 @@ impl Encoder {
             }
             return Some(frames);
         }
+
         let IpRepr::Ipv6(mut repr) = packet.ip else {
             unreachable!()
         };

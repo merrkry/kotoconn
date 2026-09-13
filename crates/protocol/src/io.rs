@@ -41,6 +41,7 @@ impl Drop for Datagram {
 pub fn packet_pair(scope: Scope) -> (Datagram, Datagram) {
     let (a_tx, b_rx) = mpsc::channel(64);
     let (b_tx, a_rx) = mpsc::channel(64);
+
     (
         Datagram {
             tx: a_tx,
@@ -63,6 +64,7 @@ pub fn stream_task(
 ) -> Result<BoxStream> {
     let (local, mut remote) = tokio::io::duplex(64 * 1024);
     let handle = scope.clone();
+
     scope.spawn(async move {
         let mut stream = connect.await?;
         tokio::io::copy_bidirectional(&mut remote, &mut stream).await?;
@@ -103,9 +105,11 @@ impl AsyncWrite for OwnedStream {
     ) -> Poll<std::io::Result<usize>> {
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
+
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
+
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }

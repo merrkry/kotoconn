@@ -119,6 +119,7 @@ impl Daemon {
         let path = path.as_ref();
         let (entry, source) = source::Files::open(path)
             .map_err(|error| Error::Config(format!("{}: {error}", path.display())))?;
+
         Self::start_with_sources(entry, source, shutdown_timeout).await
     }
 
@@ -129,6 +130,7 @@ impl Daemon {
         shutdown_timeout: Duration,
     ) -> Result<Self, Error> {
         let runtime = Handle::try_current().map_err(|error| Error::Worker(error.to_string()))?;
+
         if runtime.runtime_flavor() != RuntimeFlavor::MultiThread {
             return Err(Error::Worker(
                 "a Tokio multi-thread runtime is required".into(),
@@ -140,6 +142,7 @@ impl Daemon {
         let (commands, receiver) = mpsc::channel(CAPACITY);
         let (ready, started) = oneshot::channel();
         let (finished, completion) = watch::channel(None);
+
         let deadline = tokio::spawn({
             let stopping = stopping.clone();
             let force = force.clone();
@@ -163,6 +166,7 @@ impl Daemon {
             .spawn(move || {
                 let result = runtime.block_on(async {
                     let interrupt = force.clone();
+
                     let script = tokio::select! {
                         biased;
                         _ = force.cancelled() => return Ok(Shutdown::TimedOut),
@@ -170,6 +174,7 @@ impl Daemon {
                             result?
                         }
                     };
+
                     let config = Arc::new(script.config().await?);
                     if ready.send(config).is_err() {
                         return Ok(Shutdown::Drained);
@@ -185,6 +190,7 @@ impl Daemon {
             Ok(config) => config,
             Err(_) => return Err(worker.wait().await.err().unwrap_or(Error::Closed)),
         };
+
         let policy = Policy {
             commands,
             stopping: worker.stopping.clone(),
@@ -196,6 +202,7 @@ impl Daemon {
             worker.force.clone(),
         )
         .await?;
+
         Ok(Self {
             policy,
             worker,
@@ -245,6 +252,8 @@ impl Daemon {
 
     /// Also reports worker failures before a shutdown request.
     pub async fn wait(&self) -> Result<Shutdown, Error> {
+        // Wait for both sides so network sessions can drain while the policy
+        // worker finishes its outstanding handler calls.
         match tokio::try_join!(self.worker.wait(), self.network.wait()) {
             Ok((policy, network)) => Ok(
                 if policy == Shutdown::TimedOut || network == Shutdown::TimedOut {

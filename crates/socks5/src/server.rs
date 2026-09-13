@@ -38,10 +38,12 @@ impl p::Server for Server {
                             match command {
                                 Socks5Command::TCPConnect => {
                                     let stream = protocol.reply_success(local).await?;
+
                                     handler.tcp(from_address(destination), stream, scope).await
                                 }
                                 Socks5Command::UDPAssociate => {
-                                    let socket = UdpSocket::bind(SocketAddr::new(local.ip(), 0)).await?;
+                                    let socket =
+                                        UdpSocket::bind(SocketAddr::new(local.ip(), 0)).await?;
                                     let mut control = protocol.reply_success(socket.local_addr()?).await?;
                                     let (association, mut driver) = packet_pair(scope.child());
                                     let work = handler.udp(association);

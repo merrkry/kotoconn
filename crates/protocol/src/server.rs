@@ -62,6 +62,7 @@ where
             result = listener.accept() => {
                 let (stream, peer) = result?;
                 let local = stream.local_addr()?;
+
                 let scope = context.scope.child();
                 let work = accept(Box::pin(stream), peer, local, scope.clone());
                 scope.spawn(async move { let _permit = permit; work.await })?;

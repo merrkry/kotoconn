@@ -88,6 +88,7 @@ async fn udp(socket: UdpSocket, context: ServerContext, crypto: Arc<Crypto>) -> 
     let mut associations = HashMap::<u64, Association>::new();
     let (responses, mut replies) = mpsc::channel::<(u64, Packet)>(64);
     let mut buffer = vec![0; 65536];
+
     // Replay state must outlive short application sessions across the wire's
     // timestamp acceptance window. Application idle expiry remains in the daemon.
     let retention = context.udp_idle_timeout.max(Duration::from_secs(60));
@@ -167,6 +168,7 @@ async fn udp(socket: UdpSocket, context: ServerContext, crypto: Arc<Crypto>) -> 
                 // Authenticated packets permit source address migration.
                 association.peer = peer;
                 association.active = Instant::now();
+
                 let _ = association.tx.try_send(Packet {
                     target: from_address(destination),
                     payload: buffer[..n].to_vec().into(),

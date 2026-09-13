@@ -12,6 +12,7 @@ async fn native_futures_release_js_and_resume_on_the_owning_thread() {
         let runtime = AsyncRuntime::new().unwrap();
         let context = AsyncContext::full(&runtime).await.unwrap();
         let owner = std::thread::current().id();
+
         context
             .async_with(async |ctx| {
                 let service = Class::instance(
@@ -81,6 +82,7 @@ async fn native_futures_release_js_and_resume_on_the_owning_thread() {
                         count: 42
                     }),
                 );
+
                 assert_eq!(
                     first.catch(&ctx).unwrap(),
                     Reply {
@@ -120,6 +122,7 @@ async fn rejected_native_promises_are_catchable_and_js_rejections_reach_rust() {
                     .unwrap(),
                 )
                 .unwrap();
+
             let caught: Handler<String, String> = ctx
                 .eval(
                     r#"

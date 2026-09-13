@@ -5,6 +5,7 @@ use std::{collections::HashMap, net::SocketAddr, time::Duration};
 use tokio::time::Instant;
 
 const MAX_DATAGRAMS: usize = 64;
+
 const REASSEMBLY_LIFETIME: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -117,6 +118,7 @@ impl Decoder {
 
     pub fn decode(&mut self, data: &[u8], now: Instant) -> Option<Packet> {
         data.first()?;
+
         let (mut ip, payload, fragment) = match IpVersion::of_packet(data).ok()? {
             IpVersion::Ipv4 => {
                 let packet = Ipv4Packet::new_checked(data).ok()?;
@@ -152,6 +154,7 @@ impl Decoder {
                 (IpRepr::Ipv6(repr), payload, fragment)
             }
         };
+
         if !unicast(ip.src_addr()) || !unicast(ip.dst_addr()) || ip.hop_limit() == 0 {
             return None;
         }
@@ -165,6 +168,7 @@ impl Decoder {
         } else {
             payload.to_vec()
         };
+
         ip.set_payload_len(payload.len());
         Some(Packet { ip, payload })
     }
@@ -184,6 +188,7 @@ impl Decoder {
             ..
         } = fragment;
         self.expire(now);
+
         if !self.fragments.contains_key(&key) && self.fragments.len() >= MAX_DATAGRAMS {
             return None;
         }
@@ -199,6 +204,7 @@ impl Decoder {
         if assembly.poisoned {
             return None;
         }
+
         let end = offset + data.len();
         if data.is_empty()
             || end > 65535 - prefix_len
@@ -226,6 +232,7 @@ impl Decoder {
         if !more {
             assembly.total = Some(end);
         }
+
         assembly.data.resize(assembly.data.len().max(end), 0);
         assembly.data[offset..end].copy_from_slice(data);
         if assembly.total != Some(assembly.ranges.peek_front()) {
@@ -276,6 +283,7 @@ fn ipv6_extensions(
     mut payload: &[u8],
 ) -> Option<(IpProtocol, &[u8], Option<Fragment>)> {
     let initial_len = payload.len();
+
     // A finite chain bounds CPU even for tiny extension headers. Unsupported
     // routing/security extensions are filtered before transport admission.
     for index in 0..8 {

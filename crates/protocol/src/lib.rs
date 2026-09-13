@@ -41,6 +41,7 @@ pub trait Carrier: Send + Sync {
     fn tcp(&self, target: Target) -> BoxFuture<'_, Result<BoxStream>> {
         self.tcp_scoped(target, self.scope().child())
     }
+
     fn udp(&self, target: Target) -> BoxFuture<'_, Result<Datagram>> {
         self.udp_scoped(target, self.scope().child())
     }

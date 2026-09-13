@@ -36,6 +36,7 @@ pub fn bind(options: TunInboundConfig, context: ServerContext) -> Result<BoundTu
         !context.udp_idle_timeout.is_zero(),
         "UDP idle timeout must be positive"
     );
+
     let query = net::socket_with(
         AddressFamily::INET,
         SocketType::DGRAM,
@@ -48,6 +49,7 @@ pub fn bind(options: TunInboundConfig, context: ServerContext) -> Result<BoundTu
         Err(Errno::NODEV | Errno::NXIO) => {}
         Err(error) => return Err(error).context("check TUN interface name"),
     }
+
     let mut builder = tun_rs::DeviceBuilder::new()
         .name(&options.name)
         .mtu(options.mtu)
@@ -56,6 +58,7 @@ pub fn bind(options: TunInboundConfig, context: ServerContext) -> Result<BoundTu
         .packet_information(false);
     let mut addresses = HashSet::new();
     let mut ipv4 = false;
+
     for address in options.addresses {
         ensure!(
             crate::packet::unicast(address.address.into()),
@@ -75,10 +78,12 @@ pub fn bind(options: TunInboundConfig, context: ServerContext) -> Result<BoundTu
             }
         }
     }
+
     let device = builder
         .enable(true)
         .build_async()
         .context("create Linux TUN interface")?;
+
     let name = device.name().context("read TUN interface name")?;
     Ok(BoundTun {
         name,

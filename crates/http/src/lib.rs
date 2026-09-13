@@ -20,10 +20,12 @@ impl p::Client for Client {
             udp: false,
         }
     }
+
     fn tcp(&self, target: Target, scope: Scope) -> BoxFuture<'_, Result<BoxStream>> {
         Box::pin(async move {
             self.carrier.capabilities().require(Capabilities::TCP)?;
             let authority = authority(&target)?;
+
             let mut stream = BufReader::new(
                 self.carrier
                     .tcp_scoped(self.endpoint.resolve().await?, scope.clone())
@@ -35,6 +37,7 @@ impl p::Client for Client {
                 )
                 .await?;
             stream.flush().await?;
+
             let header = header(&mut stream).await?;
             let mut headers = [httparse::EMPTY_HEADER; 64];
             let mut response = httparse::Response::new(&mut headers);
@@ -50,6 +53,7 @@ impl p::Client for Client {
             Ok(Box::pin(stream) as BoxStream)
         })
     }
+
     fn udp(&self, _: Target, _: Scope) -> BoxFuture<'_, Result<Datagram>> {
         Box::pin(async { bail!("HTTP CONNECT does not support UDP") })
     }
@@ -66,10 +70,12 @@ impl p::Server for Server {
         Box::pin(async move {
             let listener = TcpListener::bind(address).await?;
             let local_addr = listener.local_addr()?;
+
             Ok(BoundServer {
                 local_addr,
                 run: Box::pin(async move {
                     let handler = context.handler.clone();
+
                     accept_loop(listener, context, move |stream, _, _, scope| {
                         let handler = handler.clone();
 

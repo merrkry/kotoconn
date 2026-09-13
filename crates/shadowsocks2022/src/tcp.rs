@@ -38,12 +38,14 @@ pub(super) async fn connect(
     address(target).write_to_buf(&mut header);
 
     let padding = rand::random_range(1..=900);
+
     header.put_u16(padding);
     let start = header.len();
     header.resize(start + usize::from(padding), 0);
     rand::rng().fill_bytes(&mut header[start..]);
     stream.write_all(&header).await?;
     stream.flush().await?;
+
     Ok(Box::pin(stream))
 }
 
@@ -72,6 +74,7 @@ impl AsyncRead for Encrypted {
                 .poll_read_decrypted(cx, &this.context, output)
                 .map_err(Into::into);
         }
+
         // Keep first-response plaintext private until the echoed request salt
         // has been checked. An error must not modify the caller's output buffer.
         let mut bytes = [0; 8192];
@@ -104,9 +107,11 @@ impl AsyncWrite for Encrypted {
             .poll_write_encrypted(cx, data)
             .map_err(Into::into)
     }
+
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.stream.poll_flush(cx).map_err(Into::into)
     }
+
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.stream.poll_shutdown(cx).map_err(Into::into)
     }

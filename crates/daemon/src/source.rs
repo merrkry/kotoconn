@@ -11,11 +11,13 @@ pub(crate) struct Files {
 impl Files {
     pub fn open(path: &Path) -> io::Result<(String, Self)> {
         let path = path.canonicalize()?;
+
         let entry = path
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| io::Error::other("policy filename must be UTF-8"))?
             .to_owned();
+
         let root = path
             .parent()
             .ok_or_else(|| io::Error::other("policy must have a parent directory"))?

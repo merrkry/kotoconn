@@ -26,7 +26,12 @@ pub(super) async fn association(handler: SessionHandler, mut packets: Datagram) 
             biased;
             _ = packets.scope.cancelled() => return Ok(()),
             Some((target, generation)) = completions.recv() => {
-                if sessions.get(&target).is_some_and(|entry| entry.generation == generation) { sessions.remove(&target); }
+                if sessions
+                    .get(&target)
+                    .is_some_and(|entry| entry.generation == generation)
+                {
+                    sessions.remove(&target);
+                }
             }
             packet = packets.rx.recv() => {
                 let Some(packet) = packet else { return Ok(()); };
@@ -90,6 +95,7 @@ async fn session(
         .sessions
         .register(destination.clone(), TransportProtocol::Udp, scope.clone())
         .await?;
+
     let (activity, last_activity) = watch::channel(Instant::now());
     let work = async {
         let decision = handler

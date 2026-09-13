@@ -1,5 +1,6 @@
 //! Public inbound construction. Wire protocols live in their own adapter crates.
 mod direct;
+
 use anyhow::Result;
 use kotoconn_config::InboundImpl;
 pub use kotoconn_http as http;

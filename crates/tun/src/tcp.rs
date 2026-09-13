@@ -27,6 +27,7 @@ use tokio::{
 };
 
 const BUFFER_SIZE: usize = 64 * 1024;
+
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) struct Stream {
@@ -136,6 +137,7 @@ pub(crate) fn connection(
     let (local, mut app) = tokio::io::duplex(BUFFER_SIZE);
     let (dropped, mut drop_rx) = oneshot::channel();
     let reset = Arc::new(AtomicBool::new(false));
+
     let stream = Stream {
         inner: local,
         reset: reset.clone(),
@@ -146,10 +148,12 @@ pub(crate) fn connection(
     let driver = Box::pin(async move {
         let mut guard = ResetOnDrop { reset, armed: true };
         let epoch = Instant::now();
+
         let mut device = Device::new(mtu);
         let mut config = Config::new(HardwareAddress::Ip);
         config.random_seed = rand::random();
         let mut iface = Interface::new(config, &mut device, smoltcp::time::Instant::ZERO);
+
         let destination: IpAddress = flow.destination.ip().into();
         let source: IpAddress = flow.source.ip().into();
         iface.update_ip_addrs(|addrs| {
@@ -160,6 +164,7 @@ pub(crate) fn connection(
                 ))
                 .unwrap();
         });
+
         match source {
             IpAddress::Ipv4(ip) => {
                 iface.routes_mut().add_default_ipv4_route(ip).unwrap();
@@ -168,6 +173,7 @@ pub(crate) fn connection(
                 iface.routes_mut().add_default_ipv6_route(ip).unwrap();
             }
         }
+
         let mut socket = tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0; BUFFER_SIZE]),
             tcp::SocketBuffer::new(vec![0; BUFFER_SIZE]),
@@ -177,15 +183,18 @@ pub(crate) fn connection(
         socket
             .listen(IpEndpoint::new(destination, flow.destination.port()))
             .map_err(io::Error::other)?;
+
         let mut sockets = SocketSet::new(vec![]);
         let handle = sockets.add(socket);
         let mut admission = Some((accepted_tx, stream));
+
         let mut read_eof = false;
         let mut write_eof = false;
         let mut drop_seen = false;
         let mut turns = 0;
         let mut stop_seen = false;
         let mut handshake_started = false;
+
         loop {
             let now = smoltcp::time::Instant::from_micros(epoch.elapsed().as_micros() as i64);
             iface.poll(now, &mut device, &mut sockets);
@@ -231,25 +240,55 @@ pub(crate) fn connection(
             }
             let admitting = admission.is_some();
             tokio::select! {
-                _ = async { if let Some((tx, _)) = &mut admission { tx.closed().await; } else { std::future::pending().await } }, if admitting => { sockets.get_mut::<tcp::Socket>(handle).abort(); }
-                _ = stopping.cancelled(), if !stop_seen => { stop_seen = true; }
+                _ = async {
+                    if let Some((tx, _)) = &mut admission {
+                        tx.closed().await;
+                    } else {
+                        std::future::pending().await
+                    }
+                }, if admitting => {
+                    sockets.get_mut::<tcp::Socket>(handle).abort();
+                }
+                _ = stopping.cancelled(), if !stop_seen => {
+                    stop_seen = true;
+                }
                 result = &mut drop_rx, if !drop_seen => {
                     drop_seen = true;
-                    if result != Ok(true) { sockets.get_mut::<tcp::Socket>(handle).abort(); }
+                    if result != Ok(true) {
+                        sockets.get_mut::<tcp::Socket>(handle).abort();
+                    }
                 }
                 _ = tokio::time::sleep_until(epoch + HANDSHAKE_TIMEOUT), if admitting => {
                     sockets.get_mut::<tcp::Socket>(handle).abort();
                 }
                 permit = output.reserve(), if !device.outgoing.is_empty() => {
-                    permit.map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?.send(Transmit::Packet(device.outgoing.pop_front().unwrap()));
+                    permit
+                        .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?
+                        .send(Transmit::Packet(device.outgoing.pop_front().unwrap()));
                 }
                 packet = incoming.recv(), if device.incoming.is_none() && device.outgoing.len() < 32 => {
-                    match packet { Some(packet) => device.incoming = Some(packet.bytes), None => return Err(reset_error()) }
+                    match packet {
+                        Some(packet) => device.incoming = Some(packet.bytes),
+                        None => return Err(reset_error()),
+                    }
                 }
-                result = poll_fn(|cx| bridge(cx, sockets.get_mut::<tcp::Socket>(handle), &mut app, &mut read_eof, &mut write_eof)), if !admitting => {
-                    if result.is_err() { sockets.get_mut::<tcp::Socket>(handle).abort(); }
+                result = poll_fn(|cx| bridge(
+                    cx,
+                    sockets.get_mut::<tcp::Socket>(handle),
+                    &mut app,
+                    &mut read_eof,
+                    &mut write_eof,
+                )), if !admitting => {
+                    if result.is_err() {
+                        sockets.get_mut::<tcp::Socket>(handle).abort();
+                    }
                 }
-                _ = async { match deadline { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await } }, if device.outgoing.len() < 32 => {}
+                _ = async {
+                    match deadline {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                }, if device.outgoing.len() < 32 => {}
             }
         }
     });
@@ -275,6 +314,7 @@ fn bridge(
                 result => (0, result.map_ok(|_| ())),
             })
             .map_err(io::Error::other)?;
+
         if let Poll::Ready(result) = result {
             result?;
             progressed = true;
@@ -289,6 +329,7 @@ fn bridge(
         *read_eof = true;
         progressed = true;
     }
+
     if socket.can_send() && !*write_eof {
         let result = socket
             .send(|bytes| {

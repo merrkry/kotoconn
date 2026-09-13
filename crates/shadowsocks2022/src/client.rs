@@ -27,6 +27,7 @@ impl p::Client for Client {
     fn capabilities(&self) -> Capabilities {
         self.carrier.capabilities()
     }
+
     fn tcp(&self, target: Target, scope: Scope) -> BoxFuture<'_, Result<BoxStream>> {
         Box::pin(async move {
             let stream = self
@@ -36,6 +37,7 @@ impl p::Client for Client {
             super::tcp::connect(stream, target, &self.crypto).await
         })
     }
+
     fn udp(&self, _: Target, scope: Scope) -> BoxFuture<'_, Result<Datagram>> {
         Box::pin(async move {
             let endpoint = self.endpoint.resolve().await?;
@@ -66,18 +68,20 @@ impl p::Client for Client {
                                 continue;
                             };
 
-                            if ctrl.client_session_id != client_id { continue; }
+                            if ctrl.client_session_id != client_id {
+                                continue;
+                            }
 
                             // Bound authenticated server rotations per association.
                             if windows.len() >= 1024 && !windows.contains_key(&ctrl.server_session_id) {
                                 continue;
                             }
 
-                            if !windows
+                            let accepted = windows
                                 .entry(ctrl.server_session_id)
                                 .or_default()
-                                .validate_packet_id(ctrl.packet_id, PACKET_LIMIT)
-                            {
+                                .validate_packet_id(ctrl.packet_id, PACKET_LIMIT);
+                            if !accepted {
                                 continue;
                             }
 
@@ -85,7 +89,10 @@ impl p::Client for Client {
 
                             let _ = driver
                                 .tx
-                                .try_send(Packet { target: from_address(destination), payload: payload.into() });
+                                .try_send(Packet {
+                                    target: from_address(destination),
+                                    payload: payload.into(),
+                                });
                         }
                         packet = driver.rx.recv() => {
                             let Some(packet) = packet else { return Ok(()); };
@@ -109,11 +116,12 @@ impl p::Client for Client {
                                 continue;
                             }
 
+                            let result = transport.tx.try_send(Packet {
+                                target: endpoint.clone(),
+                                payload: wire.freeze(),
+                            });
                             if matches!(
-                                transport.tx.try_send(Packet {
-                                    target: endpoint.clone(),
-                                    payload: wire.freeze(),
-                                }),
+                                result,
                                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
                             ) {
                                 return Ok(());

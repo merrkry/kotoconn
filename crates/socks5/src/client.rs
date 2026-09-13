@@ -19,6 +19,7 @@ impl p::Client for Client {
             udp: lower.tcp && lower.udp,
         }
     }
+
     fn tcp(&self, destination: Target, scope: Scope) -> BoxFuture<'_, Result<BoxStream>> {
         Box::pin(async move {
             self.carrier.capabilities().require(Capabilities::TCP)?;
@@ -33,6 +34,7 @@ impl p::Client for Client {
             Ok(protocol.get_socket())
         })
     }
+
     fn udp(&self, _: Target, scope: Scope) -> BoxFuture<'_, Result<Datagram>> {
         Box::pin(async move {
             self.carrier.capabilities().require(Capabilities::BOTH)?;
@@ -62,21 +64,33 @@ impl p::Client for Client {
                 .await?;
             let mut control = protocol.get_socket();
             let (user, mut driver) = packet_pair(scope.clone());
+
             scope.spawn(async move {
                 let mut byte = [0];
+
                 loop {
                     tokio::select! {
                         biased;
                         _ = control.read(&mut byte) => return Ok(()),
                         received = transport.rx.recv() => {
                             let Some(received) = received else { bail!("SOCKS UDP carrier closed"); };
-                            if let Ok(packet) = decode(&received.payload).await { let _ = driver.tx.try_send(packet); }
+                            if let Ok(packet) = decode(&received.payload).await {
+                                let _ = driver.tx.try_send(packet);
+                            }
                         }
                         packet = driver.rx.recv() => {
                             let Some(packet) = packet else { return Ok(()); };
+
                             match encode(packet) {
                                 Ok(payload) => {
-                                    if matches!(transport.tx.try_send(Packet { target: relay.clone(), payload: payload.into() }), Err(tokio::sync::mpsc::error::TrySendError::Closed(_))) {
+                                    let result = transport.tx.try_send(Packet {
+                                        target: relay.clone(),
+                                        payload: payload.into(),
+                                    });
+                                    if matches!(
+                                        result,
+                                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+                                    ) {
                                         return Ok(());
                                     }
                                 },

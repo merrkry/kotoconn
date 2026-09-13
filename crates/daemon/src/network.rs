@@ -1,6 +1,7 @@
 //! Native protocol execution. Each session progresses independently of supervision.
 mod sessions;
 mod udp;
+
 use crate::{Error, Policy, Shutdown};
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::future::BoxFuture;
@@ -36,6 +37,7 @@ impl Network {
             .await
             .map_err(|e| Error::Config(e.to_string()))
     }
+
     async fn build(
         policy: Policy,
         stopping: CancellationToken,
@@ -43,10 +45,12 @@ impl Network {
     ) -> Result<Self> {
         let scope = Scope::new();
         let clients = Arc::new(build_clients(&policy, scope.clone())?);
+
         let (sessions, registry) = sessions::Sessions::new();
         let mut bound = Vec::new();
         let mut addresses = HashMap::new();
         let mut inbound_addresses = HashMap::new();
+
         for (id, config) in &policy.config().inbounds {
             ensure!(
                 !config.udp_idle_timeout.is_zero(),
@@ -66,6 +70,7 @@ impl Network {
                 sessions: sessions.clone(),
                 idle: config.udp_idle_timeout,
             });
+
             let server = kotoconn_inbounds::bind(
                 config.implementation.clone(),
                 ServerContext {
@@ -76,12 +81,14 @@ impl Network {
                 },
             )
             .await?;
+
             if let kotoconn_inbounds::InboundAddress::Socket(address) = &server.address {
                 addresses.insert(*id, *address);
             }
             inbound_addresses.insert(*id, server.address.clone());
             bound.push(server);
         }
+
         let (failed, failure) = tokio::sync::watch::channel(None);
         for server in bound {
             let failed = failed.clone();
@@ -97,6 +104,7 @@ impl Network {
                 result
             })?;
         }
+
         let close = scope.clone();
         let force_signal = force.clone();
         // This supervisor is not part of the sessions it waits for.
@@ -117,6 +125,7 @@ impl Network {
             _registry: registry,
         })
     }
+
     pub async fn wait(&self) -> Result<Shutdown, Error> {
         self.scope.wait().await;
         match self.failure.borrow().as_ref() {
@@ -161,8 +170,10 @@ fn build_clients(policy: &Policy, scope: Scope) -> Result<HashMap<DialerId, Arc<
             next = definitions.get(&id).context("unknown carrier")?.dialer;
         }
     }
+
     let system: Arc<dyn Carrier> = Arc::new(System::new(scope));
     let mut clients = HashMap::<DialerId, Arc<Clients>>::new();
+
     while clients.len() < definitions.len() {
         for (id, config) in definitions {
             if clients.contains_key(id) {
@@ -179,6 +190,7 @@ fn build_clients(policy: &Policy, scope: Scope) -> Result<HashMap<DialerId, Arc<
                 policy: policy.clone(),
                 id: config.outbound.resolve_handler,
             });
+
             clients.insert(
                 *id,
                 Arc::new(Clients::new(
@@ -213,6 +225,7 @@ impl p::Handler for SessionHandler {
                 .sessions
                 .register(destination.clone(), TransportProtocol::Tcp, scope.clone())
                 .await?;
+
             scope
                 .run(async {
                     let decision = self
@@ -230,6 +243,7 @@ impl p::Handler for SessionHandler {
                     };
                     let client = self.clients.get(&dialer).context("unknown dialer")?;
                     let control = client.control(TransportProtocol::Tcp);
+
                     control
                         .run(async {
                             let mut outbound = client.tcp_scoped(target, scope.clone()).await?;
@@ -241,6 +255,7 @@ impl p::Handler for SessionHandler {
                 .await
         })
     }
+
     fn udp(&self, packets: Datagram) -> BoxFuture<'_, Result<()>> {
         Box::pin(udp::association(self.clone(), packets))
     }

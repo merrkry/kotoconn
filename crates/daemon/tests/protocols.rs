@@ -10,6 +10,7 @@ use tokio::{
 };
 
 const KEY: &str = "AAECAwQFBgcICQoLDA0ODw==";
+
 const LIMIT: Duration = Duration::from_secs(20);
 
 fn direct() -> OutboundImpl {
@@ -144,6 +145,7 @@ async fn protocols_and_nested_carriers_preserve_tcp_and_udp() -> Result<()> {
         let scope = Scope::new();
         let (tcp, udp) = echoes(&scope).await?;
         let system: Arc<dyn Carrier> = Arc::new(System::new(scope.clone()));
+
         for kind in ["http", "socks5", "shadowsocks2022"] {
             let client = Clients::new(
                 outbound(kind, address(&daemon, kind)),
@@ -157,6 +159,7 @@ async fn protocols_and_nested_carriers_preserve_tcp_and_udp() -> Result<()> {
                 assert!(client.udp(udp.clone()).await.is_err());
             }
         }
+
         // SOCKS over Shadowsocks uses one carrier for both control and data.
         let ss: Arc<dyn Carrier> = Arc::new(Clients::new(
             outbound("shadowsocks2022", address(&daemon, "shadowsocks2022")),
@@ -176,6 +179,7 @@ async fn protocols_and_nested_carriers_preserve_tcp_and_udp() -> Result<()> {
             Arc::new(SystemResolver),
         )?;
         tcp_roundtrip(&http, tcp).await?;
+
         // A domain user target cannot accidentally fall through to OS DNS.
         let direct = Clients::new(direct(), system, Arc::new(SystemResolver))?;
         let mut rejected = direct
@@ -203,6 +207,7 @@ async fn http_admission_preserves_pipelined_bytes_and_rejects_bad_headers() -> R
         let endpoint = socket_addr(&address(&daemon, "http"))?;
         let destination = socket_addr(&tcp)?;
         let mut stream = TcpStream::connect(endpoint).await?;
+
         stream
             .write_all(
                 format!("CONNECT {destination} HTTP/1.1\r\nHost: {destination}\r\n\r\npipelined")
@@ -218,6 +223,7 @@ async fn http_admission_preserves_pipelined_bytes_and_rejects_bad_headers() -> R
         stream.read_exact(&mut payload).await?;
         assert_eq!(&payload, b"hellopipelined");
         drop(stream);
+
         let mut stream = TcpStream::connect(endpoint).await?;
         stream
             .write_all(b"CONNECT invalid HTTP/1.1\r\n\r\n")
@@ -225,6 +231,7 @@ async fn http_admission_preserves_pipelined_bytes_and_rejects_bad_headers() -> R
         let mut response = Vec::new();
         stream.read_to_end(&mut response).await?;
         assert!(response.starts_with(b"HTTP/1.1 400"));
+
         scope.close();
         scope.wait().await;
         daemon.shutdown().await?;
@@ -247,6 +254,7 @@ async fn sessions_split_by_destination_and_close_without_killing_association() -
             Arc::new(SystemResolver),
         )?;
         let mut association = client.udp(a.clone()).await?;
+
         for destination in [&a, &b, &a] {
             association
                 .tx
@@ -257,12 +265,14 @@ async fn sessions_split_by_destination_and_close_without_killing_association() -
                 .await?;
             assert_eq!(association.rx.recv().await.unwrap().target, *destination);
         }
+
         let sessions = daemon.sessions().await?;
         let a_session = sessions.iter().find(|s| s.destination == a).unwrap();
         let b_session = sessions.iter().find(|s| s.destination == b).unwrap();
         assert_eq!(sessions.len(), 2);
         a_session.close();
         a_session.wait().await;
+
         association
             .tx
             .send(Packet {
@@ -293,6 +303,7 @@ async fn sessions_split_by_destination_and_close_without_killing_association() -
                 .iter()
                 .any(|s| s.destination == a && s.id != a_session.id)
         );
+
         drop(association);
         scope.close();
         scope.wait().await;
@@ -320,6 +331,7 @@ async fn lower_tcp_close_ends_socks_udp_control_but_not_sibling_udp() -> Result<
             Arc::new(SystemResolver),
         )?;
         let mut association = socks.udp(target.clone()).await?;
+
         association
             .tx
             .send(Packet {
@@ -333,6 +345,7 @@ async fn lower_tcp_close_ends_socks_udp_control_but_not_sibling_udp() -> Result<
         lower.control(TransportProtocol::Tcp).wait().await;
         // Closing TCP must not close the same protocol instance's UDP entry.
         udp_roundtrip(lower.as_ref(), target).await?;
+
         scope.close();
         scope.wait().await;
         daemon.shutdown().await?;
@@ -370,6 +383,7 @@ async fn shadowsocks_udp_rejects_tampering_and_replay_before_routing() -> Result
         let mut ctrl = UdpSocketControlData::default();
         ctrl.client_session_id = 123456;
         let mut buffer = vec![0; 65536];
+
         for id in [1, 2] {
             ctrl.packet_id = id;
             let mut wire = BytesMut::new();
@@ -399,6 +413,7 @@ async fn shadowsocks_udp_rejects_tampering_and_replay_before_routing() -> Result
             }
             // The next reply must be packet 2, not a second echo of replayed packet 1.
         }
+
         scope.close();
         scope.wait().await;
         daemon.shutdown().await?;
@@ -417,7 +432,12 @@ async fn capability_checks_and_udp_policy_contract_reject_invalid_requests() -> 
             Arc::new(System::new(scope.clone())),
             Arc::new(SystemResolver),
         )?);
-        let socks = Clients::new(outbound("socks5", target("127.0.0.1:1".parse()?)), http, Arc::new(SystemResolver))?;
+        let socks = Clients::new(
+            outbound("socks5", target("127.0.0.1:1".parse()?)),
+            http,
+            Arc::new(SystemResolver),
+        )?;
+
         assert!(socks.capabilities().tcp);
         assert!(!socks.capabilities().udp);
         // Fails before any connection attempt or fallback to system UDP.
@@ -428,7 +448,12 @@ async fn capability_checks_and_udp_policy_contract_reject_invalid_requests() -> 
             const d = k.dialer({dialer: undefined, outbound: {resolve_handler: resolver, implementation: k.direct_outbound({})}});
             k.routing_handler(flow => k.route(d, flow.dest));
         "#;
-        let daemon = Daemon::start_with_sources("main.ts".into(), HashMap::from([("main.ts".into(), source.into())]), Duration::from_secs(1)).await?;
+        let daemon = Daemon::start_with_sources(
+            "main.ts".into(),
+            HashMap::from([("main.ts".into(), source.into())]),
+            Duration::from_secs(1),
+        )
+        .await?;
         let handler = *daemon.policy().config().routing_handlers.iter().next().unwrap();
         let error = daemon
             .policy()
@@ -443,7 +468,8 @@ async fn capability_checks_and_udp_policy_contract_reject_invalid_requests() -> 
             .unwrap_err();
         assert!(error.to_string().contains("route_udp"));
         daemon.shutdown().await?;
-        scope.close(); scope.wait().await;
+        scope.close();
+        scope.wait().await;
         Ok::<_, anyhow::Error>(())
     }).await??;
     Ok(())
@@ -455,6 +481,7 @@ async fn configured_resolver_only_receives_outbound_server_names() -> Result<()>
         let daemon = daemon().await?;
         let scope = Scope::new();
         let (echo, _) = echoes(&scope).await?;
+
         struct Recording(tokio::sync::mpsc::UnboundedSender<String>);
         impl Resolver for Recording {
             fn resolve(
@@ -467,6 +494,7 @@ async fn configured_resolver_only_receives_outbound_server_names() -> Result<()>
                 })
             }
         }
+
         let (tx, mut names) = tokio::sync::mpsc::unbounded_channel();
         let endpoint = Target::Domain {
             name: "proxy.test".into(),
@@ -509,6 +537,7 @@ async fn socks_udp_discards_fragments_and_control_close_finishes_sessions() -> R
         };
         let socket = UdpSocket::bind("127.0.0.1:0").await?;
         socket.connect(relay).await?;
+
         let mut wire = fast_socks5::new_udp_header(socket_addr(&echo)?)?;
         wire.extend(b"discard");
         wire[2] = 1;
@@ -521,6 +550,7 @@ async fn socks_udp_discards_fragments_and_control_close_finishes_sessions() -> R
         let n = socket.recv(&mut buffer).await?;
         let (_, _, payload) = fast_socks5::parse_udp_request(&buffer[..n]).await?;
         assert_eq!(payload, b"valid");
+
         let session = daemon
             .sessions()
             .await?
@@ -550,6 +580,7 @@ async fn shutdown_deadline_reports_forced_network_cleanup() -> Result<()> {
             Arc::new(SystemResolver),
         )?;
         let mut stream = client.tcp(echo).await?;
+
         let mut greeting = [0; 5];
         stream.read_exact(&mut greeting).await?;
         assert_eq!(

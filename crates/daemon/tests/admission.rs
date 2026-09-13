@@ -26,6 +26,7 @@ impl Handler for Inspect {
             Ok(())
         })
     }
+
     fn udp(&self, _: Datagram) -> BoxFuture<'_, Result<()>> {
         unreachable!()
     }
@@ -37,6 +38,7 @@ async fn inbound_admission_allows_inspection_and_preserves_domain_target() -> Re
         let scope = Scope::new();
         let stopping = CancellationToken::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
         let bound = kotoconn_inbounds::bind(
             kotoconn_config::InboundImpl::Http(HttpInboundConfig {
                 listen: "127.0.0.1:0".parse()?,
@@ -54,6 +56,7 @@ async fn inbound_admission_allows_inspection_and_preserves_domain_target() -> Re
         };
         let address = target(address);
         scope.spawn(bound.run)?;
+
         let client = Clients::new(
             kotoconn_config::OutboundImpl::Http(kotoconn_config::HttpOutboundConfig {
                 server: address,
@@ -70,6 +73,7 @@ async fn inbound_admission_allows_inspection_and_preserves_domain_target() -> Re
         let mut echoed = [0; 5];
         stream.read_exact(&mut echoed).await?;
         assert_eq!(&echoed, b"sniff");
+
         assert_eq!(rx.recv().await.unwrap(), destination);
         scope.close();
         scope.wait().await;

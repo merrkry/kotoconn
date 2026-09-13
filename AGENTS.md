@@ -8,11 +8,11 @@ Time limits are allowed only when interacting with external systems, such as sub
 
 ## Dependencies
 
-Don't make re-inventing the wheel as primary consideration. Import well-maintained dependencies for:
+Do not make avoiding dependencies the primary consideration. Use well-maintained dependencies for:
 
 - reducing boilerplate code
 - complex features: cross-platform support, cross-language interop, network protocols
-- performce- or security-critical logic
+- performance- or security-critical logic
 
 ## Documentation
 
@@ -20,11 +20,13 @@ See `docs/adr` for design decisions.
 
 Documentation must remain consistent with the implementation. In cases of ambiguous or conflicting semantics, you must explicitly confirm with the user whether to modify the documentation or adjust the implementation.
 
-## Style
+## Code Style
 
-### Rust
+Leave one blank line between top-level items, including type, trait, implementation, and function definitions. Keep related imports and module declarations grouped.
 
-Leave a blank line between top-level declarations, including `struct` and `trait` definitions and `impl` blocks.
+Use blank lines to show the phases of longer functions. Separate setup, validation, core work, and cleanup into readable blocks, and expand dense one-line branches when the control flow is easier to scan that way. Avoid long uninterrupted runs of executable statements.
+
+When reviewing or editing code, scan for consecutive non-empty lines and add a blank line wherever the next statement starts a distinct logical step.
 
 ## Version control
 

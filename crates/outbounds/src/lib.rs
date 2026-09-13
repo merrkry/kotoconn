@@ -1,5 +1,6 @@
 //! Public client construction and independent TCP/UDP close handles.
 mod system;
+
 use anyhow::Result;
 use futures_util::future::BoxFuture;
 use kotoconn_config::{OutboundImpl, TransportProtocol};
@@ -24,6 +25,7 @@ impl Clients {
         resolver: Arc<dyn Resolver>,
     ) -> Result<Self> {
         let scope = carrier.scope().child();
+
         let protocol: Arc<dyn Client> = match config {
             OutboundImpl::Http(options) => Arc::new(http::Client {
                 endpoint: Endpoint {
@@ -57,6 +59,7 @@ impl Clients {
             protocol,
         })
     }
+
     pub fn control(&self, protocol: TransportProtocol) -> Scope {
         match protocol {
             TransportProtocol::Tcp => self.tcp.clone(),
@@ -69,9 +72,11 @@ impl Carrier for Clients {
     fn capabilities(&self) -> Capabilities {
         self.protocol.capabilities()
     }
+
     fn scope(&self) -> &Scope {
         &self.scope
     }
+
     fn tcp_scoped(&self, target: Target, caller: Scope) -> BoxFuture<'_, Result<BoxStream>> {
         Box::pin(async move {
             self.capabilities().require(Capabilities::TCP)?;
@@ -83,6 +88,7 @@ impl Carrier for Clients {
             })
         })
     }
+
     fn udp_scoped(&self, target: Target, caller: Scope) -> BoxFuture<'_, Result<Datagram>> {
         Box::pin(async move {
             self.capabilities().require(Capabilities {
@@ -111,6 +117,7 @@ impl Carrier for Clients {
                     }
                     Ok::<(), anyhow::Error>(())
                 };
+
                 tokio::select! { result = outgoing => result, result = incoming => result }
             })?;
             Ok(user)
@@ -124,9 +131,11 @@ impl Client for Direct {
     fn capabilities(&self) -> Capabilities {
         self.0.capabilities()
     }
+
     fn tcp(&self, target: Target, scope: Scope) -> BoxFuture<'_, Result<BoxStream>> {
         self.0.tcp_scoped(target, scope)
     }
+
     fn udp(&self, target: Target, scope: Scope) -> BoxFuture<'_, Result<Datagram>> {
         self.0.udp_scoped(target, scope)
     }
