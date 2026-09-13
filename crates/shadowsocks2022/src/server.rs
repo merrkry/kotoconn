@@ -197,7 +197,7 @@ async fn udp(socket: UdpSocket, context: ServerContext, crypto: Arc<Crypto>) -> 
                 if wire.len() <= 65507
                     && let Err(error) = socket.send_to(&wire, association.peer).await
                 {
-                    eprintln!("Shadowsocks UDP reply: {error}");
+                    tracing::warn!(error = %format_args!("{error:#}"), "Shadowsocks UDP reply");
                 }
 
                 association.active = Instant::now();

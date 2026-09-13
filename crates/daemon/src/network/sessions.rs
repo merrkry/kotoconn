@@ -42,7 +42,7 @@ pub(crate) struct Sessions {
 }
 
 pub(super) struct Registration {
-    id: SessionId,
+    pub(super) id: SessionId,
     tx: mpsc::UnboundedSender<Command>,
 }
 

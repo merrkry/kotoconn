@@ -19,3 +19,16 @@ Module names stay relative to the entry file's parent directory. Daemon reads on
 TCP and UDP clients expose independent close handles through `client_control`. `sessions()` returns stable session handles with `close()` and `wait()` methods. These are control capabilities; no hot-switching policy is imposed. Sessions run in independent Tokio tasks. See ADRs 0004–0008 for carrier capabilities, resolution, UDP lifetime, admission and protocol scope.
 
 Shadowsocks uses the single-user AES-128-GCM 2022 method in this version. The example key is public test data, not a deployment credential. HTTP supports CONNECT only; SOCKS5 supports CONNECT and UDP ASSOCIATE without authentication. UDP session routing uses `route_udp` and cannot override the destination. `lookup` uses system DNS; the I/O carrier itself never resolves domain targets.
+
+## Logging
+
+The `kotoconn` binary initializes a global tracing subscriber before starting the runtime. Logs go to stderr and default to `info`. Set `RUST_LOG` to control levels by module; an invalid filter fails startup. Use `--log-format json` for newline-delimited JSON, or keep the default `text` format. Text output uses color only when stderr is a terminal.
+
+```sh
+RUST_LOG=info,kotoconn_daemon=debug cargo run -p kotoconn-cli -- \
+  run --config packages/api/examples/policy.ts --log-format json
+```
+
+Info events report startup, bound inbound addresses and shutdown. Warnings report connection and datagram failures; errors report policy call failures and fatal CLI failures. Debug events include session start and completion, routing decisions, TCP byte counts and UDP idle expiry. Session spans carry the transport, destination and registry session ID. Inbound and accepted TCP connection spans add the inbound ID and peer/local addresses. Policy calls retain their parent span across the worker queue, and spawned protocol and native tasks inherit the current span.
+
+Logs do not dump configuration objects, credentials, source code or packet payloads. Addresses and domains appear in spans, and error text may include details supplied by user policy. Libraries emit tracing events without installing a subscriber; applications embedding `Daemon` configure their own subscriber.

@@ -5,6 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+tracing.workspace = true
 kotoconn-config.workspace = true
 kotoconn-typescript.workspace = true
 rquickjs.workspace = true

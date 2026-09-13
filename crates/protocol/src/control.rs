@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 use std::{future::Future, sync::Arc};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tracing::Instrument;
 
 /// Cloneable close handle. Cancellation follows carrier ancestry; completion includes
 /// registered descendant tasks. A handle does not own or lock an I/O state machine.
@@ -88,14 +89,18 @@ impl Scope {
         }
 
         let scope = self.clone();
-        tokio::spawn(async move {
-            let _guards = guards;
-            if let Err(error) = scope.run(work).await
-                && !scope.is_closed()
-            {
-                eprintln!("connection: {error:#}");
+        tokio::spawn(
+            async move {
+                let _guards = guards;
+                if let Err(error) = scope.run(work).await
+                    && !scope.is_closed()
+                {
+                    tracing::warn!(error = %format_args!("{error:#}"), "connection");
+                }
             }
-        });
+            .in_current_span(),
+        );
+
         Ok(())
     }
 }
