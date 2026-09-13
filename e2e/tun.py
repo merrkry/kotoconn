@@ -19,6 +19,8 @@ import threading
 import time
 from pathlib import Path
 
+from lifecycle import has_event
+
 ROOT = Path(__file__).resolve().parent.parent
 MARK = 42
 NAME = "ktest0"
@@ -43,12 +45,15 @@ class Daemon:
         self.process = subprocess.Popen(
             [
                 str(binary),
+                "--log-format",
+                "json",
                 "run",
                 "--config",
                 str(directory / "main.ts"),
                 "--shutdown-timeout",
                 str(deadline),
             ],
+            env=dict(os.environ, RUST_LOG="info"),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
@@ -56,7 +61,7 @@ class Daemon:
         self.reader = threading.Thread(target=self.read, daemon=True)
         self.reader.start()
         try:
-            self.wait_line("Daemon ready:")
+            self.wait_event("daemon_ready")
         except BaseException:
             self.close()
             raise
@@ -71,22 +76,22 @@ class Daemon:
         with self.condition:
             self.condition.notify_all()
 
-    def wait_line(self, prefix):
+    def wait_event(self, event):
         deadline = time.monotonic() + 15
         with self.condition:
-            while not any(line.startswith(prefix) for line in self.lines):
+            while not has_event(self.lines, event):
                 if self.process.poll() is not None:
                     raise RuntimeError("daemon exited: " + "".join(self.lines))
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError(
-                        "daemon did not report " + prefix + ": " + "".join(self.lines)
+                        "daemon did not report " + event + ": " + "".join(self.lines)
                     )
                 self.condition.wait(remaining)
 
     def stop(self):
         self.process.send_signal(signal.SIGTERM)
-        self.wait_line("Daemon stopping.")
+        self.wait_event("daemon_stopping")
 
     def finish(self, forced=False):
         code = self.process.wait(timeout=15)

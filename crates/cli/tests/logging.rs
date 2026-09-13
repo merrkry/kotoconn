@@ -22,7 +22,7 @@ fn startup_failure_is_one_json_event_on_stderr() {
     assert_eq!(lines.len(), 1, "{stderr}");
     let event: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
     assert_eq!(event["level"], "ERROR");
-    assert_eq!(event["fields"]["message"], "daemon failed");
+    assert_eq!(event["fields"]["event"], "daemon_failed");
     assert!(
         event["fields"]["error"]
             .as_str()

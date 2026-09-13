@@ -3,7 +3,8 @@
 These tests run the real `kotoconn` CLI and sing-box in separate containers.
 They cover protocol interoperability in both client and server roles, nested
 dialers and TypeScript policies. Rust tests cover protocol edge cases and internal
-lifecycle contracts.
+lifecycle contracts. Kotoconn readiness and shutdown checks parse the CLI's JSON
+`fields.event` values; sing-box readiness uses its startup log message.
 
 Requirements: Python 3.10+, Docker Engine and Docker Compose v2 or later. No
 Python packages are needed. Run from the repository root:

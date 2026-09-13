@@ -38,7 +38,7 @@ fn main() -> Result<std::process::ExitCode> {
 
     let result = execute(cli);
     if let Err(error) = &result {
-        tracing::error!(error = %format_args!("{error:#}"), "daemon failed");
+        tracing::error!(event = "daemon_failed", error = %format_args!("{error:#}"), "daemon failed");
     }
 
     Ok(if result.is_ok() {
@@ -96,6 +96,7 @@ async fn run(Cli { command, .. }: Cli) -> Result<()> {
                 result = Daemon::start(config, Duration::from_secs(shutdown_timeout)) => result?,
             };
             tracing::info!(
+                event = "daemon_ready",
                 inbounds = daemon.policy().config().inbounds.len(),
                 dialers = daemon.policy().config().dialers.len(),
                 "daemon ready"
@@ -104,7 +105,7 @@ async fn run(Cli { command, .. }: Cli) -> Result<()> {
             tokio::select! {
                 result = &mut signal => {
                     daemon.stop();
-                    tracing::info!("daemon stopping");
+                    tracing::info!(event = "daemon_stopping", "daemon stopping");
                     // Even a signal registration error must finish cleanup.
                     let shutdown = daemon.wait().await?;
                     result?;
@@ -117,7 +118,7 @@ async fn run(Cli { command, .. }: Cli) -> Result<()> {
                     bail!("policy worker stopped unexpectedly");
                 }
             }
-            tracing::info!("daemon stopped");
+            tracing::info!(event = "daemon_stopped", "daemon stopped");
         }
     }
     Ok(())
