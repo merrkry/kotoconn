@@ -6,14 +6,17 @@ WORKDIR /src
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY external/smoltcp ./external/smoltcp
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS build
 COPY --from=planner /src/recipe.json recipe.json
+COPY external/smoltcp ./external/smoltcp
 # Keep dependency artifacts in a regular layer so CI can export them with type=gha.
 RUN cargo chef cook --locked -p kotoconn-cli --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY external/smoltcp ./external/smoltcp
 RUN cargo build --locked -p kotoconn-cli
 
 FROM docker.io/library/debian:bookworm-slim@sha256:5ae3c39ebd15e229dcedd5cee596b2497182493d41ff162e824ba13fc1b2b867

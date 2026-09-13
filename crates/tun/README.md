@@ -24,7 +24,7 @@ The adapter proxies unicast TCP and UDP over IPv4 and IPv6. smoltcp handles TCP 
 
 ICMP echo forwarding, multicast, source routing, IPsec and unsupported IPv6 extension chains are filtered. Supported IPv6 options are those accepted by smoltcp's option parser with an action that permits processing to continue. Linux TUN offload is enabled when the kernel supports it. TCP GSO aggregates enter smoltcp as complete large segments after checksum normalization; UDP GSO is split into individual datagrams. Outgoing packets are coalesced with tun-rs GRO.
 
-For queue ownership, connection drivers and shutdown, see [ADR 0009](../../docs/adr/0009-independent-tun-connection-drivers.md). For overload behavior, adaptive queues and packet storage, see [TUN buffering](../../docs/tun-buffering.md).
+For queue ownership, TCP scheduling and shutdown, see [ADR 0009](../../docs/adr/0009-independent-tun-connection-drivers.md). For overload behavior, adaptive queues and packet storage, see [TUN buffering](../../docs/tun-buffering.md).
 
 Run the protocol tests and isolated Linux E2E tests with:
 
