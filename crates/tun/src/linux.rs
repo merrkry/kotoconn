@@ -53,7 +53,7 @@ pub fn bind(options: TunInboundConfig, context: ServerContext) -> Result<BoundTu
     let mut builder = tun_rs::DeviceBuilder::new()
         .name(&options.name)
         .mtu(options.mtu)
-        .offload(false)
+        .offload(true)
         .multi_queue(false)
         .packet_information(false);
     let mut addresses = HashSet::new();
@@ -87,7 +87,11 @@ pub fn bind(options: TunInboundConfig, context: ServerContext) -> Result<BoundTu
     let name = device.name().context("read TUN interface name")?;
     Ok(BoundTun {
         name,
-        run: Box::pin(crate::run(device, usize::from(options.mtu), context)),
+        run: Box::pin(crate::run(
+            crate::offload::OffloadDevice::new(device),
+            usize::from(options.mtu),
+            context,
+        )),
     })
 }
 

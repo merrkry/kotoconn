@@ -73,6 +73,76 @@ fn decoded(bytes: &[u8]) -> Packet {
     Decoder::default().decode(bytes, Instant::now()).unwrap()
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn gso_tcp_preserves_aggregate_bytes_sequence_and_flags_in_both_families() {
+    for ipv6 in [false, true] {
+        let payload: Vec<_> = (0..60000).map(|i| (i % 251) as u8).collect();
+        let packet = segment(flow(ipv6), 100, Some(200), TcpControl::Psh, &payload).bytes;
+        let header = tun_rs::VirtioNetHdr {
+            flags: 1,
+            gso_type: if ipv6 {
+                tun_rs::VIRTIO_NET_HDR_GSO_TCPV6
+            } else {
+                tun_rs::VIRTIO_NET_HDR_GSO_TCPV4
+            },
+            hdr_len: 0, // Linux forwarding may report an unusable hdr_len.
+            gso_size: 1220,
+            csum_start: if ipv6 { 40 } else { 20 },
+            csum_offset: 16,
+        };
+        let mut frame = vec![0; tun_rs::VIRTIO_NET_HDR_LEN];
+        header.encode(&mut frame).unwrap();
+        frame.extend_from_slice(&packet);
+        let mut output = vec![0; 65575];
+        let mut pending = std::collections::VecDeque::new();
+        let len = offload::normalize(&mut frame, &mut output, &mut pending).unwrap();
+        let packet = decoded(&output[..len]);
+        let (actual_flow, tcp) = packet.tcp().unwrap();
+        assert_eq!(actual_flow, flow(ipv6));
+        assert_eq!(tcp.seq_number, TcpSeqNumber(100));
+        assert_eq!(tcp.ack_number, Some(TcpSeqNumber(200)));
+        assert_eq!(tcp.control, TcpControl::Psh);
+        assert_eq!(tcp.payload, payload);
+        assert!(pending.is_empty());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn gso_udp_preserves_datagram_boundaries_and_rebuilds_checksums() {
+    for ipv6 in [false, true] {
+        let flow = flow(ipv6);
+        let payload: Vec<_> = (0..2501).map(|i| (i % 251) as u8).collect();
+        let packet = udp::Encoder::new(65535)
+            .encode(flow.source, flow.destination, &payload)
+            .unwrap()
+            .remove(0);
+        let header = tun_rs::VirtioNetHdr {
+            flags: 1,
+            gso_type: tun_rs::VIRTIO_NET_HDR_GSO_UDP_L4,
+            hdr_len: 0,
+            gso_size: 1000,
+            csum_start: if ipv6 { 40 } else { 20 },
+            csum_offset: 6,
+        };
+        let mut frame = vec![0; tun_rs::VIRTIO_NET_HDR_LEN];
+        header.encode(&mut frame).unwrap();
+        frame.extend_from_slice(&packet);
+        let mut output = vec![0; 65575];
+        let mut pending = std::collections::VecDeque::new();
+        let len = offload::normalize(&mut frame, &mut output, &mut pending).unwrap();
+        pending.push_front(output[..len].to_vec());
+        assert_eq!(pending.len(), 3);
+        for (packet, expected) in pending.into_iter().zip(payload.chunks(1000)) {
+            let packet = decoded(&packet);
+            let (actual_flow, actual) = packet.udp().unwrap();
+            assert_eq!(actual_flow, flow);
+            assert_eq!(actual, expected);
+        }
+    }
+}
+
 #[test]
 fn udp_roundtrips_empty_and_fragmented_datagrams_in_both_families() {
     for ipv6 in [false, true] {

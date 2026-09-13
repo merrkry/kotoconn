@@ -32,6 +32,23 @@ const INGRESS_BYTES: usize = 8 * 1024 * 1024;
 pub trait PacketIo: Send + Sync {
     fn poll_recv(&self, cx: &mut Context<'_>, bytes: &mut [u8]) -> Poll<io::Result<usize>>;
     fn poll_send(&self, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>>;
+
+    /// Send an available batch without waiting to collect more packets. A
+    /// cancelled batch may have transmitted a prefix and must not be retried.
+    fn send_batch(&self, packets: &mut [Vec<u8>]) -> impl Future<Output = io::Result<()>> + Send {
+        async move {
+            for (index, packet) in packets.iter().enumerate() {
+                let len = poll_fn(|cx| self.poll_send(cx, packet)).await?;
+                if len != packet.len() {
+                    return Err(io::Error::other("partial TUN packet write"));
+                }
+                if (index + 1).is_multiple_of(64) {
+                    tokio::task::yield_now().await;
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -112,32 +129,27 @@ async fn transmit<D: PacketIo>(
     mut input: mpsc::Receiver<Transmit>,
 ) -> Result<()> {
     let mut encoder = udp::Encoder::new(mtu);
-    let mut turns = 0;
+    let mut items = Vec::with_capacity(64);
+    let mut packets = Vec::with_capacity(64);
 
-    while let Some(item) = input.recv().await {
-        let packets = match item {
-            Transmit::Packet(packet) => vec![packet],
-            Transmit::Datagram {
-                source,
-                destination,
-                payload,
-            } => {
-                let Some(packets) = encoder.encode(source, destination, &payload) else {
-                    continue;
-                };
-                packets
-            }
-        };
-
-        for packet in packets {
-            let len = poll_fn(|cx| device.poll_send(cx, &packet)).await?;
-            ensure!(len == packet.len(), "partial TUN packet write");
-            turns += 1;
-            if turns == 64 {
-                tokio::task::yield_now().await;
-                turns = 0;
+    while input.recv_many(&mut items, 64).await != 0 {
+        for item in items.drain(..) {
+            match item {
+                Transmit::Packet(packet) => packets.push(packet),
+                Transmit::Datagram {
+                    source,
+                    destination,
+                    payload,
+                } => {
+                    if let Some(datagram) = encoder.encode(source, destination, &payload) {
+                        packets.extend(datagram);
+                    }
+                }
             }
         }
+        device.send_batch(&mut packets).await?;
+        packets.clear();
+        tokio::task::yield_now().await;
     }
     Ok(())
 }

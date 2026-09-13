@@ -309,6 +309,16 @@ pub(crate) fn connection(
                     permit
                         .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?
                         .send(Transmit::Packet(device.outgoing.pop_front().unwrap()));
+                    // Hand over the rest of this bounded burst while capacity
+                    // is ready, so the endpoint can coalesce adjacent segments.
+                    while !device.outgoing.is_empty() {
+                        let Ok(permit) = output.try_reserve() else { break; };
+                        // SAFETY: This driver alone owns the queue, and the
+                        // loop condition checked it before reserving capacity.
+                        debug_assert!(!device.outgoing.is_empty());
+                        permit.send(Transmit::Packet(device.outgoing.pop_front().unwrap()));
+                    }
+
                 }
                 packet = incoming.recv(), if device.incoming.is_none() && device.outgoing.len() < 32 => {
                     match packet {

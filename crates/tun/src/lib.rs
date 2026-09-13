@@ -2,6 +2,8 @@
 mod device;
 mod endpoint;
 mod linux;
+#[cfg(target_os = "linux")]
+mod offload;
 mod packet;
 mod reassembly;
 mod tcp;
