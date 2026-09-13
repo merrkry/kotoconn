@@ -287,6 +287,8 @@ impl Worker {
                         bytes: packet.encode(),
                         _permit: Some(permit),
                     });
+                } else {
+                    self.stats.capacity_drops += 1;
                 }
             }
             IpProtocol::Udp if !self.stopping => {
@@ -302,6 +304,7 @@ impl Worker {
                 }
 
                 let Some(payload) = budgeted_payload(payload, &self.shared.udp_bytes) else {
+                    self.stats.capacity_drops += 1;
                     return Ok(());
                 };
 
