@@ -6,7 +6,7 @@ use crate::{
 };
 use anyhow::Result;
 use bytes::Bytes;
-use kotoconn_protocol::{self as p, Scope, ServerContext};
+use kotoconn_protocol::{self as p, Scope, ServerContext, queue};
 use smoltcp::wire::{IpProtocol, TcpControl};
 use std::{
     collections::{HashMap, hash_map::RandomState},
@@ -15,23 +15,15 @@ use std::{
     sync::Arc,
 };
 use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch},
+    sync::{mpsc, watch},
     time::Instant,
 };
 use tokio_util::sync::CancellationToken;
 
-pub(crate) const MAX_TCP_CONNECTIONS: usize = 256;
-pub(crate) const MAX_UDP_ASSOCIATIONS: usize = 128;
-pub(crate) const INGRESS_BYTES: usize = 8 * 1024 * 1024;
-
 pub(crate) struct Shared {
+    pub drained: mpsc::UnboundedSender<usize>,
     pub hash: RandomState,
-    pub inboxes: Vec<mpsc::Sender<Forwarded>>,
-    pub tcp_slots: Arc<Semaphore>,
-    pub udp_slots: Arc<Semaphore>,
-    pub tcp_bytes: Arc<Semaphore>,
-    pub udp_bytes: Arc<Semaphore>,
-    pub transit_bytes: Arc<Semaphore>,
+    pub inboxes: Vec<queue::Sender<Forwarded>>,
     pub reassembly: ReassemblyLimits,
     pub stop: CancellationToken,
 }
@@ -46,7 +38,15 @@ impl Shared {
 
 pub(crate) struct Forwarded {
     packet: ForwardedPacket,
-    _permit: OwnedSemaphorePermit,
+}
+
+impl Forwarded {
+    pub(crate) fn size(&self) -> usize {
+        match &self.packet {
+            ForwardedPacket::Frame(bytes) => bytes.len(),
+            ForwardedPacket::Reassembled(packet) => packet.storage_size(),
+        }
+    }
 }
 
 enum ForwardedPacket {
@@ -80,14 +80,12 @@ impl Drop for Statistics {
 }
 
 struct TcpEntry {
-    _slot: OwnedSemaphorePermit,
-    packets: mpsc::Sender<tcp::QueuedPacket>,
+    packets: queue::Sender<tcp::QueuedPacket>,
     generation: u64,
 }
 
 struct UdpEntry {
-    _slot: OwnedSemaphorePermit,
-    packets: mpsc::Sender<p::Packet>,
+    packets: queue::Sender<p::Packet>,
     activity: watch::Sender<Instant>,
     scope: Scope,
     generation: u64,
@@ -126,7 +124,7 @@ struct Worker {
     tcp: HashMap<Flow, TcpEntry>,
     udp: HashMap<Flow, UdpEntry>,
     done: mpsc::UnboundedSender<(Protocol, Flow, u64)>,
-    output: mpsc::Sender<Transmit>,
+    output: queue::Sender<Transmit>,
     rejector: tcp::Rejector,
     generation: u64,
     stopping: bool,
@@ -138,23 +136,13 @@ impl Worker {
         // SAFETY: owner comes from Shared::owner, and receive buffers hold at most 65575 bytes.
         debug_assert!(owner < self.shared.inboxes.len());
         debug_assert!(bytes.len() <= 65575);
-        // Reserve both queue space and bytes before allocating a forwarded frame.
-        let Ok(entry) = self.shared.inboxes[owner].try_reserve() else {
+        let Ok(entry) = self.shared.inboxes[owner].try_reserve(bytes.len()) else {
             self.stats.forwarding_drops += 1;
             return;
         };
-        let Ok(permit) = self
-            .shared
-            .transit_bytes
-            .clone()
-            .try_acquire_many_owned(bytes.len() as u32)
-        else {
-            self.stats.forwarding_drops += 1;
-            return;
-        };
+        let bytes = bytes.to_vec();
         entry.send(Forwarded {
-            packet: ForwardedPacket::Frame(bytes.to_vec()),
-            _permit: permit,
+            packet: ForwardedPacket::Frame(bytes),
         });
         self.stats.forwarded_packets += 1;
     }
@@ -163,22 +151,13 @@ impl Worker {
         // SAFETY: owner comes from Shared::owner; Decoder bounds normalized IP lengths.
         debug_assert!(owner < self.shared.inboxes.len());
         debug_assert!(packet.ip.buffer_len() <= 65575);
-        let Ok(entry) = self.shared.inboxes[owner].try_reserve() else {
+        let Ok(entry) = self.shared.inboxes[owner].try_reserve(packet.storage_size()) else {
             self.stats.forwarding_drops += 1;
             return;
         };
-        let Ok(permit) = self
-            .shared
-            .transit_bytes
-            .clone()
-            .try_acquire_many_owned(packet.ip.buffer_len() as u32)
-        else {
-            self.stats.forwarding_drops += 1;
-            return;
-        };
+        let packet = packet.into_owned();
         entry.send(Forwarded {
-            packet: ForwardedPacket::Reassembled(packet.into_owned()),
-            _permit: permit,
+            packet: ForwardedPacket::Reassembled(packet),
         });
         self.stats.forwarded_packets += 1;
     }
@@ -204,16 +183,9 @@ impl Worker {
                 if !self.tcp.contains_key(&flow) {
                     if repr.control != TcpControl::Syn || repr.ack_number.is_some() || self.stopping
                     {
-                        for response in self.rejector.reject(&packet) {
-                            let _ = self.output.try_send(Transmit::Packet(response));
-                        }
+                        let _ = self.rejector.reject(&packet, &self.output);
                         return Ok(());
                     }
-
-                    let Ok(slot) = self.shared.tcp_slots.clone().try_acquire_owned() else {
-                        self.stats.capacity_drops += 1;
-                        return Ok(());
-                    };
 
                     // SAFETY: IDs must never repeat while old completions may
                     // still be queued. Exhaustion must fail even in release.
@@ -267,28 +239,20 @@ impl Worker {
                     self.tcp.insert(
                         flow,
                         TcpEntry {
-                            _slot: slot,
                             packets: conn.packets,
                             generation: self.generation,
                         },
                     );
                 }
 
-                if let Ok(permit) = self
-                    .shared
-                    .tcp_bytes
-                    .clone()
-                    .try_acquire_many_owned(packet.ip.buffer_len() as u32)
-                {
-                    // SAFETY: The flow was found or inserted above. Only
-                    // dispatch mutates this map; tasks only send completions.
-                    debug_assert!(self.tcp.contains_key(&flow));
-                    let _ = self.tcp[&flow].packets.try_send(tcp::QueuedPacket {
+                // SAFETY: Only dispatch mutates this map; the flow was admitted above.
+                debug_assert!(self.tcp.contains_key(&flow));
+                let entry = &self.tcp[&flow];
+                match entry.packets.try_reserve(packet.ip.buffer_len()) {
+                    Ok(permit) => permit.send(tcp::QueuedPacket {
                         bytes: packet.encode(),
-                        _permit: Some(permit),
-                    });
-                } else {
-                    self.stats.capacity_drops += 1;
+                    }),
+                    Err(_) => self.stats.capacity_drops += 1,
                 }
             }
             IpProtocol::Udp if !self.stopping => {
@@ -303,21 +267,11 @@ impl Worker {
                     return Ok(());
                 }
 
-                let Some(payload) = budgeted_payload(payload, &self.shared.udp_bytes) else {
-                    self.stats.capacity_drops += 1;
-                    return Ok(());
-                };
-
                 if self.udp.get(&flow).is_some_and(|e| e.scope.is_closed()) {
                     self.udp.remove(&flow);
                 }
 
                 if !self.udp.contains_key(&flow) {
-                    let Ok(slot) = self.shared.udp_slots.clone().try_acquire_owned() else {
-                        self.stats.capacity_drops += 1;
-                        return Ok(());
-                    };
-
                     // SAFETY: IDs must never repeat while old completions may
                     // still be queued. Exhaustion must fail even in release.
                     debug_assert_ne!(
@@ -362,7 +316,6 @@ impl Worker {
                     self.udp.insert(
                         flow,
                         UdpEntry {
-                            _slot: slot,
                             packets,
                             activity,
                             scope,
@@ -375,16 +328,16 @@ impl Worker {
                 // dispatch mutates this map; tasks only send completions.
                 debug_assert!(self.udp.contains_key(&flow));
                 let entry = &self.udp[&flow];
-                if entry
-                    .packets
-                    .try_send(p::Packet {
-                        target: p::target(flow.destination),
-                        payload,
-                    })
-                    .is_ok()
-                {
-                    entry.activity.send_replace(Instant::now());
-                }
+                let Ok(permit) = entry.packets.try_reserve(payload.len()) else {
+                    self.stats.capacity_drops += 1;
+                    return Ok(());
+                };
+                let payload = Bytes::copy_from_slice(payload);
+                permit.send(p::Packet {
+                    target: p::target(flow.destination),
+                    payload,
+                });
+                entry.activity.send_replace(Instant::now());
             }
             _ => {}
         }
@@ -401,11 +354,11 @@ enum Input {
 pub(crate) async fn dispatch<R: PacketReceive>(
     id: usize,
     mut device: R,
-    mut inbox: mpsc::Receiver<Forwarded>,
+    mut inbox: queue::Receiver<Forwarded>,
     shared: Arc<Shared>,
     mtu: usize,
     context: ServerContext,
-    output: mpsc::Sender<Transmit>,
+    output: queue::Sender<Transmit>,
 ) -> Result<()> {
     let (done, mut completed) = mpsc::unbounded_channel();
     let mut worker = Worker {
@@ -433,8 +386,13 @@ pub(crate) async fn dispatch<R: PacketReceive>(
     let mut decoder = Decoder::new(shared.reassembly.clone());
     let mut buffer = vec![0; 65575];
     let mut turns = 0;
+    let mut reported_drained = false;
 
     loop {
+        if worker.stopping && worker.tcp.is_empty() && !reported_drained {
+            let _ = shared.drained.send(id);
+            reported_drained = true;
+        }
         turns += 1;
         if turns == 64 {
             tokio::task::yield_now().await;
@@ -512,34 +470,10 @@ pub(crate) async fn dispatch<R: PacketReceive>(
     }
 }
 
-// The permit follows the payload through policy and outbound queues, including
-// clones. Returning queue capacity alone would release ingress credit too soon.
-struct BudgetedPayload {
-    bytes: Vec<u8>,
-    _permit: OwnedSemaphorePermit,
-}
-
-impl AsRef<[u8]> for BudgetedPayload {
-    fn as_ref(&self) -> &[u8] {
-        &self.bytes
-    }
-}
-
-fn budgeted_payload(payload: &[u8], budget: &Arc<Semaphore>) -> Option<Bytes> {
-    let permit = budget
-        .clone()
-        .try_acquire_many_owned(payload.len().max(1) as u32)
-        .ok()?;
-    Some(Bytes::from_owner(BudgetedPayload {
-        bytes: payload.to_vec(),
-        _permit: permit,
-    }))
-}
-
 async fn udp_replies(
     flow: Flow,
     mut driver: p::Datagram,
-    output: mpsc::Sender<Transmit>,
+    output: queue::Sender<Transmit>,
     activity: watch::Sender<Instant>,
 ) -> Result<()> {
     while let Some(packet) = driver.rx.recv().await {
@@ -570,34 +504,5 @@ async fn until_idle(mut activity: watch::Receiver<Instant>, idle: std::time::Dur
             _ = tokio::time::sleep_until(deadline) => return,
             result = activity.changed() => { if result.is_err() { return; } },
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[tokio::test]
-    async fn udp_ingress_credit_follows_packets_across_queues_and_clones() {
-        let budget = Arc::new(Semaphore::new(8192));
-        let payload = budgeted_payload(&[7; 8192], &budget).unwrap();
-        let (sender, mut receiver) = mpsc::channel(1);
-        sender
-            .send(p::Packet {
-                target: p::target("192.0.2.1:53".parse().unwrap()),
-                payload,
-            })
-            .await
-            .unwrap();
-        assert!(budgeted_payload(&[], &budget).is_none());
-        let packet = receiver.recv().await.unwrap();
-        let retained = packet.clone();
-        drop(packet);
-        assert!(budgeted_payload(&[1], &budget).is_none());
-        drop(retained);
-        assert_eq!(budget.available_permits(), 8192);
-        let empty = budgeted_payload(&[], &budget).unwrap();
-        assert_eq!(budget.available_permits(), 8191);
-        drop(empty);
-        assert_eq!(budget.available_permits(), 8192);
     }
 }

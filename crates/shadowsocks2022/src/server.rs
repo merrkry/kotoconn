@@ -76,7 +76,7 @@ struct Association {
     packet: u64,
     window: PacketWindowFilter,
     active: Instant,
-    tx: mpsc::Sender<Packet>,
+    tx: kotoconn_protocol::queue::Sender<Packet>,
     scope: Scope,
 }
 

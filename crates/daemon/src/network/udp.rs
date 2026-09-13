@@ -5,7 +5,7 @@ use tokio::{
 };
 
 struct Entry {
-    tx: mpsc::Sender<Packet>,
+    tx: kotoconn_protocol::queue::Sender<Packet>,
     scope: Scope,
     generation: u64,
 }
@@ -51,7 +51,7 @@ pub(super) async fn association(handler: SessionHandler, mut packets: Datagram) 
 
                     generation += 1;
                     let scope = packets.scope.child();
-                    let (tx, rx) = mpsc::channel(64);
+                    let (tx, rx) = kotoconn_protocol::queue::channel(kotoconn_protocol::queue::INITIAL_BYTES, |packet: &Packet| packet.payload.len());
                     let instance = handler.clone();
                     let replies = packets.tx.clone();
                     let done = completed.clone();
@@ -94,8 +94,8 @@ pub(super) async fn association(handler: SessionHandler, mut packets: Datagram) 
 async fn session(
     handler: SessionHandler,
     destination: Target,
-    mut incoming: mpsc::Receiver<Packet>,
-    replies: mpsc::Sender<Packet>,
+    mut incoming: kotoconn_protocol::queue::Receiver<Packet>,
+    replies: kotoconn_protocol::queue::Sender<Packet>,
     scope: Scope,
 ) -> Result<()> {
     let registration = handler

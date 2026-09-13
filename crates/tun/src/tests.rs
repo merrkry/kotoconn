@@ -4,7 +4,6 @@ use smoltcp::{phy::ChecksumCapabilities, wire::*};
 use std::{io, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::mpsc,
     time::Instant,
 };
 use tokio_util::sync::CancellationToken;
@@ -69,7 +68,6 @@ fn segment(
             payload: payload.into(),
         }
         .encode(),
-        _permit: None,
     }
 }
 
@@ -103,7 +101,13 @@ fn gso_tcp_preserves_aggregate_bytes_sequence_and_flags_in_both_families() {
         frame.extend_from_slice(&packet);
         let mut output = vec![0; 65575];
         let mut pending = std::collections::VecDeque::new();
-        let len = offload::normalize(&mut frame, &mut output, &mut pending).unwrap();
+        let len = offload::normalize(
+            &mut frame,
+            &mut output,
+            &mut pending,
+            &mut kotoconn_protocol::queue::Capacity::new(kotoconn_protocol::queue::INITIAL_BYTES),
+        )
+        .unwrap();
         let packet = decoded(&output[..len]);
         let (actual_flow, tcp) = packet.tcp().unwrap();
         assert_eq!(actual_flow, flow(ipv6));
@@ -118,18 +122,19 @@ fn gso_tcp_preserves_aggregate_bytes_sequence_and_flags_in_both_families() {
 #[cfg(target_os = "linux")]
 #[test]
 fn gso_udp_preserves_datagram_boundaries_and_rebuilds_checksums() {
-    for ipv6 in [false, true] {
+    for (ipv6, segment_size) in [(false, 1000), (true, 1000), (false, 8), (true, 8)] {
         let flow = flow(ipv6);
         let payload: Vec<_> = (0..2501).map(|i| (i % 251) as u8).collect();
         let packet = udp::Encoder::new(65535)
             .encode(flow.source, flow.destination, &payload)
             .unwrap()
-            .remove(0);
+            .remove(0)
+            .to_vec();
         let header = tun_rs::VirtioNetHdr {
             flags: 1,
             gso_type: tun_rs::VIRTIO_NET_HDR_GSO_UDP_L4,
             hdr_len: 0,
-            gso_size: 1000,
+            gso_size: segment_size as u16,
             csum_start: if ipv6 { 40 } else { 20 },
             csum_offset: 6,
         };
@@ -138,10 +143,16 @@ fn gso_udp_preserves_datagram_boundaries_and_rebuilds_checksums() {
         frame.extend_from_slice(&packet);
         let mut output = vec![0; 65575];
         let mut pending = std::collections::VecDeque::new();
-        let len = offload::normalize(&mut frame, &mut output, &mut pending).unwrap();
+        let len = offload::normalize(
+            &mut frame,
+            &mut output,
+            &mut pending,
+            &mut kotoconn_protocol::queue::Capacity::new(kotoconn_protocol::queue::INITIAL_BYTES),
+        )
+        .unwrap();
         pending.push_front(output[..len].to_vec());
-        assert_eq!(pending.len(), 3);
-        for (packet, expected) in pending.into_iter().zip(payload.chunks(1000)) {
+        assert_eq!(pending.len(), payload.len().div_ceil(segment_size));
+        for (packet, expected) in pending.into_iter().zip(payload.chunks(segment_size)) {
             let packet = decoded(&packet);
             let (actual_flow, actual) = packet.udp().unwrap();
             assert_eq!(actual_flow, flow);
@@ -160,7 +171,8 @@ fn udp_offload_encodes_a_computed_zero_checksum_as_all_ones() {
         let seed = encoder
             .encode(flow.source, flow.destination, &[0; 2])
             .unwrap()
-            .remove(0);
+            .remove(0)
+            .to_vec();
         // Adding this word to the payload makes the computed checksum zero.
         let payload = UdpPacket::new_checked(&seed[start..])
             .unwrap()
@@ -175,7 +187,8 @@ fn udp_offload_encodes_a_computed_zero_checksum_as_all_ones() {
             let mut packet = encoder
                 .encode(flow.source, flow.destination, &data)
                 .unwrap()
-                .remove(0);
+                .remove(0)
+                .to_vec();
             if !gso {
                 let mut udp = UdpPacket::new_checked(&mut packet[start..]).unwrap();
                 assert_eq!(udp.checksum(), 0xffff);
@@ -203,7 +216,15 @@ fn udp_offload_encodes_a_computed_zero_checksum_as_all_ones() {
             frame.extend_from_slice(&packet);
             let mut output = vec![0; 65575];
             let mut pending = std::collections::VecDeque::new();
-            let len = offload::normalize(&mut frame, &mut output, &mut pending).unwrap();
+            let len = offload::normalize(
+                &mut frame,
+                &mut output,
+                &mut pending,
+                &mut kotoconn_protocol::queue::Capacity::new(
+                    kotoconn_protocol::queue::INITIAL_BYTES,
+                ),
+            )
+            .unwrap();
             pending.push_front(output[..len].to_vec());
             assert_eq!(pending.len(), if gso { 2 } else { 1 });
             for bytes in pending {
@@ -306,7 +327,8 @@ fn ipv6_overlaps_poison_the_datagram_but_atomic_fragments_are_independent() {
     let small = udp::Encoder::new(1280)
         .encode(flow.source, flow.destination, b"atomic")
         .unwrap()
-        .remove(0);
+        .remove(0)
+        .to_vec();
     let mut atomic = vec![0; small.len() + 8];
     atomic[..40].copy_from_slice(&small[..40]);
     let mut ip = Ipv6Packet::new_unchecked(&mut atomic);
@@ -335,20 +357,69 @@ fn ipv6_overlaps_poison_the_datagram_but_atomic_fragments_are_independent() {
 fn closed_tcp_ports_use_rfc_reset_sequence_numbers() {
     for ipv6 in [false, true] {
         let mut rejector = tcp::Rejector::new(1280);
+        let (output, mut replies) =
+            kotoconn_protocol::queue::channel(128 * 1024, device::Transmit::size);
         let syn = decoded(&segment(flow(ipv6), 100, None, TcpControl::Syn, &[]));
-        let replies = rejector.reject(&syn);
-        let reply = decoded(&replies[0]);
+        rejector.reject(&syn, &output).unwrap();
+        let device::Transmit::Packet(bytes) = replies.try_recv().unwrap() else {
+            panic!("packet expected")
+        };
+        let reply = decoded(&bytes);
         let (_, repr) = reply.tcp().unwrap();
         assert_eq!(repr.control, TcpControl::Rst);
         assert_eq!(repr.ack_number, Some(TcpSeqNumber(101)));
         let ack = decoded(&segment(flow(ipv6), 100, Some(999), TcpControl::None, &[]));
-        let replies = rejector.reject(&ack);
-        let reply = decoded(&replies[0]);
+        rejector.reject(&ack, &output).unwrap();
+        let device::Transmit::Packet(bytes) = replies.try_recv().unwrap() else {
+            panic!("packet expected")
+        };
+        let reply = decoded(&bytes);
         let (_, repr) = reply.tcp().unwrap();
         assert_eq!(repr.seq_number, TcpSeqNumber(999));
         assert_eq!(repr.ack_number, None);
         let rst = decoded(&segment(flow(ipv6), 100, None, TcpControl::Rst, &[]));
-        assert!(rejector.reject(&rst).is_empty());
+        rejector.reject(&rst, &output).unwrap();
+        assert!(replies.try_recv().is_err());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropped_resets_do_not_scatter_queued_packets_across_blocks() {
+    use kotoconn_protocol::queue;
+
+    for mtu in [1500, 65535] {
+        let mut rejector = tcp::Rejector::new(mtu);
+        let (output, mut replies) = queue::channel(128 * 1024, device::Transmit::size);
+        let syn = decoded(&segment(flow(false), 100, None, TcpControl::Syn, &[]));
+        let mut queued = 0;
+        while rejector.reject(&syn, &output).is_ok() {
+            queued += 1;
+        }
+        assert!(queued * 40 > 16 * 1024);
+
+        // Keep the queue full while repeatedly dropping enough responses to
+        // consume an entire arena block if admission happens after encoding.
+        for _ in 0..queued {
+            drop(replies.try_recv().unwrap());
+            rejector.reject(&syn, &output).unwrap();
+            for _ in 0..512 {
+                assert_eq!(rejector.reject(&syn, &output), Err(queue::Error::Full));
+            }
+        }
+        let mut packets = Vec::new();
+        while let Ok(device::Transmit::Packet(packet)) = replies.try_recv() {
+            assert_eq!(packet.len(), 40);
+            assert_eq!(decoded(&packet).tcp().unwrap().1.control, TcpControl::Rst);
+            packets.push(packet);
+        }
+        assert_eq!(packets.len(), queued);
+        // Retain every view while checking contiguous packing, so allocator
+        // reuse cannot make unrelated blocks appear to be shared.
+        let blocks = 1 + packets
+            .windows(2)
+            .filter(|pair| pair[1].as_ptr() as usize != pair[0].as_ptr() as usize + pair[0].len())
+            .count();
+        assert!(blocks * 16 * 1024 <= queued * 40 * 2 + 2 * 16 * 1024);
     }
 }
 
@@ -356,12 +427,13 @@ async fn accepted(
     ipv6: bool,
 ) -> (
     tcp::Stream,
-    mpsc::Sender<tcp::QueuedPacket>,
-    mpsc::Receiver<device::Transmit>,
+    kotoconn_protocol::queue::Sender<tcp::QueuedPacket>,
+    kotoconn_protocol::queue::Receiver<device::Transmit>,
     tokio::task::JoinHandle<io::Result<()>>,
     i32,
 ) {
-    let (output, mut replies) = mpsc::channel(128);
+    let (output, mut replies) =
+        kotoconn_protocol::queue::channel(128 * 1024, device::Transmit::size);
     let conn = tcp::connection(flow(ipv6), 1280, output, CancellationToken::new());
     let driver = tokio::spawn(conn.driver);
     conn.packets
@@ -468,7 +540,8 @@ async fn tcp_drop_aborts_and_remote_reset_is_an_io_error() {
 
 #[tokio::test(start_paused = true)]
 async fn tcp_retransmits_without_caller_polling_and_cancelled_admission_releases_state() {
-    let (output, mut replies) = mpsc::channel(128);
+    let (output, mut replies) =
+        kotoconn_protocol::queue::channel(128 * 1024, device::Transmit::size);
     let conn = tcp::connection(flow(false), 1280, output, CancellationToken::new());
     let driver = tokio::spawn(conn.driver);
     conn.packets
@@ -499,7 +572,8 @@ fn udp_zero_checksum_is_only_valid_for_ipv4_and_source_port_may_be_omitted() {
         let mut bytes = udp::Encoder::new(1280)
             .encode(flow.source, flow.destination, b"test")
             .unwrap()
-            .remove(0);
+            .remove(0)
+            .to_vec();
         let offset = if ipv6 { 40 } else { 20 };
         let mut udp = UdpPacket::new_unchecked(&mut bytes[offset..]);
         udp.set_src_port(0);
@@ -513,7 +587,7 @@ fn udp_zero_checksum_is_only_valid_for_ipv4_and_source_port_may_be_omitted() {
 impl device::Transmit {
     fn packet(self) -> Vec<u8> {
         match self {
-            Self::Packet(packet) => packet,
+            Self::Packet(packet) => packet.to_vec(),
             Self::Datagram { .. } => panic!("expected TCP packet"),
         }
     }
@@ -521,7 +595,8 @@ impl device::Transmit {
 
 #[tokio::test(start_paused = true)]
 async fn reset_during_handshake_releases_state_without_waiting_for_a_timeout() {
-    let (output, mut replies) = mpsc::channel(128);
+    let (output, mut replies) =
+        kotoconn_protocol::queue::channel(128 * 1024, device::Transmit::size);
     let conn = tcp::connection(flow(false), 1280, output, CancellationToken::new());
     let driver = tokio::spawn(conn.driver);
     conn.packets
@@ -604,26 +679,18 @@ fn ipv6_first_fragment_requires_the_complete_tcp_header_and_reserved_bits_are_ig
 fn ipv6_reassembly_capacity_expires_and_malformed_input_does_not_panic() {
     let mut decoder = Decoder::default();
     let now = Instant::now();
-    for id in 0..64 {
-        assert!(
-            decoder
-                .decode(&ipv6_fragment(&[0; 8], IpProtocol::Udp, 0, true, id), now)
-                .is_none()
-        );
-    }
     let first = ipv6_fragment(&[0; 8], IpProtocol::Udp, 0, true, 64);
     let last = ipv6_fragment(&[0; 8], IpProtocol::Udp, 8, false, 64);
     assert!(decoder.decode(&first, now).is_none());
-    assert!(decoder.decode(&last, now).is_none());
     decoder.expire(now + Duration::from_secs(60));
     assert!(
         decoder
-            .decode(&first, now + Duration::from_secs(60))
+            .decode(&last, now + Duration::from_secs(60))
             .is_none()
     );
     assert!(
         decoder
-            .decode(&last, now + Duration::from_secs(60))
+            .decode(&first, now + Duration::from_secs(60))
             .is_some()
     );
     // Exercise all lengths and version nibbles with a reproducible corpus.
@@ -654,7 +721,10 @@ fn ipv4_reassembly_accounts_for_options_in_the_original_size_limit() {
     for size in [4096, 65507] {
         let mut packets = udp::Encoder::new(1280)
             .encode(flow.source, flow.destination, &vec![7; size])
-            .unwrap();
+            .unwrap()
+            .into_iter()
+            .map(|packet| packet.to_vec())
+            .collect::<Vec<_>>();
         packets[0].splice(20..20, [1, 1, 1, 1]);
         let len = packets[0].len();
         let mut first = Ipv4Packet::new_unchecked(&mut packets[0]);
@@ -680,73 +750,62 @@ fn ipv4_reassembly_accounts_for_options_in_the_original_size_limit() {
 }
 
 #[test]
-fn reassembly_capacity_is_shared_between_workers() {
+fn concurrent_reassembly_keeps_datagrams_separate_across_workers() {
     for ipv6 in [false, true] {
-        let limits = packet::ReassemblyLimits::default();
+        let limits = packet::ReassemblyLimits::new(1024 * 1024);
         let mut decoders = [Decoder::new(limits.clone()), Decoder::new(limits)];
-        let limit = if ipv6 {
-            64
-        } else {
-            smoltcp::config::REASSEMBLY_BUFFER_COUNT
-        };
         let f = flow(ipv6);
         let now = Instant::now();
         let mut encoder = udp::Encoder::new(1280);
         let mut datagrams = Vec::new();
-        for index in 0..=limit {
-            let frames = encoder.encode(f.source, f.destination, &[7; 2500]).unwrap();
+        for index in 0..8 {
+            let frames = encoder
+                .encode(f.source, f.destination, &vec![index as u8; 2500])
+                .unwrap();
             assert!(decoders[index % 2].decode(&frames[0], now).is_none());
             datagrams.push(frames);
         }
-        // The extra datagram cannot allocate state on either worker.
-        for frame in &datagrams[limit][1..] {
-            assert!(decoders[limit % 2].decode(frame, now).is_none());
+        for (index, frames) in datagrams.iter().enumerate() {
+            let mut completed = None;
+            for frame in &frames[1..] {
+                completed = decoders[index % 2]
+                    .decode(frame, now)
+                    .map(Packet::into_owned)
+                    .or(completed);
+            }
+            assert_eq!(completed.unwrap().udp().unwrap().1, vec![index as u8; 2500]);
         }
-        let mut completed = None;
-        for frame in &datagrams[0][1..] {
-            completed = decoders[0].decode(frame, now).map(Packet::into_owned);
-        }
-        assert!(completed.is_some());
-        // Finishing a datagram releases global capacity for another worker.
-        let mut completed = None;
-        for frame in &datagrams[limit] {
-            completed = decoders[limit % 2]
-                .decode(frame, now)
-                .map(Packet::into_owned);
-        }
-        assert!(completed.is_some());
     }
 }
 
 #[test]
-fn idle_reassembly_workers_release_capacity_on_their_deadline() {
+fn idle_reassembly_releases_shared_storage_at_its_deadline() {
     for ipv6 in [false, true] {
-        let limits = packet::ReassemblyLimits::default();
+        let limits = packet::ReassemblyLimits::new(8192);
         let mut idle = Decoder::new(limits.clone());
         let mut active = Decoder::new(limits);
-        let limit = if ipv6 {
-            64
-        } else {
-            smoltcp::config::REASSEMBLY_BUFFER_COUNT
-        };
         let f = flow(ipv6);
         let now = Instant::now();
         let mut encoder = udp::Encoder::new(1280);
-        for _ in 0..limit {
+        for _ in 0..64 {
             let frames = encoder.encode(f.source, f.destination, &[7; 2500]).unwrap();
             assert!(idle.decode(&frames[0], now).is_none());
         }
-        let frames = encoder.encode(f.source, f.destination, &[7; 2500]).unwrap();
+        let frames = encoder.encode(f.source, f.destination, &[9; 2500]).unwrap();
         for frame in &frames {
             assert!(active.decode(frame, now).is_none());
         }
         let deadline = idle.deadline().unwrap();
         idle.expire(deadline);
+        active.expire(deadline);
         assert_eq!(idle.deadline(), None);
         let mut completed = None;
         for frame in &frames {
-            completed = active.decode(frame, deadline).map(Packet::into_owned);
+            completed = active
+                .decode(frame, deadline)
+                .map(Packet::into_owned)
+                .or(completed);
         }
-        assert!(completed.is_some());
+        assert_eq!(completed.unwrap().udp().unwrap().1, [9; 2500]);
     }
 }

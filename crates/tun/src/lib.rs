@@ -6,6 +6,7 @@ mod linux;
 mod offload;
 mod packet;
 mod reassembly;
+mod storage;
 mod tcp;
 mod udp;
 mod worker;
