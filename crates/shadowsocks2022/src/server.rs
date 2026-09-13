@@ -55,6 +55,8 @@ impl p::Server for Server {
                                     crypto.config.key(),
                                 );
                                 let destination = from_address(stream.handshake().await?);
+                                let stream = super::buffered::Buffered::new(stream);
+
                                 handler.tcp(destination, Box::pin(stream), scope).await
                             }
                         })

@@ -1,6 +1,6 @@
 //! Use the library's crypto stream with an explicit, nonempty request padding.
 //! ProxyClientStream's empty-write helper can randomly choose zero padding.
-use super::{Crypto, METHOD, address};
+use super::{Crypto, METHOD, address, buffered::Buffered};
 use anyhow::Result;
 use bytes::{BufMut, BytesMut};
 use kotoconn_protocol::{BoxStream, Target};
@@ -46,7 +46,7 @@ pub(super) async fn connect(
     stream.write_all(&header).await?;
     stream.flush().await?;
 
-    Ok(Box::pin(stream))
+    Ok(Box::pin(Buffered::new(stream)))
 }
 
 struct Encrypted {
@@ -123,6 +123,77 @@ mod tests {
     use futures_util::future::poll_fn;
     use shadowsocks::config::ServerType;
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn pending_writes_preserve_payload_when_input_grows() -> Result<()> {
+        use shadowsocks::relay::tcprelay::proxy_stream::ProxyServerStream;
+        use std::task::Waker;
+
+        for server_writes in [false, true] {
+            let crypto = Crypto::new("AAECAwQFBgcICQoLDA0ODw==", ServerType::Local)?;
+            let server_crypto = Crypto::new("AAECAwQFBgcICQoLDA0ODw==", ServerType::Server)?;
+            // Fit the fixed handshake header, but force payload backpressure.
+            let (client, server) = tokio::io::duplex(64);
+            let client = connect(
+                Box::pin(client),
+                kotoconn_protocol::target("127.0.0.1:80".parse()?),
+                &crypto,
+            );
+            let server = async {
+                let mut server = ProxyServerStream::from_stream(
+                    server_crypto.context.clone(),
+                    server,
+                    METHOD,
+                    server_crypto.config.key(),
+                );
+                server.handshake().await?;
+                Ok::<BoxStream, anyhow::Error>(Box::pin(Buffered::new(server)))
+            };
+            let (client, server) = tokio::try_join!(client, server)?;
+            let (mut writer, mut reader) = if server_writes {
+                (server, client)
+            } else {
+                (client, server)
+            };
+
+            let payload: Vec<u8> = (0..32769).map(|index| index as u8).collect();
+            let mut accepted = 0;
+            loop {
+                let first = writer.as_mut().poll_write(
+                    &mut Context::from_waker(Waker::noop()),
+                    &payload[accepted..accepted + 128],
+                );
+                match first {
+                    Poll::Pending => break,
+                    Poll::Ready(result) => accepted += result?,
+                }
+            }
+
+            let (received, acknowledged) = tokio::sync::oneshot::channel();
+            let send = async {
+                // Like tokio::io::copy, append data after a pending write.
+                writer.write_all(&payload[accepted..]).await?;
+                // Completion must not depend on an explicit flush or shutdown.
+                acknowledged.await.map_err(io::Error::other)?;
+                writer.shutdown().await
+            };
+            let receive = async {
+                let mut output = vec![0; payload.len()];
+                reader.read_exact(&mut output).await?;
+                received.send(()).unwrap();
+
+                let mut trailing = Vec::new();
+                reader.read_to_end(&mut trailing).await?;
+                assert!(trailing.is_empty());
+                Ok::<_, io::Error>(output)
+            };
+            let ((), output) = tokio::try_join!(send, receive)?;
+            assert_eq!(output.len(), payload.len(), "server_writes={server_writes}");
+            assert_eq!(output, payload, "server_writes={server_writes}");
+        }
+
+        Ok(())
+    }
 
     #[tokio::test]
     async fn response_with_another_requests_salt_never_exposes_plaintext() -> Result<()> {
