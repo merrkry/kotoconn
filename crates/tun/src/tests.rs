@@ -678,3 +678,75 @@ fn ipv4_reassembly_accounts_for_options_in_the_original_size_limit() {
         }
     }
 }
+
+#[test]
+fn reassembly_capacity_is_shared_between_workers() {
+    for ipv6 in [false, true] {
+        let limits = packet::ReassemblyLimits::default();
+        let mut decoders = [Decoder::new(limits.clone()), Decoder::new(limits)];
+        let limit = if ipv6 {
+            64
+        } else {
+            smoltcp::config::REASSEMBLY_BUFFER_COUNT
+        };
+        let f = flow(ipv6);
+        let now = Instant::now();
+        let mut encoder = udp::Encoder::new(1280);
+        let mut datagrams = Vec::new();
+        for index in 0..=limit {
+            let frames = encoder.encode(f.source, f.destination, &[7; 2500]).unwrap();
+            assert!(decoders[index % 2].decode(&frames[0], now).is_none());
+            datagrams.push(frames);
+        }
+        // The extra datagram cannot allocate state on either worker.
+        for frame in &datagrams[limit][1..] {
+            assert!(decoders[limit % 2].decode(frame, now).is_none());
+        }
+        let mut completed = None;
+        for frame in &datagrams[0][1..] {
+            completed = decoders[0].decode(frame, now).map(Packet::into_owned);
+        }
+        assert!(completed.is_some());
+        // Finishing a datagram releases global capacity for another worker.
+        let mut completed = None;
+        for frame in &datagrams[limit] {
+            completed = decoders[limit % 2]
+                .decode(frame, now)
+                .map(Packet::into_owned);
+        }
+        assert!(completed.is_some());
+    }
+}
+
+#[test]
+fn idle_reassembly_workers_release_capacity_on_their_deadline() {
+    for ipv6 in [false, true] {
+        let limits = packet::ReassemblyLimits::default();
+        let mut idle = Decoder::new(limits.clone());
+        let mut active = Decoder::new(limits);
+        let limit = if ipv6 {
+            64
+        } else {
+            smoltcp::config::REASSEMBLY_BUFFER_COUNT
+        };
+        let f = flow(ipv6);
+        let now = Instant::now();
+        let mut encoder = udp::Encoder::new(1280);
+        for _ in 0..limit {
+            let frames = encoder.encode(f.source, f.destination, &[7; 2500]).unwrap();
+            assert!(idle.decode(&frames[0], now).is_none());
+        }
+        let frames = encoder.encode(f.source, f.destination, &[7; 2500]).unwrap();
+        for frame in &frames {
+            assert!(active.decode(frame, now).is_none());
+        }
+        let deadline = idle.deadline().unwrap();
+        idle.expire(deadline);
+        assert_eq!(idle.deadline(), None);
+        let mut completed = None;
+        for frame in &frames {
+            completed = active.decode(frame, deadline).map(Packet::into_owned);
+        }
+        assert!(completed.is_some());
+    }
+}

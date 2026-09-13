@@ -96,8 +96,10 @@ def configure_network():
         "add",
         "priority",
         "100",
-        "uidrange",
-        "1000-1000",
+        # TIME_WAIT ACKs use the kernel's UID, not the original application's.
+        # Keep those packets on the same proxy path as the bound client socket.
+        "from",
+        f"{CLIENT}/32",
         "lookup",
         "100",
     )

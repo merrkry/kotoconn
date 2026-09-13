@@ -88,7 +88,7 @@ pub fn bind(options: TunInboundConfig, context: ServerContext) -> Result<BoundTu
     Ok(BoundTun {
         name,
         run: Box::pin(crate::run(
-            crate::offload::Queues::new(device)?,
+            crate::offload::queues(device)?,
             usize::from(options.mtu),
             context,
         )),

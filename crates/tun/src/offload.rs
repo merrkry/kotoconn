@@ -1,10 +1,10 @@
 //! Normalize Linux virtio frames before the common IP validation path.
-use crate::PacketIo;
+use crate::{PacketReceive, PacketSend};
 use smoltcp::wire::TcpPacket;
 use std::{
     collections::VecDeque,
     io::{self, IoSlice},
-    sync::Mutex,
+    sync::Arc,
     task::{Context, Poll, ready},
 };
 use tun_rs::{
@@ -14,93 +14,102 @@ use tun_rs::{
 
 const MAX_IP_PACKET: usize = 65575;
 
-pub(crate) struct OffloadDevice {
-    device: AsyncDevice,
-    receive: Mutex<Receive>,
-    send: tokio::sync::Mutex<Send>,
-}
-
-struct Send {
-    gro: tun_rs::GROTable,
-    buffers: Vec<Vec<u8>>,
-}
-
-struct Receive {
+pub(crate) struct Receiver {
+    device: Arc<AsyncDevice>,
     frame: Vec<u8>,
     datagrams: VecDeque<Vec<u8>>,
 }
 
-impl OffloadDevice {
-    pub fn new(device: AsyncDevice) -> Self {
-        Self {
+pub(crate) struct Sender {
+    device: Arc<AsyncDevice>,
+    gro: tun_rs::GROTable,
+    buffers: Vec<Vec<u8>>,
+}
+
+fn split(device: AsyncDevice) -> (Receiver, Sender) {
+    let device = Arc::new(device);
+    (
+        Receiver {
+            device: device.clone(),
+            frame: vec![0; MAX_IP_PACKET + VIRTIO_NET_HDR_LEN],
+            datagrams: VecDeque::new(),
+        },
+        Sender {
             device,
-            send: tokio::sync::Mutex::new(Send {
-                gro: tun_rs::GROTable::default(),
-                buffers: Vec::new(),
-            }),
-            receive: Mutex::new(Receive {
-                frame: vec![0; MAX_IP_PACKET + VIRTIO_NET_HDR_LEN],
-                datagrams: VecDeque::new(),
-            }),
+            gro: tun_rs::GROTable::default(),
+            buffers: Vec::new(),
+        },
+    )
+}
+
+pub(crate) fn queues(device: AsyncDevice) -> io::Result<Vec<(Receiver, Sender)>> {
+    let count = match std::thread::available_parallelism() {
+        Ok(count) => count.get(),
+        Err(error) => {
+            tracing::warn!(%error, "failed to determine available CPUs; using one TUN queue");
+            1
         }
+    };
+    let mut queues = Vec::with_capacity(count);
+    // Keep the original descriptor at index zero, matching Linux queue indices.
+    for _ in 1..count {
+        queues.push(split(device.try_clone()?));
+    }
+    queues.insert(0, split(device));
+    Ok(queues)
+}
+
+impl PacketReceive for Receiver {
+    fn poll_recv(&mut self, cx: &mut Context<'_>, bytes: &mut [u8]) -> Poll<io::Result<usize>> {
+        if !self.device.tcp_gso() {
+            return self.device.poll_recv(cx, bytes);
+        }
+        if let Some(packet) = self.datagrams.pop_front() {
+            return Poll::Ready(copy_packet(&packet, bytes));
+        }
+
+        let len = ready!(self.device.poll_recv(cx, &mut self.frame))?;
+        // SAFETY: AsyncDevice reports the bytes written into this frame.
+        debug_assert!(len <= self.frame.len());
+        Poll::Ready(normalize(
+            &mut self.frame[..len],
+            bytes,
+            &mut self.datagrams,
+        ))
     }
 }
 
-impl PacketIo for OffloadDevice {
-    async fn send_batch(&self, packets: &mut [Vec<u8>]) -> io::Result<()> {
+impl PacketSend for Sender {
+    async fn send_batch(&mut self, packets: &mut [Vec<u8>]) -> io::Result<()> {
         let offset = if self.device.tcp_gso() {
             VIRTIO_NET_HDR_LEN
         } else {
             0
         };
-        let mut send = self.send.lock().await;
-        // tun-rs only coalesces into existing capacity. Retain a bounded pool
-        // across batches instead of allocating a large Vec for every IP packet.
-        while send.buffers.len() < packets.len().min(64) {
-            send.buffers
+        while self.buffers.len() < packets.len().min(64) {
+            self.buffers
                 .push(Vec::with_capacity(MAX_IP_PACKET + 2 * VIRTIO_NET_HDR_LEN));
         }
-        // SAFETY: The pool was grown to the largest chunk this batch can use.
-        debug_assert!(send.buffers.len() >= packets.len().min(64));
-        let Send { gro, buffers } = &mut *send;
+
+        // SAFETY: The pool was grown to hold each bounded batch.
+        debug_assert!(self.buffers.len() >= packets.len().min(64));
         for chunk in packets.chunks(64) {
-            for (buffer, packet) in buffers.iter_mut().zip(chunk) {
+            for (buffer, packet) in self.buffers.iter_mut().zip(chunk) {
                 buffer.clear();
                 buffer.resize(offset, 0);
                 buffer.extend_from_slice(packet);
             }
             self.device
-                .send_multiple(gro, &mut buffers[..chunk.len()], offset)
+                .send_multiple(&mut self.gro, &mut self.buffers[..chunk.len()], offset)
                 .await?;
         }
         Ok(())
     }
 
-    fn poll_recv(&self, cx: &mut Context<'_>, bytes: &mut [u8]) -> Poll<io::Result<usize>> {
-        if !self.device.tcp_gso() {
-            return self.device.poll_recv(cx, bytes);
-        }
-        let mut receive = self
-            .receive
-            .lock()
-            .map_err(|_| io::Error::other("TUN receive lock poisoned"))?;
-        if let Some(packet) = receive.datagrams.pop_front() {
-            return Poll::Ready(copy_packet(&packet, bytes));
-        }
-
-        let len = ready!(self.device.poll_recv(cx, &mut receive.frame))?;
-        // SAFETY: AsyncDevice returns the number of bytes read into frame.
-        debug_assert!(len <= receive.frame.len());
-        let Receive { frame, datagrams } = &mut *receive;
-        Poll::Ready(normalize(&mut frame[..len], bytes, datagrams))
-    }
-
-    fn poll_send(&self, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_send(&mut self, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
         if !self.device.tcp_gso() {
             return self.device.poll_send(cx, bytes);
         }
-        // A zero virtio header describes a complete, checksummed IP packet.
-        // writev adds it without allocating or copying the packet payload.
         let header = [0; VIRTIO_NET_HDR_LEN];
         loop {
             ready!(self.device.poll_writable(cx))?;
@@ -232,53 +241,5 @@ pub(super) fn normalize(
             }
         }
         _ => Err(invalid("unsupported TUN GSO type")),
-    }
-}
-
-pub(crate) struct Queues {
-    devices: Vec<OffloadDevice>,
-    next: std::sync::atomic::AtomicUsize,
-}
-
-impl Queues {
-    pub fn new(device: AsyncDevice) -> io::Result<Self> {
-        let count = std::thread::available_parallelism()?.get().min(4);
-        let mut devices = Vec::with_capacity(count);
-        for _ in 1..count {
-            devices.push(OffloadDevice::new(device.try_clone()?));
-        }
-        devices.push(OffloadDevice::new(device));
-        Ok(Self {
-            devices,
-            next: std::sync::atomic::AtomicUsize::new(0),
-        })
-    }
-}
-
-impl PacketIo for Queues {
-    fn poll_recv(&self, cx: &mut Context<'_>, bytes: &mut [u8]) -> Poll<io::Result<usize>> {
-        // SAFETY: new uses a nonzero CPU count, capped at four queues.
-        debug_assert!((1..=4).contains(&self.devices.len()));
-        let next = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        for index in 0..self.devices.len() {
-            let device = &self.devices[next.wrapping_add(index) % self.devices.len()];
-            if let Poll::Ready(result) = device.poll_recv(cx, bytes) {
-                return Poll::Ready(result);
-            }
-        }
-        Poll::Pending
-    }
-
-    fn poll_send(&self, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
-        // SAFETY: new creates at least one queue from a nonzero CPU count.
-        debug_assert!(!self.devices.is_empty());
-        self.devices[0].poll_send(cx, bytes)
-    }
-
-    async fn send_batch(&self, packets: &mut [Vec<u8>]) -> io::Result<()> {
-        // Keep one writer so endpoint UDP fragment identifiers stay shared.
-        // SAFETY: new creates at least one queue from a nonzero CPU count.
-        debug_assert!(!self.devices.is_empty());
-        self.devices[0].send_batch(packets).await
     }
 }

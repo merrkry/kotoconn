@@ -8,9 +8,12 @@ mod packet;
 mod reassembly;
 mod tcp;
 mod udp;
+mod worker;
 
-pub use endpoint::{PacketIo, run};
+pub use endpoint::{PacketReceive, PacketSend, run};
 pub use linux::{BoundTun, bind};
 
+#[cfg(test)]
+mod parallel_tests;
 #[cfg(test)]
 mod tests;

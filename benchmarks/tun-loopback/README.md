@@ -2,8 +2,11 @@
 
 This benchmark compares the current Kotoconn working tree with the sing-box
 `go` TUN stack. It runs iperf3 inside one isolated container network namespace.
-A UID policy rule sends only the client traffic through TUN. The proxy's direct
-outbound reaches a server bound to another loopback address.
+A source-address policy rule sends client traffic through TUN, including
+kernel-generated TCP control packets after the client socket enters TIME_WAIT.
+The proxy's direct outbound uses the server's separate loopback address.
+UID-only routing misses TIME_WAIT ACKs and can leave proxy connections in LAST_ACK;
+see [Linux TCP reply routing](https://github.com/torvalds/linux/blob/master/net/ipv4/tcp_ipv4.c).
 
 Run it from the repository root:
 
@@ -26,3 +29,6 @@ Each scenario has five samples. iperf3 omits the first second and measures the
 next three seconds. The JSON contains received throughput, daemon CPU time, and
 TUN interface counters for each sample. Scenarios cover one or four TCP streams
 in upload and reverse-download directions at MTU 1500.
+
+The [parallel-worker measurements](../../docs/tun-parallel-benchmarks.md) extend
+this setup to 16 and 64 streams, with controls at four and 16 CPUs.
