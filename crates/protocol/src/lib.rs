@@ -6,7 +6,7 @@ mod server;
 pub mod stream_buffer;
 
 use anyhow::{Result, bail};
-pub use control::Scope;
+pub use control::{Scope, WorkGuard};
 use futures_util::future::BoxFuture;
 pub use io::{BoxStream, Datagram, Packet, Stream, packet_pair, stream_task};
 pub use kotoconn_config::{Target, TransportProtocol};
