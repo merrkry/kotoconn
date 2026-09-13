@@ -64,13 +64,157 @@ fn segment(
         &ChecksumCapabilities::default(),
     );
     tcp::QueuedPacket {
-        bytes: Packet { ip, payload }.encode(),
+        bytes: Packet {
+            ip,
+            payload: payload.into(),
+        }
+        .encode(),
         _permit: None,
     }
 }
 
-fn decoded(bytes: &[u8]) -> Packet {
-    Decoder::default().decode(bytes, Instant::now()).unwrap()
+fn decoded(bytes: &[u8]) -> Packet<'static> {
+    Decoder::default()
+        .decode(bytes, Instant::now())
+        .unwrap()
+        .into_owned()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn gso_tcp_preserves_aggregate_bytes_sequence_and_flags_in_both_families() {
+    for ipv6 in [false, true] {
+        let payload: Vec<_> = (0..60000).map(|i| (i % 251) as u8).collect();
+        let packet = segment(flow(ipv6), 100, Some(200), TcpControl::Psh, &payload).bytes;
+        let header = tun_rs::VirtioNetHdr {
+            flags: 1,
+            gso_type: if ipv6 {
+                tun_rs::VIRTIO_NET_HDR_GSO_TCPV6
+            } else {
+                tun_rs::VIRTIO_NET_HDR_GSO_TCPV4
+            },
+            hdr_len: 0, // Linux forwarding may report an unusable hdr_len.
+            gso_size: 1220,
+            csum_start: if ipv6 { 40 } else { 20 },
+            csum_offset: 16,
+        };
+        let mut frame = vec![0; tun_rs::VIRTIO_NET_HDR_LEN];
+        header.encode(&mut frame).unwrap();
+        frame.extend_from_slice(&packet);
+        let mut output = vec![0; 65575];
+        let mut pending = std::collections::VecDeque::new();
+        let len = offload::normalize(&mut frame, &mut output, &mut pending).unwrap();
+        let packet = decoded(&output[..len]);
+        let (actual_flow, tcp) = packet.tcp().unwrap();
+        assert_eq!(actual_flow, flow(ipv6));
+        assert_eq!(tcp.seq_number, TcpSeqNumber(100));
+        assert_eq!(tcp.ack_number, Some(TcpSeqNumber(200)));
+        assert_eq!(tcp.control, TcpControl::Psh);
+        assert_eq!(tcp.payload, payload);
+        assert!(pending.is_empty());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn gso_udp_preserves_datagram_boundaries_and_rebuilds_checksums() {
+    for ipv6 in [false, true] {
+        let flow = flow(ipv6);
+        let payload: Vec<_> = (0..2501).map(|i| (i % 251) as u8).collect();
+        let packet = udp::Encoder::new(65535)
+            .encode(flow.source, flow.destination, &payload)
+            .unwrap()
+            .remove(0);
+        let header = tun_rs::VirtioNetHdr {
+            flags: 1,
+            gso_type: tun_rs::VIRTIO_NET_HDR_GSO_UDP_L4,
+            hdr_len: 0,
+            gso_size: 1000,
+            csum_start: if ipv6 { 40 } else { 20 },
+            csum_offset: 6,
+        };
+        let mut frame = vec![0; tun_rs::VIRTIO_NET_HDR_LEN];
+        header.encode(&mut frame).unwrap();
+        frame.extend_from_slice(&packet);
+        let mut output = vec![0; 65575];
+        let mut pending = std::collections::VecDeque::new();
+        let len = offload::normalize(&mut frame, &mut output, &mut pending).unwrap();
+        pending.push_front(output[..len].to_vec());
+        assert_eq!(pending.len(), 3);
+        for (packet, expected) in pending.into_iter().zip(payload.chunks(1000)) {
+            let packet = decoded(&packet);
+            let (actual_flow, actual) = packet.udp().unwrap();
+            assert_eq!(actual_flow, flow);
+            assert_eq!(actual, expected);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn udp_offload_encodes_a_computed_zero_checksum_as_all_ones() {
+    for ipv6 in [false, true] {
+        let flow = flow(ipv6);
+        let start = if ipv6 { 40 } else { 20 };
+        let mut encoder = udp::Encoder::new(65535);
+        let seed = encoder
+            .encode(flow.source, flow.destination, &[0; 2])
+            .unwrap()
+            .remove(0);
+        // Adding this word to the payload makes the computed checksum zero.
+        let payload = UdpPacket::new_checked(&seed[start..])
+            .unwrap()
+            .checksum()
+            .to_be_bytes();
+        for gso in [false, true] {
+            let data = if gso {
+                payload.repeat(2)
+            } else {
+                payload.to_vec()
+            };
+            let mut packet = encoder
+                .encode(flow.source, flow.destination, &data)
+                .unwrap()
+                .remove(0);
+            if !gso {
+                let mut udp = UdpPacket::new_checked(&mut packet[start..]).unwrap();
+                assert_eq!(udp.checksum(), 0xffff);
+                udp.set_checksum(smoltcp::wire::checksum::pseudo_header(
+                    &flow.source.ip().into(),
+                    &flow.destination.ip().into(),
+                    IpProtocol::Udp,
+                    10,
+                ));
+            }
+            let header = tun_rs::VirtioNetHdr {
+                flags: 1,
+                gso_type: if gso {
+                    tun_rs::VIRTIO_NET_HDR_GSO_UDP_L4
+                } else {
+                    0
+                },
+                hdr_len: 0,
+                gso_size: if gso { 2 } else { 0 },
+                csum_start: start as u16,
+                csum_offset: 6,
+            };
+            let mut frame = vec![0; tun_rs::VIRTIO_NET_HDR_LEN];
+            header.encode(&mut frame).unwrap();
+            frame.extend_from_slice(&packet);
+            let mut output = vec![0; 65575];
+            let mut pending = std::collections::VecDeque::new();
+            let len = offload::normalize(&mut frame, &mut output, &mut pending).unwrap();
+            pending.push_front(output[..len].to_vec());
+            assert_eq!(pending.len(), if gso { 2 } else { 1 });
+            for bytes in pending {
+                assert_eq!(
+                    UdpPacket::new_checked(&bytes[start..]).unwrap().checksum(),
+                    0xffff
+                );
+                assert_eq!(decoded(&bytes).udp().unwrap().1, payload);
+            }
+        }
+    }
 }
 
 #[test]
@@ -92,7 +236,7 @@ fn udp_roundtrips_empty_and_fragmented_datagrams_in_both_families() {
             let mut completed = Vec::new();
             for packet in packets {
                 if let Some(packet) = decoder.decode(&packet, now) {
-                    completed.push(packet);
+                    completed.push(packet.into_owned());
                 }
             }
             assert_eq!(completed.len(), 1, "IPv6={ipv6}, payload={size}");
@@ -181,6 +325,7 @@ fn ipv6_overlaps_poison_the_datagram_but_atomic_fragments_are_independent() {
     for packet in packets.drain(..) {
         completed = decoder
             .decode(&packet, now + Duration::from_secs(60))
+            .map(Packet::into_owned)
             .or(completed);
     }
     assert_eq!(completed.unwrap().udp().unwrap().1, vec![7; 2500]);
@@ -531,5 +676,77 @@ fn ipv4_reassembly_accounts_for_options_in_the_original_size_limit() {
                 assert_eq!(packet.udp().unwrap().1, vec![7; size]);
             }
         }
+    }
+}
+
+#[test]
+fn reassembly_capacity_is_shared_between_workers() {
+    for ipv6 in [false, true] {
+        let limits = packet::ReassemblyLimits::default();
+        let mut decoders = [Decoder::new(limits.clone()), Decoder::new(limits)];
+        let limit = if ipv6 {
+            64
+        } else {
+            smoltcp::config::REASSEMBLY_BUFFER_COUNT
+        };
+        let f = flow(ipv6);
+        let now = Instant::now();
+        let mut encoder = udp::Encoder::new(1280);
+        let mut datagrams = Vec::new();
+        for index in 0..=limit {
+            let frames = encoder.encode(f.source, f.destination, &[7; 2500]).unwrap();
+            assert!(decoders[index % 2].decode(&frames[0], now).is_none());
+            datagrams.push(frames);
+        }
+        // The extra datagram cannot allocate state on either worker.
+        for frame in &datagrams[limit][1..] {
+            assert!(decoders[limit % 2].decode(frame, now).is_none());
+        }
+        let mut completed = None;
+        for frame in &datagrams[0][1..] {
+            completed = decoders[0].decode(frame, now).map(Packet::into_owned);
+        }
+        assert!(completed.is_some());
+        // Finishing a datagram releases global capacity for another worker.
+        let mut completed = None;
+        for frame in &datagrams[limit] {
+            completed = decoders[limit % 2]
+                .decode(frame, now)
+                .map(Packet::into_owned);
+        }
+        assert!(completed.is_some());
+    }
+}
+
+#[test]
+fn idle_reassembly_workers_release_capacity_on_their_deadline() {
+    for ipv6 in [false, true] {
+        let limits = packet::ReassemblyLimits::default();
+        let mut idle = Decoder::new(limits.clone());
+        let mut active = Decoder::new(limits);
+        let limit = if ipv6 {
+            64
+        } else {
+            smoltcp::config::REASSEMBLY_BUFFER_COUNT
+        };
+        let f = flow(ipv6);
+        let now = Instant::now();
+        let mut encoder = udp::Encoder::new(1280);
+        for _ in 0..limit {
+            let frames = encoder.encode(f.source, f.destination, &[7; 2500]).unwrap();
+            assert!(idle.decode(&frames[0], now).is_none());
+        }
+        let frames = encoder.encode(f.source, f.destination, &[7; 2500]).unwrap();
+        for frame in &frames {
+            assert!(active.decode(frame, now).is_none());
+        }
+        let deadline = idle.deadline().unwrap();
+        idle.expire(deadline);
+        assert_eq!(idle.deadline(), None);
+        let mut completed = None;
+        for frame in &frames {
+            completed = active.decode(frame, deadline).map(Packet::into_owned);
+        }
+        assert!(completed.is_some());
     }
 }

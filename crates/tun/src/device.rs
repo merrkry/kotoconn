@@ -53,7 +53,9 @@ impl phy::Device for Device {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
         caps.max_transmission_unit = self.mtu;
-        caps.max_burst_size = Some(32);
+        // The egress queue is drained between polls. It does not limit the
+        // TCP receive window advertised to the peer.
+        caps.max_burst_size = None;
         caps
     }
 }

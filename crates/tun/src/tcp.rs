@@ -28,6 +28,10 @@ use tokio::{
 
 const BUFFER_SIZE: usize = 64 * 1024;
 
+// The receive window must cover bursts while the application and endpoint
+// drivers run. smoltcp fixes its receive storage and window scale at creation.
+const RECEIVE_BUFFER_SIZE: usize = 1024 * 1024;
+
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 // SAFETY: Each TCP interface needs one address and one route. Reject smoltcp
@@ -147,7 +151,11 @@ pub(crate) fn connection(
     debug_assert_ne!(flow.destination.port(), 0);
     debug_assert!((1280..=65535).contains(&mtu));
 
-    let (packets, mut incoming) = mpsc::channel::<QueuedPacket>(32);
+    // Queue storage is allocated on demand. Allow two receive windows of MTU
+    // packets so scheduler bursts do not turn advertised credit into packet loss.
+    // The endpoint also enforces its shared 8 MiB ingress budget.
+    let (packets, mut incoming) =
+        mpsc::channel::<QueuedPacket>((2 * RECEIVE_BUFFER_SIZE).div_ceil(mtu));
     let (accepted_tx, accepted) = oneshot::channel();
     let (local, mut app) = tokio::io::duplex(BUFFER_SIZE);
     let (dropped, mut drop_rx) = oneshot::channel();
@@ -200,7 +208,7 @@ pub(crate) fn connection(
         }
 
         let mut socket = tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0; BUFFER_SIZE]),
+            tcp::SocketBuffer::new(vec![0; RECEIVE_BUFFER_SIZE]),
             tcp::SocketBuffer::new(vec![0; BUFFER_SIZE]),
         );
         socket.set_congestion_control(tcp::CongestionControl::Cubic);
@@ -301,6 +309,16 @@ pub(crate) fn connection(
                     permit
                         .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?
                         .send(Transmit::Packet(device.outgoing.pop_front().unwrap()));
+                    // Hand over the rest of this bounded burst while capacity
+                    // is ready, so the endpoint can coalesce adjacent segments.
+                    while !device.outgoing.is_empty() {
+                        let Ok(permit) = output.try_reserve() else { break; };
+                        // SAFETY: This driver alone owns the queue, and the
+                        // loop condition checked it before reserving capacity.
+                        debug_assert!(!device.outgoing.is_empty());
+                        permit.send(Transmit::Packet(device.outgoing.pop_front().unwrap()));
+                    }
+
                 }
                 packet = incoming.recv(), if device.incoming.is_none() && device.outgoing.len() < 32 => {
                     match packet {

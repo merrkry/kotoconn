@@ -6,15 +6,18 @@ use smoltcp::{
     socket::raw,
     wire::{HardwareAddress, IpVersion, Ipv4FragKey, Ipv4Packet},
 };
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 struct HeaderLimit {
+    _permit: OwnedSemaphorePermit,
     length: usize,
     expires: Instant,
 }
 
 pub(crate) struct Ipv4Reassembly {
+    slots: Arc<Semaphore>,
     epoch: Instant,
     iface: Interface,
     device: Device,
@@ -23,8 +26,8 @@ pub(crate) struct Ipv4Reassembly {
     headers: BTreeMap<Ipv4FragKey, HeaderLimit>,
 }
 
-impl Default for Ipv4Reassembly {
-    fn default() -> Self {
+impl Ipv4Reassembly {
+    pub fn new(slots: Arc<Semaphore>) -> Self {
         let mut device = Device::new(65535);
         let mut config = Config::new(HardwareAddress::Ip);
         config.random_seed = rand::random();
@@ -38,6 +41,7 @@ impl Default for Ipv4Reassembly {
             raw::PacketBuffer::new(vec![], vec![]),
         ));
         Self {
+            slots,
             epoch: Instant::now(),
             iface,
             device,
@@ -49,28 +53,40 @@ impl Default for Ipv4Reassembly {
 }
 
 impl Ipv4Reassembly {
+    pub fn deadline(&self) -> Option<Instant> {
+        self.headers.values().map(|header| header.expires).min()
+    }
+
+    pub fn expire(&mut self, now: Instant) {
+        self.headers.retain(|_, header| header.expires > now);
+        self.iface
+            .poll_maintenance(smoltcp::time::Instant::from_micros(
+                now.duration_since(self.epoch).as_micros() as i64,
+            ));
+    }
+
     pub fn process(&mut self, data: &[u8], now: Instant) -> Option<Vec<u8>> {
         let packet = Ipv4Packet::new_checked(data).ok()?;
         let key = packet.get_key();
-        self.headers.retain(|_, header| header.expires > now);
-        if !self.headers.contains_key(&key)
-            && self.headers.len() >= smoltcp::config::REASSEMBLY_BUFFER_COUNT
-        {
-            return None;
+        self.expire(now);
+        if let std::collections::btree_map::Entry::Vacant(entry) = self.headers.entry(key) {
+            let permit = self.slots.clone().try_acquire_owned().ok()?;
+            entry.insert(HeaderLimit {
+                _permit: permit,
+                length: 20,
+                // smoltcp expires at timestamp > deadline, in whole microseconds.
+                expires: now + Duration::from_secs(60) + Duration::from_micros(1),
+            });
         }
-        let header = self.headers.entry(key).or_insert(HeaderLimit {
-            length: 20,
-            expires: now + Duration::from_secs(60),
-        });
+        let header = self.headers.get_mut(&key)?;
         header.length = header.length.max(usize::from(packet.header_len()));
         let now =
             smoltcp::time::Instant::from_micros(now.duration_since(self.epoch).as_micros() as i64);
-        self.iface.poll_maintenance(now);
         self.device.incoming = Some(data.to_vec());
         self.iface
             .poll_ingress_single(now, &mut self.device, &mut self.sockets);
         self.device.outgoing.clear();
-        // SAFETY: Default inserted this IPv4 raw socket; process never removes
+        // SAFETY: new inserted this IPv4 raw socket; process never removes
         // it. A received buffer includes the IPv4 header emitted by smoltcp.
         debug_assert!(self.sockets.iter().any(|(id, socket)| {
             id == self.raw && matches!(socket, smoltcp::socket::Socket::Raw(_))

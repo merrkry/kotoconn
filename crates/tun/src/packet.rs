@@ -1,7 +1,8 @@
 //! Validate and normalize IP before allocating transport state. Reassembly is
 //! shared by TCP and UDP, including fragmented initial SYNs.
 use smoltcp::{phy::ChecksumCapabilities, wire::*};
-use std::{collections::HashMap, net::SocketAddr, time::Duration};
+use std::{borrow::Cow, collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 const MAX_DATAGRAMS: usize = 64;
@@ -14,12 +15,19 @@ pub(crate) struct Flow {
     pub destination: SocketAddr,
 }
 
-pub(crate) struct Packet {
+pub(crate) struct Packet<'a> {
     pub ip: IpRepr,
-    pub payload: Vec<u8>,
+    pub payload: Cow<'a, [u8]>,
 }
 
-impl Packet {
+impl Packet<'_> {
+    pub fn into_owned(self) -> Packet<'static> {
+        Packet {
+            ip: self.ip,
+            payload: Cow::Owned(self.payload.into_owned()),
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         // SAFETY: Decoder normalizes the IP payload length after reassembly;
         // outbound encoders construct it from their transport buffer length.
@@ -91,6 +99,7 @@ struct Fragment {
 }
 
 struct Assembly {
+    _permit: OwnedSemaphorePermit,
     expires: Instant,
     ranges: smoltcp::storage::Assembler,
     data: Vec<u8>,
@@ -108,79 +117,196 @@ impl Assembly {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct Decoder {
-    fragments: HashMap<FragmentKey, Assembly>,
-    ipv4: crate::reassembly::Ipv4Reassembly,
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum RouteKey {
+    Flow(u8, Flow),
+    Ipv4Fragment {
+        source: Ipv4Address,
+        destination: Ipv4Address,
+        protocol: u8,
+        id: u32,
+    },
+    Ipv6Fragment {
+        source: Ipv6Address,
+        destination: Ipv6Address,
+        id: u32,
+    },
 }
 
-impl Decoder {
-    pub fn deadline(&self) -> Option<Instant> {
-        self.fragments.values().map(|a| a.expires).min()
-    }
+pub(crate) struct Parsed<'a> {
+    bytes: &'a [u8],
+    ip: IpRepr,
+    payload: &'a [u8],
+    fragment: Option<Fragment>,
+}
 
-    pub fn expire(&mut self, now: Instant) {
-        self.fragments.retain(|_, a| a.expires > now);
-    }
-
-    pub fn decode(&mut self, data: &[u8], now: Instant) -> Option<Packet> {
-        data.first()?;
-
-        let (mut ip, payload, fragment) = match IpVersion::of_packet(data).ok()? {
-            IpVersion::Ipv4 => {
-                let packet = Ipv4Packet::new_checked(data).ok()?;
-                let repr = Ipv4Repr::parse(&packet, &ChecksumCapabilities::default()).ok()?;
-                // SAFETY: Successful checked parsing establishes the fixed
-                // header and the complete options slice within this buffer.
-                debug_assert!((20..=data.len()).contains(&usize::from(packet.header_len())));
-                // Source routing is deliberately outside this unicast proxy's policy.
-                if !ipv4_options(&data[20..packet.header_len() as usize]) {
-                    return None;
-                }
-                let fragment = (packet.more_frags() || packet.frag_offset() != 0).then_some((
-                    u32::from(packet.ident()),
-                    usize::from(packet.frag_offset()),
-                    packet.more_frags(),
-                ));
-                if let Some((_, offset, more)) = fragment {
-                    if packet.payload().is_empty()
-                        || offset + packet.payload().len() > 65515
-                        || (more && !packet.payload().len().is_multiple_of(8))
-                    {
-                        return None;
-                    }
-                    let assembled = self.ipv4.process(data, now)?;
-                    return self.decode(&assembled, now);
-                }
-                (IpRepr::Ipv4(repr), packet.payload(), None)
-            }
-            IpVersion::Ipv6 => {
-                let packet = Ipv6Packet::new_checked(data).ok()?;
-                let mut repr = Ipv6Repr::parse(&packet).ok()?;
-                let (protocol, payload, fragment) =
-                    ipv6_extensions(repr.next_header, packet.payload())?;
-                repr.next_header = protocol;
-                repr.payload_len = payload.len();
-                (IpRepr::Ipv6(repr), payload, fragment)
-            }
-        };
-
-        if !unicast(ip.src_addr()) || !unicast(ip.dst_addr()) || ip.hop_limit() == 0 {
+impl<'a> Parsed<'a> {
+    pub fn route(&self) -> Option<RouteKey> {
+        if let Some(fragment) = self.fragment {
+            return Some(match self.ip {
+                IpRepr::Ipv4(ip) => RouteKey::Ipv4Fragment {
+                    source: ip.src_addr,
+                    destination: ip.dst_addr,
+                    protocol: u8::from(ip.next_header),
+                    id: fragment.id,
+                },
+                IpRepr::Ipv6(ip) => RouteKey::Ipv6Fragment {
+                    source: ip.src_addr,
+                    destination: ip.dst_addr,
+                    id: fragment.id,
+                },
+            });
+        }
+        if !matches!(self.ip.next_header(), IpProtocol::Tcp | IpProtocol::Udp) {
             return None;
         }
-        let payload = if let Some(fragment) = fragment {
+        let ports = self.payload.get(..4)?;
+        // SAFETY: get above established all four bytes of the transport ports.
+        debug_assert!(ports.len() == 4);
+        let source = u16::from_be_bytes([ports[0], ports[1]]);
+        let destination = u16::from_be_bytes([ports[2], ports[3]]);
+        (destination != 0).then(|| {
+            RouteKey::Flow(
+                u8::from(self.ip.next_header()),
+                Flow {
+                    source: SocketAddr::new(self.ip.src_addr().into(), source),
+                    destination: SocketAddr::new(self.ip.dst_addr().into(), destination),
+                },
+            )
+        })
+    }
+
+    pub fn decode(self, decoder: &mut Decoder, now: Instant) -> Option<Packet<'a>> {
+        if self.fragment.is_some() && matches!(self.ip, IpRepr::Ipv4(_)) {
+            let assembled = decoder.ipv4.process(self.bytes, now)?;
+            return decoder.decode(&assembled, now).map(Packet::into_owned);
+        }
+        let mut ip = self.ip;
+        let payload = if let Some(fragment) = self.fragment {
             let key = FragmentKey {
                 source: ip.src_addr(),
                 destination: ip.dst_addr(),
                 id: fragment.id,
             };
-            self.reassemble(key, ip.next_header(), fragment, payload, now)?
+            Cow::Owned(decoder.reassemble(key, ip.next_header(), fragment, self.payload, now)?)
         } else {
-            payload.to_vec()
+            Cow::Borrowed(self.payload)
         };
-
         ip.set_payload_len(payload.len());
         Some(Packet { ip, payload })
+    }
+}
+
+pub(crate) fn parse(data: &[u8]) -> Option<Parsed<'_>> {
+    // SAFETY: IpVersion::of_packet reads the first byte without checking length.
+    data.first()?;
+    let (ip, payload, fragment) = match IpVersion::of_packet(data).ok()? {
+        IpVersion::Ipv4 => {
+            let packet = Ipv4Packet::new_checked(data).ok()?;
+            let repr = Ipv4Repr::parse(&packet, &ChecksumCapabilities::default()).ok()?;
+            // SAFETY: Successful checked parsing establishes the fixed
+            // header and the complete options slice within this buffer.
+            debug_assert!((20..=data.len()).contains(&usize::from(packet.header_len())));
+            // Source routing is deliberately outside this unicast proxy's policy.
+            if !ipv4_options(&data[20..packet.header_len() as usize]) {
+                return None;
+            }
+            let fragment = (packet.more_frags() || packet.frag_offset() != 0).then_some((
+                u32::from(packet.ident()),
+                usize::from(packet.frag_offset()),
+                packet.more_frags(),
+            ));
+            if let Some((_, offset, more)) = fragment
+                && (packet.payload().is_empty()
+                    || offset + packet.payload().len() > 65515
+                    || (more && !packet.payload().len().is_multiple_of(8)))
+            {
+                return None;
+            }
+            (
+                IpRepr::Ipv4(repr),
+                packet.payload(),
+                fragment.map(|(id, offset, more)| Fragment {
+                    id,
+                    offset,
+                    more,
+                    prefix_len: 0,
+                }),
+            )
+        }
+        IpVersion::Ipv6 => {
+            let packet = Ipv6Packet::new_checked(data).ok()?;
+            let mut repr = Ipv6Repr::parse(&packet).ok()?;
+            let (protocol, payload, fragment) =
+                ipv6_extensions(repr.next_header, packet.payload())?;
+            repr.next_header = protocol;
+            repr.payload_len = payload.len();
+            (IpRepr::Ipv6(repr), payload, fragment)
+        }
+    };
+
+    if !unicast(ip.src_addr()) || !unicast(ip.dst_addr()) || ip.hop_limit() == 0 {
+        return None;
+    }
+    Some(Parsed {
+        bytes: data,
+        ip,
+        payload,
+        fragment,
+    })
+}
+
+#[derive(Clone)]
+pub(crate) struct ReassemblyLimits {
+    ipv4: Arc<Semaphore>,
+    ipv6: Arc<Semaphore>,
+}
+
+impl Default for ReassemblyLimits {
+    fn default() -> Self {
+        Self {
+            ipv4: Arc::new(Semaphore::new(smoltcp::config::REASSEMBLY_BUFFER_COUNT)),
+            ipv6: Arc::new(Semaphore::new(MAX_DATAGRAMS)),
+        }
+    }
+}
+
+pub(crate) struct Decoder {
+    fragments: HashMap<FragmentKey, Assembly>,
+    slots: Arc<Semaphore>,
+    ipv4: crate::reassembly::Ipv4Reassembly,
+}
+
+impl Default for Decoder {
+    fn default() -> Self {
+        Self::new(ReassemblyLimits::default())
+    }
+}
+
+impl Decoder {
+    pub fn new(limits: ReassemblyLimits) -> Self {
+        Self {
+            fragments: HashMap::new(),
+            slots: limits.ipv6,
+            ipv4: crate::reassembly::Ipv4Reassembly::new(limits.ipv4),
+        }
+    }
+
+    pub fn deadline(&self) -> Option<Instant> {
+        self.fragments
+            .values()
+            .map(|a| a.expires)
+            .chain(self.ipv4.deadline())
+            .min()
+    }
+
+    pub fn expire(&mut self, now: Instant) {
+        self.fragments.retain(|_, a| a.expires > now);
+        self.ipv4.expire(now);
+    }
+
+    pub fn decode<'a>(&mut self, data: &'a [u8], now: Instant) -> Option<Packet<'a>> {
+        parse(data)?.decode(self, now)
     }
 
     fn reassemble(
@@ -203,18 +329,20 @@ impl Decoder {
         debug_assert!(offset <= 0xfff8 && offset.is_multiple_of(8));
         self.expire(now);
 
-        if !self.fragments.contains_key(&key) && self.fragments.len() >= MAX_DATAGRAMS {
-            return None;
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.fragments.entry(key) {
+            let permit = self.slots.clone().try_acquire_owned().ok()?;
+            entry.insert(Assembly {
+                _permit: permit,
+                expires: now + REASSEMBLY_LIFETIME,
+                ranges: smoltcp::storage::Assembler::new(),
+                data: Vec::new(),
+                protocol,
+                prefix_len,
+                total: None,
+                poisoned: false,
+            });
         }
-        let assembly = self.fragments.entry(key).or_insert_with(|| Assembly {
-            expires: now + REASSEMBLY_LIFETIME,
-            ranges: smoltcp::storage::Assembler::new(),
-            data: Vec::new(),
-            protocol,
-            prefix_len,
-            total: None,
-            poisoned: false,
-        });
+        let assembly = self.fragments.get_mut(&key)?;
         if assembly.poisoned {
             return None;
         }

@@ -1,471 +1,231 @@
 use crate::{
     device::Transmit,
-    packet::{Decoder, Flow},
-    tcp, udp,
+    udp,
+    worker::{self, Shared},
 };
-use anyhow::{Result, ensure};
-use bytes::Bytes;
-use kotoconn_protocol::{self as p, Scope, ServerContext};
-use smoltcp::wire::{IpProtocol, TcpControl};
+use anyhow::{Context as _, Result, anyhow, bail, ensure};
+use kotoconn_protocol::ServerContext;
 use std::{
-    collections::HashMap,
+    collections::hash_map::RandomState,
     future::poll_fn,
     io,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch},
-    time::Instant,
+    sync::{Semaphore, mpsc},
+    task::JoinSet,
 };
+use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
-const MAX_TCP_CONNECTIONS: usize = 256;
-
-const MAX_UDP_ASSOCIATIONS: usize = 128;
-
-const INGRESS_BYTES: usize = 8 * 1024 * 1024;
-
-/// Packet boundaries are preserved. A successful send consumes exactly one IP
-/// packet. Implementations must register readiness with the supplied context.
-/// A successful receive returns the number of bytes written into `bytes`,
-/// which must not exceed its length.
-pub trait PacketIo: Send + Sync {
-    fn poll_recv(&self, cx: &mut Context<'_>, bytes: &mut [u8]) -> Poll<io::Result<usize>>;
-    fn poll_send(&self, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>>;
+/// A queue has one receive owner. Implementations preserve packet boundaries,
+/// register the supplied waker on Pending, and return at most bytes.len() bytes.
+pub trait PacketReceive: Send {
+    fn poll_recv(&mut self, cx: &mut Context<'_>, bytes: &mut [u8]) -> Poll<io::Result<usize>>;
 }
 
-#[cfg(target_os = "linux")]
-impl PacketIo for tun_rs::AsyncDevice {
-    fn poll_recv(&self, cx: &mut Context<'_>, bytes: &mut [u8]) -> Poll<io::Result<usize>> {
-        self.poll_recv(cx, bytes)
+/// A queue has one transmit owner, independent of its receive owner.
+pub trait PacketSend: Send {
+    fn poll_send(&mut self, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>>;
+
+    /// Send only packets already available. Cancellation may transmit a prefix;
+    /// the caller must not retry a cancelled batch.
+    fn send_batch(
+        &mut self,
+        packets: &mut [Vec<u8>],
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        async move {
+            for (index, packet) in packets.iter().enumerate() {
+                let len = poll_fn(|cx| self.poll_send(cx, packet)).await?;
+                if len != packet.len() {
+                    return Err(io::Error::other("partial TUN packet write"));
+                }
+                if (index + 1).is_multiple_of(64) {
+                    tokio::task::yield_now().await;
+                }
+            }
+            Ok(())
+        }
     }
-
-    fn poll_send(&self, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
-        self.poll_send(cx, bytes)
-    }
 }
 
-struct TcpEntry {
-    packets: mpsc::Sender<tcp::QueuedPacket>,
-    generation: u64,
-}
+struct ConnectionGuard(kotoconn_protocol::Scope);
 
-struct UdpEntry {
-    packets: mpsc::Sender<p::Packet>,
-    activity: watch::Sender<Instant>,
-    scope: Scope,
-    generation: u64,
-}
-
-impl Drop for UdpEntry {
+impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        self.scope.close();
+        // Dropping run must also cancel connections when its future is aborted.
+        self.0.close();
     }
 }
 
-#[derive(Clone, Copy)]
-enum Protocol {
-    Tcp,
-    Udp,
-}
-
-struct Completion {
-    tx: mpsc::UnboundedSender<(Protocol, Flow, u64)>,
-    protocol: Protocol,
-    flow: Flow,
-    generation: u64,
-}
-
-impl Drop for Completion {
-    fn drop(&mut self) {
-        let _ = self.tx.send((self.protocol, self.flow, self.generation));
-    }
-}
-
-/// Run until admission stops and accepted TCP connections drain. The caller's
-/// scope owns every connection task and interrupts device I/O on forced shutdown.
-pub async fn run<D: PacketIo>(device: D, mtu: usize, context: ServerContext) -> Result<()> {
+/// Own queue workers until TCP drains or cancellation stops device I/O.
+/// Queue membership stays fixed so flow and fragment ownership cannot migrate.
+pub async fn run<R: PacketReceive + 'static, W: PacketSend + 'static>(
+    queues: Vec<(R, W)>,
+    mtu: usize,
+    mut context: ServerContext,
+) -> Result<()> {
     ensure!(
         (1280..=65535).contains(&mtu),
         "TUN MTU must be between 1280 and 65535"
     );
-
-    let (output, packets) = mpsc::channel::<Transmit>(128);
-    let receive = dispatch(&device, mtu, context.clone(), output);
-    let send = transmit(&device, mtu, packets);
-
-    tokio::pin!(receive, send);
-    tokio::select! {
-        biased;
-        _ = context.scope.cancelled() => Ok(()),
-        result = &mut receive => {
-            result?;
-            send.await
-        },
-        result = &mut send => result,
-    }
-}
-
-async fn transmit<D: PacketIo>(
-    device: &D,
-    mtu: usize,
-    mut input: mpsc::Receiver<Transmit>,
-) -> Result<()> {
-    let mut encoder = udp::Encoder::new(mtu);
-    let mut turns = 0;
-
-    while let Some(item) = input.recv().await {
-        let packets = match item {
-            Transmit::Packet(packet) => vec![packet],
-            Transmit::Datagram {
-                source,
-                destination,
-                payload,
-            } => {
-                let Some(packets) = encoder.encode(source, destination, &payload) else {
-                    continue;
-                };
-                packets
+    ensure!(!queues.is_empty(), "TUN needs at least one queue");
+    // Local failure cancels this endpoint's connections, without closing other inbounds.
+    context.scope = context.scope.child();
+    let _connections = ConnectionGuard(context.scope.clone());
+    let (inboxes, receivers): (Vec<_>, Vec<_>) =
+        (0..queues.len()).map(|_| mpsc::channel(128)).unzip();
+    let shared = Arc::new(Shared {
+        hash: RandomState::new(),
+        inboxes,
+        tcp_slots: Arc::new(Semaphore::new(worker::MAX_TCP_CONNECTIONS)),
+        udp_slots: Arc::new(Semaphore::new(worker::MAX_UDP_ASSOCIATIONS)),
+        tcp_bytes: Arc::new(Semaphore::new(worker::INGRESS_BYTES)),
+        udp_bytes: Arc::new(Semaphore::new(worker::INGRESS_BYTES)),
+        transit_bytes: Arc::new(Semaphore::new(worker::INGRESS_BYTES)),
+        reassembly: Default::default(),
+        stop: CancellationToken::new(),
+    });
+    // Only UDP packetization shares mutable state: IP fragment IDs span flows.
+    // Encoding never awaits and writers release this lock before touching a FD.
+    let encoder = Arc::new(Mutex::new(udp::Encoder::new(mtu)));
+    let mut workers: JoinSet<Result<()>> = JoinSet::new();
+    for (id, ((read, write), inbox)) in queues.into_iter().zip(receivers).enumerate() {
+        let (output, packets) = mpsc::channel(128);
+        let state = shared.clone();
+        let context = context.clone();
+        let encoder = encoder.clone();
+        workers.spawn(
+            async move {
+                // RX and TX progress independently, but share one queue's task and wakeup.
+                // Other queues run in parallel; a pending writer does not stop this receiver.
+                tokio::try_join!(
+                    async {
+                        worker::dispatch(id, read, inbox, state, mtu, context, output)
+                            .await
+                            .with_context(|| format!("TUN receive queue {id}"))
+                    },
+                    async {
+                        transmit(id, write, packets, encoder)
+                            .await
+                            .with_context(|| format!("TUN transmit queue {id}"))
+                    },
+                )?;
+                Ok(())
             }
-        };
-
-        for packet in packets {
-            let len = poll_fn(|cx| device.poll_send(cx, &packet)).await?;
-            ensure!(len == packet.len(), "partial TUN packet write");
-            turns += 1;
-            if turns == 64 {
-                tokio::task::yield_now().await;
-                turns = 0;
-            }
-        }
+            .in_current_span(),
+        );
     }
-    Ok(())
-}
 
-async fn dispatch<D: PacketIo>(
-    device: &D,
-    mtu: usize,
-    context: ServerContext,
-    output: mpsc::Sender<Transmit>,
-) -> Result<()> {
-    let mut tcp = HashMap::<Flow, TcpEntry>::new();
-    let mut udp = HashMap::<Flow, UdpEntry>::new();
-
-    let mut decoder = Decoder::default();
-    let mut rejector = tcp::Rejector::new(mtu);
-    let mut buffer = vec![0; 65575];
-
-    let (done, mut completed) = mpsc::unbounded_channel();
-    let mut generation = 0u64;
-    let mut stopping = false;
-
-    let tcp_budget = Arc::new(Semaphore::new(INGRESS_BYTES));
-    let udp_budget = Arc::new(Semaphore::new(INGRESS_BYTES));
-    let mut turns = 0;
-
-    loop {
-        turns += 1;
-        if turns == 64 {
-            tokio::task::yield_now().await;
-            turns = 0;
-        }
-        if stopping && tcp.is_empty() {
-            return Ok(());
-        }
-        let expiry = decoder.deadline();
-
-        tokio::select! {
+    let result = async {
+        // Holding all admission permits prevents a late SYN racing the drain.
+        let _drained = tokio::select! {
             biased;
-            _ = context.stopping.cancelled(), if !stopping => {
-                stopping = true;
-                udp.clear();
-            }
-            Some((protocol, flow, id)) = completed.recv() => {
-                match protocol {
-                    Protocol::Tcp if tcp.get(&flow).is_some_and(|e| e.generation == id) => {
-                        tcp.remove(&flow);
-                    }
-                    Protocol::Udp if udp.get(&flow).is_some_and(|e| e.generation == id) => {
-                        udp.remove(&flow);
-                    }
-                    _ => {}
-                }
-            }
-            _ = async { match expiry { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await } } => {
-                decoder.expire(Instant::now());
-            }
-            len = poll_fn(|cx| device.poll_recv(cx, &mut buffer)) => {
-                let len = len?;
-                // SAFETY: PacketIo reports bytes written into the supplied
-                // buffer. Invalid packet contents still go through Decoder.
-                debug_assert!(len <= buffer.len(), "PacketIo returned an invalid receive length");
-                let Some(packet) = decoder.decode(&buffer[..len], Instant::now()) else { continue; };
-
-                match packet.ip.next_header() {
-                    IpProtocol::Tcp => {
-                        let Some((flow, repr)) = packet.tcp() else { continue; };
-
-                        if tcp.get(&flow).is_some_and(|e| e.packets.is_closed()) {
-                            tcp.remove(&flow);
-                        }
-
-                        if !tcp.contains_key(&flow) {
-                            if repr.control != TcpControl::Syn || repr.ack_number.is_some() || stopping {
-                                for response in rejector.reject(&packet) {
-                                    let _ = output.try_send(Transmit::Packet(response));
-                                }
-                                continue;
-                            }
-
-                            if tcp.len() >= MAX_TCP_CONNECTIONS {
-                                continue;
-                            }
-
-                            // SAFETY: IDs must never repeat while old completions may
-                            // still be queued. Exhaustion must fail even in release.
-                            debug_assert_ne!(generation, u64::MAX, "TUN connection generation exhausted");
-                            generation = generation.checked_add(1).expect("TUN connection generation exhausted");
-                            let conn = tcp::connection(flow, mtu, output.clone(), context.stopping.clone());
-                            let session = context.scope.child();
-                            let handler = context.handler.clone();
-                            let admission_scope = session.clone();
-
-                            session.spawn(async move {
-                                let stream = conn.accepted.await?;
-                                handler.tcp(p::target(flow.destination), Box::pin(stream), admission_scope).await
-                            })?;
-                            // Track FIN/RST cleanup in the session, but only forced listener
-                            // cancellation may interrupt the driver while it sends that cleanup.
-                            let driver_scope = context.scope.child().tracked_by(&session);
-                            let completion = Completion {
-                                tx: done.clone(),
-                                protocol: Protocol::Tcp,
-                                flow,
-                                generation,
-                            };
-
-                            driver_scope.spawn(async move {
-                                let _completion = completion;
-                                if conn.driver.await.is_err() {
-                                    session.close();
-                                }
-                                Ok(())
-                            })?;
-
-                            tcp.insert(
-                                flow,
-                                TcpEntry {
-                                    packets: conn.packets,
-                                    generation,
-                                },
-                            );
-                        }
-
-                        if let Ok(permit) = tcp_budget
-                            .clone()
-                            .try_acquire_many_owned(packet.ip.buffer_len() as u32)
-                        {
-                            // SAFETY: The flow was found or inserted above. Only
-                            // dispatch mutates this map; tasks only send completions.
-                            debug_assert!(tcp.contains_key(&flow));
-                            let _ = tcp[&flow].packets.try_send(tcp::QueuedPacket {
-                                bytes: packet.encode(),
-                                _permit: Some(permit),
-                            });
-                        }
-                    }
-                    IpProtocol::Udp if !stopping => {
-                        let Some((flow, payload)) = packet.udp() else { continue; };
-                        let Some(payload) = budgeted_payload(payload, &udp_budget) else { continue; };
-
-                        if udp.get(&flow).is_some_and(|e| e.scope.is_closed()) {
-                            udp.remove(&flow);
-                        }
-
-                        if !udp.contains_key(&flow) {
-                            if udp.len() >= MAX_UDP_ASSOCIATIONS {
-                                continue;
-                            }
-
-                            // SAFETY: IDs must never repeat while old completions may
-                            // still be queued. Exhaustion must fail even in release.
-                            debug_assert_ne!(generation, u64::MAX, "TUN connection generation exhausted");
-                            generation = generation.checked_add(1).expect("TUN connection generation exhausted");
-                            let scope = context.scope.child();
-                            let (association, driver) = p::packet_pair(scope.clone());
-                            let packets = driver.tx.clone();
-                            let (activity, clock) = watch::channel(Instant::now());
-                            let handler = context.handler.clone();
-                            let output = output.clone();
-                            let completion = Completion {
-                                tx: done.clone(),
-                                protocol: Protocol::Udp,
-                                flow,
-                                generation,
-                            };
-                            let stopping = context.stopping.clone();
-                            let idle = context.udp_idle_timeout;
-                            let reply_activity = activity.clone();
-                            let control = scope.clone();
-
-                            scope.spawn(async move {
-                                let _completion = completion;
-                                let replies = udp_replies(flow, driver, output, reply_activity);
-                                tokio::select! {
-                                    _ = stopping.cancelled() => {},
-                                    _ = until_idle(clock, idle) => {},
-                                    result = handler.udp(association) => result?,
-                                    result = replies => result?,
-                                }
-                                control.close();
-                                Ok(())
-                            })?;
-
-                            udp.insert(
-                                flow,
-                                UdpEntry {
-                                    packets,
-                                    activity,
-                                    scope,
-                                    generation,
-                                },
-                            );
-                        }
-
-                        // SAFETY: The flow was found or inserted above. Only
-                        // dispatch mutates this map; tasks only send completions.
-                        debug_assert!(udp.contains_key(&flow));
-                        let entry = &udp[&flow];
-                        if entry
-                            .packets
-                            .try_send(p::Packet {
-                                target: p::target(flow.destination),
-                                payload,
-                            })
-                            .is_ok()
-                        {
-                            entry.activity.send_replace(Instant::now());
-                        }
-                    }
-                    _ => {},
-                }
+            _ = context.scope.cancelled() => return Ok(()),
+            permits = async {
+                context.stopping.cancelled().await;
+                shared.tcp_slots.clone().acquire_many_owned(worker::MAX_TCP_CONNECTIONS as u32).await
+            } => permits?,
+            result = workers.join_next() => {
+                result.ok_or_else(|| anyhow!("TUN has no workers"))??.context("TUN worker failed")?;
+                bail!("TUN worker stopped before shutdown");
+            },
+        };
+        shared.stop.cancel();
+        loop {
+            // Forced shutdown also interrupts blocked transmitters during graceful drain.
+            let result = tokio::select! {
+                biased;
+                _ = context.scope.cancelled() => return Ok(()),
+                result = workers.join_next() => result,
+            };
+            match result {
+                Some(result) => result??,
+                None => break,
             }
         }
-    }
+        Ok(())
+    }.await;
+
+    shared.stop.cancel();
+    context.scope.close();
+    workers.abort_all();
+    while workers.join_next().await.is_some() {}
+    result
 }
 
-// The permit follows the payload through policy and outbound queues, including
-// clones. Returning queue capacity alone would release ingress credit too soon.
-struct BudgetedPayload {
-    bytes: Vec<u8>,
-    _permit: OwnedSemaphorePermit,
-}
-
-impl AsRef<[u8]> for BudgetedPayload {
-    fn as_ref(&self) -> &[u8] {
-        &self.bytes
-    }
-}
-
-fn budgeted_payload(payload: &[u8], budget: &Arc<Semaphore>) -> Option<Bytes> {
-    let permit = budget
-        .clone()
-        .try_acquire_many_owned(payload.len().max(1) as u32)
-        .ok()?;
-    Some(Bytes::from_owner(BudgetedPayload {
-        bytes: payload.to_vec(),
-        _permit: permit,
-    }))
-}
-
-async fn udp_replies(
-    flow: Flow,
-    mut driver: p::Datagram,
-    output: mpsc::Sender<Transmit>,
-    activity: watch::Sender<Instant>,
+async fn transmit<W: PacketSend>(
+    id: usize,
+    mut device: W,
+    mut input: mpsc::Receiver<Transmit>,
+    encoder: Arc<Mutex<udp::Encoder>>,
 ) -> Result<()> {
-    while let Some(packet) = driver.rx.recv().await {
-        let Ok(source) = p::socket_addr(&packet.target) else {
-            continue;
-        };
-        let Some((source, destination)) = udp::reply_flow(flow, source) else {
-            continue;
-        };
-        // One queued item owns the whole datagram. Only this association waits
-        // for capacity; shared ingress keeps receiving other connections.
-        output
-            .send(Transmit::Datagram {
-                source,
-                destination,
-                payload: packet.payload,
-            })
-            .await?;
-        activity.send_replace(Instant::now());
-    }
-    Ok(())
-}
+    let mut items = Vec::with_capacity(64);
+    let mut packets = Vec::with_capacity(64);
+    let mut sent_packets = 0u64;
+    let mut sent_bytes = 0u64;
 
-async fn until_idle(mut activity: watch::Receiver<Instant>, idle: std::time::Duration) {
-    loop {
-        let deadline = *activity.borrow_and_update() + idle;
-        tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => return,
-            result = activity.changed() => { if result.is_err() { return; } },
+    while input.recv_many(&mut items, 64).await != 0 {
+        for item in items.drain(..) {
+            match item {
+                Transmit::Packet(packet) => packets.push(packet),
+                Transmit::Datagram {
+                    source,
+                    destination,
+                    payload,
+                } => {
+                    let datagram = encoder
+                        .lock()
+                        .map_err(|_| anyhow!("TUN UDP encoder lock poisoned"))?
+                        .encode(source, destination, &payload);
+                    if let Some(datagram) = datagram {
+                        packets.extend(datagram);
+                    }
+                }
+            }
         }
+        device.send_batch(&mut packets).await?;
+        sent_packets += packets.len() as u64;
+        sent_bytes += packets.iter().map(|p| p.len() as u64).sum::<u64>();
+        packets.clear();
+        tokio::task::yield_now().await;
     }
+    tracing::debug!(
+        queue = id,
+        sent_packets,
+        sent_bytes,
+        "TUN transmit worker stopped"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packet::Decoder;
+    use tokio::time::Instant;
 
     struct Sink(mpsc::Sender<Vec<u8>>);
-
-    impl PacketIo for Sink {
-        fn poll_recv(&self, _: &mut Context<'_>, _: &mut [u8]) -> Poll<io::Result<usize>> {
-            unreachable!()
-        }
-        fn poll_send(&self, _: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
+    impl PacketSend for Sink {
+        fn poll_send(&mut self, _: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
             self.0.try_send(bytes.to_vec()).unwrap();
             Poll::Ready(Ok(bytes.len()))
         }
     }
 
     #[tokio::test]
-    async fn udp_ingress_credit_follows_packets_across_queues_and_clones() {
-        let budget = Arc::new(Semaphore::new(8192));
-        let payload = budgeted_payload(&[7; 8192], &budget).unwrap();
-        let (sender, mut receiver) = mpsc::channel(1);
-        sender
-            .send(p::Packet {
-                target: p::target("192.0.2.1:53".parse().unwrap()),
-                payload,
-            })
-            .await
-            .unwrap();
-        assert!(budgeted_payload(&[], &budget).is_none());
-        let packet = receiver.recv().await.unwrap();
-        let retained = packet.clone();
-        drop(packet);
-        assert!(budgeted_payload(&[1], &budget).is_none());
-        drop(retained);
-        assert_eq!(budget.available_permits(), 8192);
-        let empty = budgeted_payload(&[], &budget).unwrap();
-        assert_eq!(budget.available_permits(), 8191);
-        drop(empty);
-        assert_eq!(budget.available_permits(), 8192);
-    }
-
-    #[tokio::test]
     async fn udp_replies_share_packetization_and_preserve_complete_datagrams() {
         let source: std::net::SocketAddr = "198.51.100.1:443".parse().unwrap();
         let destination = "192.0.2.2:12345".parse().unwrap();
-        let (output, packets) = mpsc::channel(1);
+        let (output0, packets0) = mpsc::channel(1);
+        let (output1, packets1) = mpsc::channel(1);
         let (sink, mut received) = mpsc::channel(16);
-        let sink = Sink(sink);
-        let writer = transmit(&sink, 1280, packets);
+        let encoder = Arc::new(Mutex::new(udp::Encoder::new(1280)));
+        let writer0 = transmit(0, Sink(sink.clone()), packets0, encoder.clone());
+        let writer1 = transmit(1, Sink(sink), packets1, encoder);
         let producer = async {
-            for port in [443, 8443] {
+            for (port, output) in [(443, output0), (8443, output1)] {
                 let source = std::net::SocketAddr::new(source.ip(), port);
                 output
                     .send(Transmit::Datagram {
@@ -476,10 +236,10 @@ mod tests {
                     .await
                     .unwrap();
             }
-            drop(output);
         };
-        let (result, _) = tokio::join!(writer, producer);
-        result.unwrap();
+        let (result0, result1, _) = tokio::join!(writer0, writer1, producer);
+        result0.unwrap();
+        result1.unwrap();
         let mut ids = std::collections::HashSet::new();
         let mut decoder = Decoder::default();
         let mut complete = Vec::new();
@@ -489,7 +249,7 @@ mod tests {
                 assert!(ids.insert(header.ident()));
             }
             if let Some(packet) = decoder.decode(&packet, Instant::now()) {
-                complete.push(packet);
+                complete.push(packet.into_owned());
             }
         }
         assert_eq!(complete.len(), 2);

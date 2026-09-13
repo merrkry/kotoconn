@@ -1559,6 +1559,7 @@ dependencies = [
  "smoltcp",
  "tokio",
  "tokio-util",
+ "tracing",
  "tun-rs",
 ]
 

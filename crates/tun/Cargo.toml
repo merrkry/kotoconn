@@ -18,6 +18,7 @@ rand.workspace = true
 smoltcp = { workspace = true, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-tcp-cubic", "socket-raw", "proto-ipv4-fragmentation", "reassembly-buffer-count-16", "assembler-max-segment-count-32", "fragmentation-buffer-size-65536"] }
 tokio = { workspace = true, features = ["io-util", "sync", "time"] }
 tokio-util = { workspace = true, features = ["rt"] }
+tracing.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
