@@ -5,8 +5,8 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-oxc.workspace = true
+oxc = { workspace = true, features = ["codegen", "semantic", "transformer"] }
 thiserror.workspace = true
 
 [dev-dependencies]
-rquickjs.workspace = true
+rquickjs = { workspace = true, features = ["macro", "loader", "futures"] }

@@ -5,13 +5,13 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-tracing.workspace = true
-kotoconn-config.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
-tokio.workspace = true
-tokio-util.workspace = true
+kotoconn-config.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "sync"] }
+tokio-util = { workspace = true, features = ["rt"] }
+tracing.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

@@ -9,12 +9,12 @@ name = "kotoconn"
 path = "src/main.rs"
 
 [dependencies]
-tracing.workspace = true
-tracing-subscriber.workspace = true
-kotoconn-daemon.workspace = true
-tokio.workspace = true
-clap.workspace = true
 anyhow.workspace = true
+clap = { workspace = true, features = ["derive"] }
+kotoconn-daemon.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 
 [dev-dependencies]
-serde_json = "1"
+serde_json.workspace = true
