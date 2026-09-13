@@ -4,20 +4,20 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true, features = ["net"] }
+tun-rs = { workspace = true, features = ["async_tokio"] }
+
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
-kotoconn-protocol.workspace = true
 kotoconn-config.workspace = true
+kotoconn-protocol.workspace = true
 rand.workspace = true
-smoltcp.workspace = true
-tokio = { workspace = true, features = ["io-util"] }
-tokio-util.workspace = true
-
-[target.'cfg(target_os = "linux")'.dependencies]
-tun-rs.workspace = true
-rustix.workspace = true
+smoltcp = { workspace = true, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-tcp-cubic", "socket-raw", "proto-ipv4-fragmentation", "reassembly-buffer-count-16", "assembler-max-segment-count-32", "fragmentation-buffer-size-65536"] }
+tokio = { workspace = true, features = ["io-util", "sync", "time"] }
+tokio-util = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
