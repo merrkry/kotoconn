@@ -17,6 +17,7 @@ use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 
 pub(crate) struct Network {
     pub addresses: HashMap<InboundId, SocketAddr>,
+    pub inbound_addresses: HashMap<InboundId, kotoconn_inbounds::InboundAddress>,
     pub clients: Arc<HashMap<DialerId, Arc<Clients>>>,
     pub sessions: sessions::Sessions,
     scope: Scope,
@@ -45,6 +46,7 @@ impl Network {
         let (sessions, registry) = sessions::Sessions::new();
         let mut bound = Vec::new();
         let mut addresses = HashMap::new();
+        let mut inbound_addresses = HashMap::new();
         for (id, config) in &policy.config().inbounds {
             ensure!(
                 !config.udp_idle_timeout.is_zero(),
@@ -64,19 +66,20 @@ impl Network {
                 sessions: sessions.clone(),
                 idle: config.udp_idle_timeout,
             });
-            let (address, server) = kotoconn_inbounds::build(config.implementation.clone())?;
-            let server = server
-                .bind(
-                    address,
-                    ServerContext {
-                        handler,
-                        scope: scope.clone(),
-                        stopping: stopping.clone(),
-                        udp_idle_timeout: config.udp_idle_timeout,
-                    },
-                )
-                .await?;
-            addresses.insert(*id, server.local_addr);
+            let server = kotoconn_inbounds::bind(
+                config.implementation.clone(),
+                ServerContext {
+                    handler,
+                    scope: scope.clone(),
+                    stopping: stopping.clone(),
+                    udp_idle_timeout: config.udp_idle_timeout,
+                },
+            )
+            .await?;
+            if let kotoconn_inbounds::InboundAddress::Socket(address) = &server.address {
+                addresses.insert(*id, *address);
+            }
+            inbound_addresses.insert(*id, server.address.clone());
             bound.push(server);
         }
         let (failed, failure) = tokio::sync::watch::channel(None);
@@ -105,6 +108,7 @@ impl Network {
         }));
         Ok(Self {
             addresses,
+            inbound_addresses,
             clients,
             sessions,
             scope,

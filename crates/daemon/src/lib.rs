@@ -12,6 +12,7 @@ use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 
 mod network;
 mod source;
+pub use kotoconn_inbounds::InboundAddress;
 pub use network::{SessionHandle, SessionId};
 
 // Bound both queued and executing calls. Awaiting admission provides backpressure.
@@ -207,6 +208,11 @@ impl Daemon {
         &self.network.addresses
     }
 
+    /// Bound socket addresses and TUN interface names, indexed by inbound.
+    pub fn inbound_addresses(&self) -> &std::collections::HashMap<InboundId, InboundAddress> {
+        &self.network.inbound_addresses
+    }
+
     pub async fn sessions(&self) -> anyhow::Result<Vec<SessionHandle>> {
         self.network.sessions.list().await
     }
@@ -226,9 +232,14 @@ impl Daemon {
         &self.policy
     }
 
+    /// Request admission shutdown without waiting for accepted sessions to drain.
+    pub fn stop(&self) {
+        self.policy.stopping.cancel();
+    }
+
     /// Idempotent; cancellation of this future does not cancel the shutdown request.
     pub async fn shutdown(&self) -> Result<Shutdown, Error> {
-        self.policy.stopping.cancel();
+        self.stop();
         self.wait().await
     }
 

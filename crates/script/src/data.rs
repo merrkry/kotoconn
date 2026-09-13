@@ -76,6 +76,23 @@ pub(crate) struct DirectInboundConfig {
 }
 
 #[derive(FromJs, TS, StructuralConvert)]
+#[convert(from(config::TunAddress), into(config::TunAddress))]
+#[ts(as = "config::TunAddress")]
+pub(crate) struct TunAddress {
+    pub address: IpAddr,
+    pub prefix: Byte,
+}
+
+#[derive(FromJs, TS, StructuralConvert)]
+#[convert(from(config::TunInboundConfig), into(config::TunInboundConfig))]
+#[ts(as = "config::TunInboundConfig")]
+pub(crate) struct TunInboundConfig {
+    pub name: String,
+    pub mtu: Mtu,
+    pub addresses: Vec<TunAddress>,
+}
+
+#[derive(FromJs, TS, StructuralConvert)]
 #[convert(from(config::DirectOutboundConfig), into(config::DirectOutboundConfig))]
 #[ts(as = "config::DirectOutboundConfig")]
 pub(crate) struct DirectOutboundConfig {}

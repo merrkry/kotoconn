@@ -60,8 +60,10 @@ async fn run(Cli { command }: Cli) -> Result<()> {
 
             tokio::select! {
                 result = &mut signal => {
+                    daemon.stop();
+                    eprintln!("Daemon stopping.");
                     // Even a signal registration error must finish cleanup.
-                    let shutdown = daemon.shutdown().await?;
+                    let shutdown = daemon.wait().await?;
                     result?;
                     if shutdown == Shutdown::TimedOut {
                         bail!("shutdown deadline exceeded; remaining policy work was cancelled");

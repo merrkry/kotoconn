@@ -12,7 +12,9 @@ pub use config::Config;
 pub use dialer::{DialerConfig, DialerId};
 pub use dns::{DnsHandlerId, DnsHandlerResult, DnsRequest, DnsResponse};
 pub use flow::{Flow, TransportProtocol};
-pub use inbound::{DirectInboundConfig, InboundConfig, InboundId, InboundImpl};
+pub use inbound::{
+    DirectInboundConfig, InboundConfig, InboundId, InboundImpl, TunAddress, TunInboundConfig,
+};
 pub use outbound::{DirectOutboundConfig, OutboundConfig, OutboundImpl, Socks5OutboundConfig};
 pub use resolve::ResolveHandlerId;
 pub use route::{RouteDecision, RoutingHandlerId};

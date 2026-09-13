@@ -49,7 +49,7 @@ impl Carrier for System {
                                 Ok(n) => {
                                     let _ = driver
                                         .tx
-                                        .try_send(Packet { target: target.clone(), payload: buffer[..n].to_vec() });
+                                        .try_send(Packet { target: target.clone(), payload: buffer[..n].to_vec().into() });
                                 }
                                 Err(error) => eprintln!("UDP receive: {error}"),
                             }

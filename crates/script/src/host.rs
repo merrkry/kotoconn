@@ -145,6 +145,10 @@ api! {
             Ok(config::InboundImpl::Direct(options.into()).into())
         }
 
+        fn tun_inbound(self, options: TunInboundConfig) -> InboundImpl {
+            Ok(config::InboundImpl::Tun(options.into()).into())
+        }
+
         fn direct_outbound(self, options: DirectOutboundConfig) -> OutboundImpl {
             Ok(config::OutboundImpl::Direct(options.into()).into())
         }

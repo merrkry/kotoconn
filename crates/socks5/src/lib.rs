@@ -39,6 +39,6 @@ async fn decode(wire: &[u8]) -> Result<Packet> {
     ensure!(fragment == 0, "SOCKS UDP fragmentation is not supported");
     Ok(Packet {
         target: from_address(destination),
-        payload: payload.to_vec(),
+        payload: payload.to_vec().into(),
     })
 }

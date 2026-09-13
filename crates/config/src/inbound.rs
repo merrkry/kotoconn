@@ -5,6 +5,8 @@ pub use socks5::Socks5InboundConfig;
 mod http;
 pub use http::HttpInboundConfig;
 mod direct;
+mod tun;
+pub use tun::{TunAddress, TunInboundConfig};
 
 use std::{num::NonZeroU64, time::Duration};
 
@@ -33,4 +35,5 @@ pub enum InboundImpl {
     Socks5(Socks5InboundConfig),
     Http(HttpInboundConfig),
     Direct(DirectInboundConfig),
+    Tun(TunInboundConfig),
 }

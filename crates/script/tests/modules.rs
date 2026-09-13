@@ -146,3 +146,41 @@ async fn seals_registration_after_native_await_and_calls_each_handler_family() {
             .contains("dns handler failed")
     );
 }
+
+#[tokio::test]
+async fn tun_configuration_preserves_native_addresses_and_checks_numeric_ranges() {
+    let source = r#"
+        import { kotoconn as k } from '@kotoconn/bindings';
+        const routing = k.routing_handler(() => k.reject());
+        k.inbound({implementation: k.tun_inbound({name: 'test0', mtu: 1500, addresses: [
+            {address: k.ip('192.0.2.1'), prefix: 30}, {address: k.ip('fd00::1'), prefix: 126}
+        ]}), routing_handler: routing, udp_idle_timeout: k.timeout(1000)});
+    "#;
+    let script = Script::load(
+        "main.ts",
+        HashMap::from([("main.ts".into(), source.into())]),
+    )
+    .await
+    .unwrap();
+    let config = script.config().await.unwrap();
+    let kotoconn_config::InboundImpl::Tun(tun) =
+        &config.inbounds.values().next().unwrap().implementation
+    else {
+        panic!("expected a TUN inbound");
+    };
+    assert_eq!(tun.name, "test0");
+    assert_eq!(tun.mtu, 1500);
+    assert_eq!(
+        tun.addresses[0].address,
+        "192.0.2.1".parse::<std::net::IpAddr>().unwrap()
+    );
+    assert_eq!(tun.addresses[1].prefix, 126);
+    for value in ["1.5", "65536", "-1", "NaN", "Infinity", "'1500'"] {
+        let bad = source.replace("mtu: 1500", &format!("mtu: {value}"));
+        assert!(
+            Script::load("main.ts", HashMap::from([("main.ts".into(), bad)]))
+                .await
+                .is_err()
+        );
+    }
+}
