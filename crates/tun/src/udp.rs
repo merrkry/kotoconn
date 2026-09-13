@@ -67,10 +67,34 @@ impl Encoder {
         };
         let source_ip = source.ip().into();
         let destination_ip = destination.ip().into();
+        let ip = IpRepr::new(
+            source_ip,
+            destination_ip,
+            IpProtocol::Udp,
+            8 + payload.len(),
+            64,
+        );
+        if ip.buffer_len() <= self.mtu {
+            let (_, bytes) = self.arena.encode(ip.buffer_len(), |bytes| {
+                let (header, body) = bytes.split_at_mut(ip.header_len());
+                ip.emit(header, &ChecksumCapabilities::default());
+                // SAFETY: The arena allocated the IP header, UDP header and complete payload.
+                udp.emit(
+                    &mut UdpPacket::new_unchecked(body),
+                    &source_ip,
+                    &destination_ip,
+                    payload.len(),
+                    |bytes| bytes.copy_from_slice(payload),
+                    &ChecksumCapabilities::default(),
+                );
+            });
+            return Some(vec![bytes]);
+        }
+
+        // Fragmentation needs a checksum over the complete datagram before the
+        // individual fragment headers are emitted.
         let mut transport = vec![0; 8 + payload.len()];
-        // SAFETY: The buffer includes the UDP header and complete payload;
-        // size and matching address families were validated above.
-        debug_assert!(u16::try_from(transport.len()).is_ok());
+        // SAFETY: The buffer includes the UDP header and complete validated payload.
         udp.emit(
             &mut UdpPacket::new_unchecked(&mut transport),
             &source_ip,
@@ -79,25 +103,10 @@ impl Encoder {
             |bytes| bytes.copy_from_slice(payload),
             &ChecksumCapabilities::default(),
         );
-        let ip = IpRepr::new(
-            source_ip,
-            destination_ip,
-            IpProtocol::Udp,
-            transport.len(),
-            64,
-        );
         let packet = Packet {
             ip,
             payload: transport.into(),
         };
-        if packet.ip.buffer_len() <= self.mtu {
-            return Some(vec![
-                self.arena
-                    .encode(packet.ip.buffer_len(), |bytes| packet.emit(bytes))
-                    .1,
-            ]);
-        }
-
         if let IpRepr::Ipv4(mut repr) = packet.ip {
             let size = (self.mtu - 20) / 8 * 8;
             let id = self.identifiers.ipv4.fetch_add(1, Ordering::Relaxed);
