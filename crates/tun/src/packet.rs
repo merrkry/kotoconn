@@ -396,8 +396,18 @@ impl Decoder {
             assembly.poison();
             return None;
         }
+
         let length = assembly.data.len().max(end);
-        assembly.data.resize(length, 0);
+        // Reject growth before allocating or zeroing attacker-selected offsets.
+        let required = assembly.data.capacity().max(length);
+        if !assembly.lease.resize(ASSEMBLY_METADATA + required, now) {
+            self.fragments.remove(&key);
+            return None;
+        }
+
+        // Avoid Vec's geometric growth exceeding the reserved allowance. The
+        // allocator may still supply extra capacity, which must also be charged.
+        assembly.data.reserve_exact(length - assembly.data.len());
         if !assembly
             .lease
             .resize(ASSEMBLY_METADATA + assembly.data.capacity(), now)
@@ -405,6 +415,8 @@ impl Decoder {
             self.fragments.remove(&key);
             return None;
         }
+        assembly.data.resize(length, 0);
+
         if assembly.ranges.add(offset, data.len()).is_err() {
             assembly.poison();
             return None;
