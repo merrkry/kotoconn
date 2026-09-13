@@ -219,3 +219,51 @@ pub(super) fn normalize(
         _ => Err(invalid("unsupported TUN GSO type")),
     }
 }
+
+pub(crate) struct Queues {
+    devices: Vec<OffloadDevice>,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+impl Queues {
+    pub fn new(device: AsyncDevice) -> io::Result<Self> {
+        let count = std::thread::available_parallelism()?.get().min(4);
+        let mut devices = Vec::with_capacity(count);
+        for _ in 1..count {
+            devices.push(OffloadDevice::new(device.try_clone()?));
+        }
+        devices.push(OffloadDevice::new(device));
+        Ok(Self {
+            devices,
+            next: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+}
+
+impl PacketIo for Queues {
+    fn poll_recv(&self, cx: &mut Context<'_>, bytes: &mut [u8]) -> Poll<io::Result<usize>> {
+        // SAFETY: new uses a nonzero CPU count, capped at four queues.
+        debug_assert!((1..=4).contains(&self.devices.len()));
+        let next = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        for index in 0..self.devices.len() {
+            let device = &self.devices[next.wrapping_add(index) % self.devices.len()];
+            if let Poll::Ready(result) = device.poll_recv(cx, bytes) {
+                return Poll::Ready(result);
+            }
+        }
+        Poll::Pending
+    }
+
+    fn poll_send(&self, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
+        // SAFETY: new creates at least one queue from a nonzero CPU count.
+        debug_assert!(!self.devices.is_empty());
+        self.devices[0].poll_send(cx, bytes)
+    }
+
+    async fn send_batch(&self, packets: &mut [Vec<u8>]) -> io::Result<()> {
+        // Keep one writer so endpoint UDP fragment identifiers stay shared.
+        // SAFETY: new creates at least one queue from a nonzero CPU count.
+        debug_assert!(!self.devices.is_empty());
+        self.devices[0].send_batch(packets).await
+    }
+}

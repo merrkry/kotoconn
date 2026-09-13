@@ -54,7 +54,7 @@ pub fn bind(options: TunInboundConfig, context: ServerContext) -> Result<BoundTu
         .name(&options.name)
         .mtu(options.mtu)
         .offload(true)
-        .multi_queue(false)
+        .multi_queue(true)
         .packet_information(false);
     let mut addresses = HashSet::new();
     let mut ipv4 = false;
@@ -88,7 +88,7 @@ pub fn bind(options: TunInboundConfig, context: ServerContext) -> Result<BoundTu
     Ok(BoundTun {
         name,
         run: Box::pin(crate::run(
-            crate::offload::OffloadDevice::new(device),
+            crate::offload::Queues::new(device)?,
             usize::from(options.mtu),
             context,
         )),
