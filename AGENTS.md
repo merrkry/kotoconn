@@ -2,7 +2,13 @@
 
 Kotoconn is a programmable proxy.
 
+The repository is experimental. Freely rewrite or replace abstractions that no longer fit the current design or are poorly implemented. Prioritize the current design and code quality without preserving backward compatibility.
+
 ## Correctness
+
+In non-test code, every `unwrap`, `expect`, `unsafe` block or implementation, and similar operation that relies on programmer-maintained invariants must have a nearby `SAFETY` comment. Explain the required invariants and why they hold at that location.
+
+Actively use `debug_assert!` and related assertion macros to check invariants that the type system and existing runtime checks do not cover.
 
 Time limits are allowed only when interacting with external systems, such as subprocesses, OS I/O, or user code. Fixed delays or timeout lengths must not express ordering dependencies. Use explicit synchronization or observable completion instead, so code and tests remain correct under parallel execution and varying scheduling speeds.
 
