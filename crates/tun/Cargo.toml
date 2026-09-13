@@ -11,6 +11,7 @@ tun-rs = { workspace = true, features = ["async_tokio"] }
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true
+crossbeam-queue = "0.3"
 futures-util.workspace = true
 kotoconn-config.workspace = true
 kotoconn-protocol.workspace = true
