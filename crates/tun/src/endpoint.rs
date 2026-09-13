@@ -501,7 +501,7 @@ mod tests {
                 assert!(ids.insert(header.ident()));
             }
             if let Some(packet) = decoder.decode(&packet, Instant::now()) {
-                complete.push(packet);
+                complete.push(packet.into_owned());
             }
         }
         assert_eq!(complete.len(), 2);

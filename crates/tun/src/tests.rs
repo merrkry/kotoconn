@@ -64,13 +64,20 @@ fn segment(
         &ChecksumCapabilities::default(),
     );
     tcp::QueuedPacket {
-        bytes: Packet { ip, payload }.encode(),
+        bytes: Packet {
+            ip,
+            payload: payload.into(),
+        }
+        .encode(),
         _permit: None,
     }
 }
 
-fn decoded(bytes: &[u8]) -> Packet {
-    Decoder::default().decode(bytes, Instant::now()).unwrap()
+fn decoded(bytes: &[u8]) -> Packet<'static> {
+    Decoder::default()
+        .decode(bytes, Instant::now())
+        .unwrap()
+        .into_owned()
 }
 
 #[cfg(target_os = "linux")]
@@ -162,7 +169,7 @@ fn udp_roundtrips_empty_and_fragmented_datagrams_in_both_families() {
             let mut completed = Vec::new();
             for packet in packets {
                 if let Some(packet) = decoder.decode(&packet, now) {
-                    completed.push(packet);
+                    completed.push(packet.into_owned());
                 }
             }
             assert_eq!(completed.len(), 1, "IPv6={ipv6}, payload={size}");
@@ -251,6 +258,7 @@ fn ipv6_overlaps_poison_the_datagram_but_atomic_fragments_are_independent() {
     for packet in packets.drain(..) {
         completed = decoder
             .decode(&packet, now + Duration::from_secs(60))
+            .map(Packet::into_owned)
             .or(completed);
     }
     assert_eq!(completed.unwrap().udp().unwrap().1, vec![7; 2500]);

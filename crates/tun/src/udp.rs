@@ -88,7 +88,7 @@ impl Encoder {
         );
         let packet = Packet {
             ip,
-            payload: transport,
+            payload: transport.into(),
         };
 
         if packet.ip.buffer_len() <= self.mtu {

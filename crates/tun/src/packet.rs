@@ -1,7 +1,7 @@
 //! Validate and normalize IP before allocating transport state. Reassembly is
 //! shared by TCP and UDP, including fragmented initial SYNs.
 use smoltcp::{phy::ChecksumCapabilities, wire::*};
-use std::{collections::HashMap, net::SocketAddr, time::Duration};
+use std::{borrow::Cow, collections::HashMap, net::SocketAddr, time::Duration};
 use tokio::time::Instant;
 
 const MAX_DATAGRAMS: usize = 64;
@@ -14,12 +14,19 @@ pub(crate) struct Flow {
     pub destination: SocketAddr,
 }
 
-pub(crate) struct Packet {
+pub(crate) struct Packet<'a> {
     pub ip: IpRepr,
-    pub payload: Vec<u8>,
+    pub payload: Cow<'a, [u8]>,
 }
 
-impl Packet {
+impl Packet<'_> {
+    pub fn into_owned(self) -> Packet<'static> {
+        Packet {
+            ip: self.ip,
+            payload: Cow::Owned(self.payload.into_owned()),
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         // SAFETY: Decoder normalizes the IP payload length after reassembly;
         // outbound encoders construct it from their transport buffer length.
@@ -123,7 +130,7 @@ impl Decoder {
         self.fragments.retain(|_, a| a.expires > now);
     }
 
-    pub fn decode(&mut self, data: &[u8], now: Instant) -> Option<Packet> {
+    pub fn decode<'a>(&mut self, data: &'a [u8], now: Instant) -> Option<Packet<'a>> {
         data.first()?;
 
         let (mut ip, payload, fragment) = match IpVersion::of_packet(data).ok()? {
@@ -150,7 +157,7 @@ impl Decoder {
                         return None;
                     }
                     let assembled = self.ipv4.process(data, now)?;
-                    return self.decode(&assembled, now);
+                    return self.decode(&assembled, now).map(Packet::into_owned);
                 }
                 (IpRepr::Ipv4(repr), packet.payload(), None)
             }
@@ -174,9 +181,9 @@ impl Decoder {
                 destination: ip.dst_addr(),
                 id: fragment.id,
             };
-            self.reassemble(key, ip.next_header(), fragment, payload, now)?
+            Cow::Owned(self.reassemble(key, ip.next_header(), fragment, payload, now)?)
         } else {
-            payload.to_vec()
+            Cow::Borrowed(payload)
         };
 
         ip.set_payload_len(payload.len());
