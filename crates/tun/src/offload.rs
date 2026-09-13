@@ -154,6 +154,13 @@ pub(super) fn normalize(
             // SAFETY: at >= start and the checksum field was checked above.
             debug_assert!(start <= at && at + 2 <= packet.len());
             let checksum = !tun_rs::checksum(&packet[start..], u64::from(initial));
+            // Linux uses checksum offset 6 for UDP. A computed zero must be
+            // encoded as all ones; a literal zero means "checksum omitted".
+            let checksum = if header.csum_offset == 6 && checksum == 0 {
+                0xffff
+            } else {
+                checksum
+            };
             packet[at..at + 2].copy_from_slice(&checksum.to_be_bytes());
         }
         return copy_packet(packet, output);
@@ -209,6 +216,14 @@ pub(super) fn normalize(
             let count = tun_rs::gso_split(packet, header, &mut packets, &mut sizes, 0, is_v6)?;
             for (mut packet, size) in packets.into_iter().zip(sizes).take(count) {
                 packet.truncate(size);
+                // tun-rs 2.8.9 emits the computed value directly. Preserve UDP's
+                // zero-checksum encoding, including for each IPv6 datagram.
+                let checksum = packet
+                    .get_mut(start + 6..start + 8)
+                    .ok_or_else(|| invalid("short segmented UDP packet"))?;
+                if checksum == [0, 0] {
+                    checksum.fill(0xff);
+                }
                 datagrams.push_back(packet);
             }
             match datagrams.pop_front() {
