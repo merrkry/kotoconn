@@ -779,6 +779,31 @@ fn concurrent_reassembly_keeps_datagrams_separate_across_workers() {
 }
 
 #[test]
+fn reassembly_fits_its_allowance_without_geometric_buffer_growth() {
+    for ipv6 in [false, true] {
+        let limits = packet::ReassemblyLimits::new(5000);
+        let mut decoders = [Decoder::new(limits.clone()), Decoder::new(limits)];
+        let f = flow(ipv6);
+        let now = Instant::now();
+        let mut encoder = udp::Encoder::new(1280);
+
+        // Payload and metadata fit, but Vec's geometric growth would not.
+        // Completing on one worker must release the shared allowance for another.
+        for decoder in &mut decoders {
+            let frames = encoder.encode(f.source, f.destination, &[7; 4000]).unwrap();
+            let mut completed = None;
+            for frame in &frames {
+                completed = decoder
+                    .decode(frame, now)
+                    .map(Packet::into_owned)
+                    .or(completed);
+            }
+            assert_eq!(completed.unwrap().udp().unwrap().1, [7; 4000]);
+        }
+    }
+}
+
+#[test]
 fn idle_reassembly_releases_shared_storage_at_its_deadline() {
     for ipv6 in [false, true] {
         let limits = packet::ReassemblyLimits::new(8192);
