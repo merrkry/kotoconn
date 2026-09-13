@@ -45,7 +45,7 @@ impl p::Server for Server {
 }
 
 struct Association {
-    tx: mpsc::Sender<Packet>,
+    tx: kotoconn_protocol::queue::Sender<Packet>,
     scope: Scope,
     active: tokio::time::Instant,
 }

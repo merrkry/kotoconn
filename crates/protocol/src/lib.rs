@@ -1,7 +1,9 @@
 //! Protocol-independent I/O, capability and lifetime contracts.
 mod control;
 mod io;
+pub mod queue;
 mod server;
+pub mod stream_buffer;
 
 use anyhow::{Result, bail};
 pub use control::Scope;

@@ -29,6 +29,3 @@ Each scenario has five samples. iperf3 omits the first second and measures the
 next three seconds. The JSON contains received throughput, daemon CPU time, and
 TUN interface counters for each sample. Scenarios cover one or four TCP streams
 in upload and reverse-download directions at MTU 1500.
-
-The [parallel-worker measurements](../../docs/tun-parallel-benchmarks.md) extend
-this setup to 16 and 64 streams, with controls at four and 16 CPUs.

@@ -105,7 +105,7 @@ async fn fragments_cross_receive_queues_and_replies_keep_the_flow_owner() {
             .encode(source, destination, b"probe")
             .unwrap()
             .remove(0);
-        inputs[0].send(probe).await.unwrap();
+        inputs[0].send(probe.to_vec()).await.unwrap();
         let (owner, bytes) = received.recv().await.unwrap();
         let mut decoder = packet::Decoder::default();
         assert_eq!(
@@ -124,7 +124,10 @@ async fn fragments_cross_receive_queues_and_replies_keep_the_flow_owner() {
         let key = packet::parse(&fragments[0]).unwrap().route().unwrap();
         for (index, fragment) in fragments.into_iter().rev().enumerate() {
             assert_eq!(packet::parse(&fragment).unwrap().route().unwrap(), key);
-            inputs[index % inputs.len()].send(fragment).await.unwrap();
+            inputs[index % inputs.len()]
+                .send(fragment.to_vec())
+                .await
+                .unwrap();
         }
         loop {
             let (queue, bytes) = received.recv().await.unwrap();
@@ -178,6 +181,86 @@ async fn receive_failure_releases_other_queues_without_cancelling_the_parent_sco
     context.scope.wait().await;
 }
 
+struct SelectiveReader(Arc<Notify>);
+
+impl p::Handler for SelectiveReader {
+    fn tcp(&self, _: p::Target, _: p::BoxStream, _: Scope) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { bail!("TCP is not used in this test") })
+    }
+
+    fn udp(&self, mut packets: p::Datagram) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            while let Some(packet) = packets.rx.recv().await {
+                if p::socket_addr(&packet.target)?.port() == 443 {
+                    self.0.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                packets.tx.send(packet).await?;
+            }
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_stalled_udp_reader_does_not_block_other_flows_or_shutdown() {
+    let mut context = context();
+    let stalled = Arc::new(Notify::new());
+    context.handler = Arc::new(SelectiveReader(stalled.clone()));
+    let (input, packets) = mpsc::channel(16);
+    let (output, mut received) = mpsc::unbounded_channel();
+    let endpoint = tokio::spawn(run(
+        vec![(
+            Receiver {
+                packets,
+                dropped: None,
+            },
+            Sender {
+                queue: 0,
+                packets: output,
+            },
+        )],
+        65535,
+        context.clone(),
+    ));
+    let mut encoder = udp::Encoder::new(65535);
+    let source = "192.0.2.2:12345".parse().unwrap();
+    let packet = encoder
+        .encode(source, "198.51.100.1:443".parse().unwrap(), &[7; 16384])
+        .unwrap()
+        .remove(0);
+    input.send(packet.to_vec()).await.unwrap();
+    stalled.notified().await;
+    // The stopped reader cannot increase its allowance. This exceeds the
+    // initial queue storage before the independent flow reaches dispatch.
+    for _ in 0..64 {
+        input.send(packet.to_vec()).await.unwrap();
+    }
+    let probe = encoder
+        .encode(
+            source,
+            "198.51.100.1:8443".parse().unwrap(),
+            b"still progressing",
+        )
+        .unwrap()
+        .remove(0);
+    input.send(probe.to_vec()).await.unwrap();
+    let (_, reply) = received.recv().await.unwrap();
+    assert_eq!(
+        packet::Decoder::default()
+            .decode(&reply, tokio::time::Instant::now())
+            .unwrap()
+            .udp()
+            .unwrap()
+            .1,
+        b"still progressing"
+    );
+
+    context.stopping.cancel();
+    endpoint.await.unwrap().unwrap();
+    context.scope.wait().await;
+}
+
 struct BlockedSender(Arc<Notify>);
 
 impl PacketSend for BlockedSender {
@@ -212,7 +295,7 @@ async fn forced_shutdown_interrupts_a_writer_after_receive_workers_have_drained(
         )
         .unwrap()
         .remove(0);
-    input.send(packet).await.unwrap();
+    input.send(packet.to_vec()).await.unwrap();
     writing.notified().await;
     context.stopping.cancel();
     released.await.unwrap();

@@ -9,9 +9,9 @@ anyhow.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
 kotoconn-config.workspace = true
-tokio = { workspace = true, features = ["io-util", "net", "sync"] }
+tokio = { workspace = true, features = ["io-util", "net", "sync", "time", "rt"] }
 tokio-util = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

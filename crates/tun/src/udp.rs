@@ -1,49 +1,50 @@
 use crate::{
-    device::Device,
     packet::{Flow, Packet},
+    storage::PacketArena,
 };
-use smoltcp::{
-    iface::{Config, Interface, SocketHandle, SocketSet},
-    phy::ChecksumCapabilities,
-    socket::raw,
-    wire::*,
+use bytes::Bytes;
+use smoltcp::{phy::ChecksumCapabilities, wire::*};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU16, AtomicU32, Ordering},
+    },
 };
-use std::net::SocketAddr;
 
-/// Uses smoltcp's IPv4 fragmenter. IPv6 fragmentation is missing on Medium::Ip
-/// in smoltcp 0.14; its wire representations still own the header encoding.
+struct Identifiers {
+    ipv4: AtomicU16,
+    ipv6: AtomicU32,
+}
+
+/// Each writer packs its own packets. Only fragment identifiers cross writers.
 pub(crate) struct Encoder {
-    iface: Interface,
-    device: Device,
-    sockets: SocketSet<'static>,
-    raw: SocketHandle,
     mtu: usize,
-    ipv6_id: u32,
+    identifiers: Arc<Identifiers>,
+    arena: PacketArena,
+}
+
+impl Clone for Encoder {
+    fn clone(&self) -> Self {
+        Self {
+            mtu: self.mtu,
+            identifiers: self.identifiers.clone(),
+            arena: PacketArena::default(),
+        }
+    }
 }
 
 impl Encoder {
     pub fn new(mtu: usize) -> Self {
-        // SAFETY: run validates the MTU. IPv6 fragmentation later subtracts
-        // 48 header bytes and requires a nonzero, eight-byte-aligned chunk.
+        // SAFETY: The endpoint validates MTU before fragment header subtraction.
         debug_assert!((1280..=65535).contains(&mtu));
-        let mut device = Device::new(mtu);
-        let mut config = Config::new(HardwareAddress::Ip);
-        config.random_seed = rand::random();
-        let iface = Interface::new(config, &mut device, smoltcp::time::Instant::ZERO);
-        let mut sockets = SocketSet::new(vec![]);
-        let raw = sockets.add(raw::Socket::new(
-            Some(IpVersion::Ipv4),
-            Some(IpProtocol::Udp),
-            raw::PacketBuffer::new(vec![], vec![]),
-            raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY], vec![0; 65535]),
-        ));
         Self {
-            iface,
-            device,
-            sockets,
-            raw,
             mtu,
-            ipv6_id: rand::random(),
+            identifiers: Arc::new(Identifiers {
+                ipv4: AtomicU16::new(rand::random()),
+                ipv6: AtomicU32::new(rand::random()),
+            }),
+            arena: PacketArena::default(),
         }
     }
 
@@ -52,7 +53,7 @@ impl Encoder {
         source: SocketAddr,
         destination: SocketAddr,
         payload: &[u8],
-    ) -> Option<Vec<Vec<u8>>> {
+    ) -> Option<Vec<Bytes>> {
         if source.is_ipv4() != destination.is_ipv4()
             || source.port() == 0
             || payload.len() > if source.is_ipv4() { 65507 } else { 65527 }
@@ -68,7 +69,7 @@ impl Encoder {
         let destination_ip = destination.ip().into();
         let mut transport = vec![0; 8 + payload.len()];
         // SAFETY: The buffer includes the UDP header and complete payload;
-        // the size and matching address families were validated above.
+        // size and matching address families were validated above.
         debug_assert!(u16::try_from(transport.len()).is_ok());
         udp.emit(
             &mut UdpPacket::new_unchecked(&mut transport),
@@ -78,7 +79,6 @@ impl Encoder {
             |bytes| bytes.copy_from_slice(payload),
             &ChecksumCapabilities::default(),
         );
-
         let ip = IpRepr::new(
             source_ip,
             destination_ip,
@@ -90,73 +90,71 @@ impl Encoder {
             ip,
             payload: transport.into(),
         };
-
         if packet.ip.buffer_len() <= self.mtu {
-            return Some(vec![packet.encode()]);
+            return Some(vec![
+                self.arena
+                    .encode(packet.ip.buffer_len(), |bytes| packet.emit(bytes))
+                    .1,
+            ]);
         }
-        if source.is_ipv4() {
-            // SAFETY: new inserted this raw socket and no method removes it.
-            debug_assert!(self.sockets.iter().any(|(id, socket)| {
-                id == self.raw && matches!(socket, smoltcp::socket::Socket::Raw(_))
-            }));
-            self.sockets
-                .get_mut::<raw::Socket>(self.raw)
-                .send_slice(&packet.encode())
-                .ok()?;
-            let mut frames = Vec::new();
-            loop {
-                self.iface.poll_egress(
-                    smoltcp::time::Instant::ZERO,
-                    &mut self.device,
-                    &mut self.sockets,
-                );
-                if self.device.outgoing.is_empty() {
-                    break;
-                }
-                frames.extend(self.device.outgoing.drain(..));
+
+        if let IpRepr::Ipv4(mut repr) = packet.ip {
+            let size = (self.mtu - 20) / 8 * 8;
+            let id = self.identifiers.ipv4.fetch_add(1, Ordering::Relaxed);
+            let chunks = packet.payload.chunks(size);
+            let count = chunks.len();
+            let mut frames = Vec::with_capacity(count);
+            for (index, data) in chunks.enumerate() {
+                repr.payload_len = data.len();
+                let (_, bytes) = self.arena.encode(20 + data.len(), |bytes| {
+                    // SAFETY: The frame contains the header and complete chunk;
+                    // validated UDP length bounds the byte offset.
+                    debug_assert!(index * size <= 0xfff8);
+                    let mut header = Ipv4Packet::new_unchecked(&mut *bytes);
+                    repr.emit(&mut header, &ChecksumCapabilities::default());
+                    header.set_ident(id);
+                    header.set_dont_frag(false);
+                    header.set_more_frags(index + 1 < count);
+                    header.set_frag_offset((index * size) as u16);
+                    header.fill_checksum();
+                    bytes[20..].copy_from_slice(data);
+                });
+                frames.push(bytes);
             }
             return Some(frames);
         }
 
-        // SAFETY: IpRepr was built from matching address families, and the
-        // IPv4 branch returned above. Only the IPv6 variant can reach here.
+        // SAFETY: Matching address families constructed IpRepr; IPv4 returned
+        // above, so only the IPv6 variant can reach this branch.
         debug_assert!(source.is_ipv6() && destination.is_ipv6());
-        debug_assert!(matches!(packet.ip, IpRepr::Ipv6(_)));
         let IpRepr::Ipv6(mut repr) = packet.ip else {
             unreachable!()
         };
         let size = (self.mtu - 48) / 8 * 8;
         debug_assert!(size > 0 && size.is_multiple_of(8));
-        let id = self.ipv6_id;
-        self.ipv6_id = self.ipv6_id.wrapping_add(1);
+        let id = self.identifiers.ipv6.fetch_add(1, Ordering::Relaxed);
         let chunks = packet.payload.chunks(size);
         let count = chunks.len();
-        Some(
-            chunks
-                .enumerate()
-                .map(|(i, data)| {
-                    repr.next_header = IpProtocol::Ipv6Frag;
-                    repr.payload_len = data.len() + 8;
-                    let mut bytes = vec![0; 48 + data.len()];
-                    // SAFETY: Each buffer holds the 40-byte IPv6 header,
-                    // 8-byte fragment header and this chunk. Validated UDP
-                    // size also bounds every fragment offset to 13 bits.
-                    debug_assert!(bytes.len() <= self.mtu);
-                    debug_assert_eq!(bytes.len(), 40 + repr.payload_len);
-                    debug_assert!(i * size / 8 <= 0x1fff);
-                    repr.emit(&mut Ipv6Packet::new_unchecked(&mut bytes));
-                    bytes[40] = u8::from(IpProtocol::Udp);
-                    Ipv6FragmentRepr {
-                        frag_offset: (i * size / 8) as u16,
-                        more_frags: i + 1 < count,
-                        ident: id,
-                    }
-                    .emit(&mut Ipv6FragmentHeader::new_unchecked(&mut bytes[42..48]));
-                    bytes[48..].copy_from_slice(data);
-                    bytes
-                })
-                .collect(),
-        )
+        let mut frames = Vec::with_capacity(count);
+        for (index, data) in chunks.enumerate() {
+            repr.next_header = IpProtocol::Ipv6Frag;
+            repr.payload_len = data.len() + 8;
+            let (_, bytes) = self.arena.encode(48 + data.len(), |bytes| {
+                // SAFETY: Each frame includes both headers and this chunk.
+                debug_assert!(index * size / 8 <= 0x1fff);
+                repr.emit(&mut Ipv6Packet::new_unchecked(&mut *bytes));
+                bytes[40] = u8::from(IpProtocol::Udp);
+                Ipv6FragmentRepr {
+                    frag_offset: (index * size / 8) as u16,
+                    more_frags: index + 1 < count,
+                    ident: id,
+                }
+                .emit(&mut Ipv6FragmentHeader::new_unchecked(&mut bytes[42..48]));
+                bytes[48..].copy_from_slice(data);
+            });
+            frames.push(bytes);
+        }
+        Some(frames)
     }
 }
 

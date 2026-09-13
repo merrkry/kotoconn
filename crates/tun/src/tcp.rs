@@ -1,8 +1,12 @@
 //! Each connection owns its smoltcp state and timer. Applications exchange bytes
-//! through bounded Tokio buffers; no lock protects a protocol state machine.
+//! through adaptive chunked buffers; no lock protects a protocol state machine.
 use crate::{
     device::{Device, Transmit},
     packet::Flow,
+};
+use kotoconn_protocol::{
+    queue,
+    stream_buffer::{self, BufferedStream},
 };
 use smoltcp::{
     iface::{Config, Interface, SocketSet},
@@ -21,16 +25,16 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf},
-    sync::{mpsc, oneshot},
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    sync::oneshot,
     time::Instant,
 };
 
-const BUFFER_SIZE: usize = 64 * 1024;
+const BUFFER_SIZE: usize = 512 * 1024;
 
 // The receive window must cover bursts while the application and endpoint
 // drivers run. smoltcp fixes its receive storage and window scale at creation.
-const RECEIVE_BUFFER_SIZE: usize = 1024 * 1024;
+const RECEIVE_BUFFER_SIZE: usize = 256 * 1024;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -39,10 +43,12 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const _: () = {
     assert!(smoltcp::config::IFACE_MAX_ADDR_COUNT > 0);
     assert!(smoltcp::config::IFACE_MAX_ROUTE_COUNT > 0);
+    // smoltcp's sequence arithmetic requires receive storage below 2^30.
+    assert!(RECEIVE_BUFFER_SIZE < (1 << 30));
 };
 
 pub(crate) struct Stream {
-    inner: DuplexStream,
+    inner: BufferedStream,
     reset: Arc<AtomicBool>,
     dropped: Option<oneshot::Sender<bool>>,
     read_eof: bool,
@@ -128,11 +134,10 @@ impl Drop for ResetOnDrop {
 
 pub(crate) struct QueuedPacket {
     pub bytes: Vec<u8>,
-    pub _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 pub(crate) struct Connection {
-    pub packets: mpsc::Sender<QueuedPacket>,
+    pub packets: queue::Sender<QueuedPacket>,
     pub accepted: oneshot::Receiver<Stream>,
     pub driver: Pin<Box<dyn Future<Output = io::Result<()>> + Send>>,
 }
@@ -140,7 +145,7 @@ pub(crate) struct Connection {
 pub(crate) fn connection(
     flow: Flow,
     mtu: usize,
-    output: mpsc::Sender<Transmit>,
+    output: queue::Sender<Transmit>,
     stopping: tokio_util::sync::CancellationToken,
 ) -> Connection {
     // SAFETY: Dispatch constructs flows from validated unicast IP packets and
@@ -151,13 +156,14 @@ pub(crate) fn connection(
     debug_assert_ne!(flow.destination.port(), 0);
     debug_assert!((1280..=65535).contains(&mtu));
 
-    // Queue storage is allocated on demand. Allow two receive windows of MTU
-    // packets so scheduler bursts do not turn advertised credit into packet loss.
-    // The endpoint also enforces its shared 8 MiB ingress budget.
-    let (packets, mut incoming) =
-        mpsc::channel::<QueuedPacket>((2 * RECEIVE_BUFFER_SIZE).div_ceil(mtu));
+    let (packets, mut incoming) = queue::channel(
+        queue::INITIAL_BYTES.max(2 * RECEIVE_BUFFER_SIZE),
+        |packet: &QueuedPacket| packet.bytes.len(),
+    );
+    let receive_buffer = vec![0; RECEIVE_BUFFER_SIZE];
+    let send_buffer = vec![0; BUFFER_SIZE];
     let (accepted_tx, accepted) = oneshot::channel();
-    let (local, mut app) = tokio::io::duplex(BUFFER_SIZE);
+    let (local, mut app) = stream_buffer::duplex();
     let (dropped, mut drop_rx) = oneshot::channel();
     let reset = Arc::new(AtomicBool::new(false));
 
@@ -208,8 +214,8 @@ pub(crate) fn connection(
         }
 
         let mut socket = tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0; RECEIVE_BUFFER_SIZE]),
-            tcp::SocketBuffer::new(vec![0; BUFFER_SIZE]),
+            tcp::SocketBuffer::new(receive_buffer),
+            tcp::SocketBuffer::new(send_buffer),
         );
         socket.set_congestion_control(tcp::CongestionControl::Cubic);
         socket.set_timeout(Some(smoltcp::time::Duration::from_secs(120)));
@@ -301,7 +307,7 @@ pub(crate) fn connection(
                 _ = tokio::time::sleep_until(epoch + HANDSHAKE_TIMEOUT), if admitting => {
                     sockets.get_mut::<tcp::Socket>(handle).abort();
                 }
-                permit = output.reserve(), if !device.outgoing.is_empty() => {
+                permit = output.reserve(device.outgoing.front().map_or(0, |packet| crate::storage::charge(packet.len()))), if !device.outgoing.is_empty() => {
                     // SAFETY: The select guard observed a packet. This driver
                     // alone owns the queue, and no other branch handler runs
                     // between that guard and this pop.
@@ -312,13 +318,14 @@ pub(crate) fn connection(
                     // Hand over the rest of this bounded burst while capacity
                     // is ready, so the endpoint can coalesce adjacent segments.
                     while !device.outgoing.is_empty() {
-                        let Ok(permit) = output.try_reserve() else { break; };
+                        let Ok(permit) = output.try_reserve(device.outgoing.front().map_or(0, |packet| crate::storage::charge(packet.len()))) else {
+                            break;
+                        };
                         // SAFETY: This driver alone owns the queue, and the
                         // loop condition checked it before reserving capacity.
                         debug_assert!(!device.outgoing.is_empty());
                         permit.send(Transmit::Packet(device.outgoing.pop_front().unwrap()));
                     }
-
                 }
                 packet = incoming.recv(), if device.incoming.is_none() && device.outgoing.len() < 32 => {
                     match packet {
@@ -356,7 +363,7 @@ pub(crate) fn connection(
 fn bridge(
     cx: &mut Context<'_>,
     socket: &mut tcp::Socket<'_>,
-    app: &mut DuplexStream,
+    app: &mut BufferedStream,
     read_eof: &mut bool,
     write_eof: &mut bool,
 ) -> Poll<io::Result<()>> {
@@ -432,7 +439,17 @@ impl Rejector {
         }
     }
 
-    pub fn reject(&mut self, packet: &crate::packet::Packet) -> Vec<Vec<u8>> {
+    pub fn reject(
+        &mut self,
+        packet: &crate::packet::Packet,
+        output: &queue::Sender<Transmit>,
+    ) -> std::result::Result<(), queue::Error> {
+        debug_assert_eq!(packet.ip.next_header(), IpProtocol::Tcp);
+        // Closed-port resets have no payload. Reserve the IP header and the
+        // maximum TCP header before encoding, so dropped replies cannot leave
+        // holes that let a few queued packets pin many arena blocks.
+        let permit = output.try_reserve(crate::storage::charge(packet.ip.header_len() + 60))?;
+
         self.iface.update_ip_addrs(|addrs| {
             addrs.clear();
             // SAFETY: Clearing the address list makes room for this single
@@ -455,6 +472,12 @@ impl Rejector {
             &mut self.device,
             &mut self.sockets,
         );
-        self.device.outgoing.drain(..).collect()
+        // SAFETY: One TCP ingress poll with an empty socket set emits at most
+        // one closed-port reset. No socket can produce additional egress.
+        assert!(self.device.outgoing.len() <= 1);
+        if let Some(response) = self.device.outgoing.pop_front() {
+            permit.send(Transmit::Packet(response));
+        }
+        Ok(())
     }
 }

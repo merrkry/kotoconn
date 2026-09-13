@@ -1,3 +1,5 @@
+use crate::storage::{self, PacketArena};
+use bytes::Bytes;
 use smoltcp::{
     phy::{self, DeviceCapabilities, Medium},
     time::Instant,
@@ -8,7 +10,7 @@ use std::{collections::VecDeque, net::SocketAddr};
 /// all associations share the same fragment identification state.
 #[derive(Debug)]
 pub(crate) enum Transmit {
-    Packet(Vec<u8>),
+    Packet(Bytes),
     Datagram {
         source: SocketAddr,
         destination: SocketAddr,
@@ -16,11 +18,21 @@ pub(crate) enum Transmit {
     },
 }
 
+impl Transmit {
+    pub(crate) fn size(&self) -> usize {
+        match self {
+            Self::Packet(packet) => storage::charge(packet.len()),
+            Self::Datagram { payload, .. } => payload.len() + 48,
+        }
+    }
+}
+
 /// One ingress packet and bounded egress storage. The TCP driver waits for
 /// egress capacity before polling again when the device cannot transmit.
 pub(crate) struct Device {
     pub incoming: Option<Vec<u8>>,
-    pub outgoing: VecDeque<Vec<u8>>,
+    pub outgoing: VecDeque<Bytes>,
+    arena: PacketArena,
     mtu: usize,
 }
 
@@ -29,6 +41,7 @@ impl Device {
         Self {
             incoming: None,
             outgoing: VecDeque::new(),
+            arena: PacketArena::default(),
             mtu,
         }
     }
@@ -42,11 +55,20 @@ impl phy::Device for Device {
         if self.outgoing.len() >= 32 {
             return None;
         }
-        Some((Rx(self.incoming.take()?), Tx(&mut self.outgoing)))
+        let incoming = self.incoming.take()?;
+        let tx = self.transmit(Instant::ZERO)?;
+        Some((Rx(incoming), tx))
     }
 
     fn transmit(&mut self, _: Instant) -> Option<Tx<'_>> {
-        (self.outgoing.len() < 32).then_some(Tx(&mut self.outgoing))
+        if self.outgoing.len() >= 32 {
+            return None;
+        }
+        Some(Tx {
+            outgoing: &mut self.outgoing,
+            arena: &mut self.arena,
+            mtu: self.mtu,
+        })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -68,16 +90,20 @@ impl phy::RxToken for Rx {
     }
 }
 
-pub(crate) struct Tx<'a>(&'a mut VecDeque<Vec<u8>>);
+pub(crate) struct Tx<'a> {
+    outgoing: &'a mut VecDeque<Bytes>,
+    arena: &'a mut PacketArena,
+    mtu: usize,
+}
 
 impl phy::TxToken for Tx<'_> {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
-        // SAFETY: receive/transmit issue a token only below the queue limit.
-        // Its exclusive borrow prevents another token from filling this slot.
-        debug_assert!(self.0.len() < 32);
-        let mut packet = vec![0; len];
-        let result = f(&mut packet);
-        self.0.push_back(packet);
+        // SAFETY: The token exclusively borrows the device's bounded work queue;
+        // smoltcp derives packet lengths from the advertised device MTU.
+        debug_assert!(self.outgoing.len() < 32);
+        assert!(len <= self.mtu, "smoltcp exceeded device MTU");
+        let (result, bytes) = self.arena.encode(len, f);
+        self.outgoing.push_back(bytes);
         result
     }
 }

@@ -1,5 +1,7 @@
 //! Normalize Linux virtio frames before the common IP validation path.
 use crate::{PacketReceive, PacketSend};
+use bytes::Bytes;
+use kotoconn_protocol::queue::{Capacity, INITIAL_BYTES};
 use smoltcp::wire::TcpPacket;
 use std::{
     collections::VecDeque,
@@ -7,6 +9,7 @@ use std::{
     sync::Arc,
     task::{Context, Poll, ready},
 };
+use tokio::time::Instant;
 use tun_rs::{
     AsyncDevice, VIRTIO_NET_HDR_GSO_TCPV4, VIRTIO_NET_HDR_GSO_TCPV6, VIRTIO_NET_HDR_GSO_UDP_L4,
     VIRTIO_NET_HDR_LEN, VirtioNetHdr,
@@ -18,6 +21,7 @@ pub(crate) struct Receiver {
     device: Arc<AsyncDevice>,
     frame: Vec<u8>,
     datagrams: VecDeque<Vec<u8>>,
+    capacity: Capacity,
 }
 
 pub(crate) struct Sender {
@@ -33,6 +37,7 @@ fn split(device: AsyncDevice) -> (Receiver, Sender) {
             device: device.clone(),
             frame: vec![0; MAX_IP_PACKET + VIRTIO_NET_HDR_LEN],
             datagrams: VecDeque::new(),
+            capacity: Capacity::new(INITIAL_BYTES),
         },
         Sender {
             device,
@@ -65,6 +70,7 @@ impl PacketReceive for Receiver {
             return self.device.poll_recv(cx, bytes);
         }
         if let Some(packet) = self.datagrams.pop_front() {
+            self.capacity.complete(packet.len(), Instant::now());
             return Poll::Ready(copy_packet(&packet, bytes));
         }
 
@@ -75,17 +81,20 @@ impl PacketReceive for Receiver {
             &mut self.frame[..len],
             bytes,
             &mut self.datagrams,
+            &mut self.capacity,
         ))
     }
 }
 
 impl PacketSend for Sender {
-    async fn send_batch(&mut self, packets: &mut [Vec<u8>]) -> io::Result<()> {
+    async fn send_batch(&mut self, packets: &[Bytes]) -> io::Result<()> {
         let offset = if self.device.tcp_gso() {
             VIRTIO_NET_HDR_LEN
         } else {
             0
         };
+        // GRO needs room to combine complete IP packets. This reusable scratch
+        // pool belongs to this writer, independently of queued packet storage.
         while self.buffers.len() < packets.len().min(64) {
             self.buffers
                 .push(Vec::with_capacity(MAX_IP_PACKET + 2 * VIRTIO_NET_HDR_LEN));
@@ -145,6 +154,7 @@ pub(super) fn normalize(
     frame: &mut [u8],
     output: &mut [u8],
     datagrams: &mut VecDeque<Vec<u8>>,
+    capacity: &mut Capacity,
 ) -> io::Result<usize> {
     let mut header = VirtioNetHdr::decode(frame)?;
     // SAFETY: decode checked the complete virtio header. The remaining bytes
@@ -215,11 +225,18 @@ pub(super) fn normalize(
                 .checked_add(8)
                 .ok_or_else(|| invalid("GSO UDP header too large"))?;
             let count = (transport.len() - 8).div_ceil(usize::from(header.gso_size));
-            if count == 0 || count > tun_rs::IDEAL_BATCH_SIZE {
-                // Bound the extra UDP queue independently of the sender's GSO size.
+            if count == 0 {
                 return Ok(0);
             }
             let size = usize::from(header.hdr_len) + usize::from(header.gso_size);
+            // The previous aggregate is drained before reading another frame.
+            // Charge duplicated headers as well as payload; GSO segment count
+            // is not an independent admission quota.
+            debug_assert!(datagrams.is_empty());
+            let cost = count.saturating_mul(size + std::mem::size_of::<Vec<u8>>());
+            if count > 1 && cost > capacity.target(Instant::now()) {
+                return Ok(0);
+            }
             let mut packets = vec![vec![0; size]; count];
             let mut sizes = vec![0; count];
             let count = tun_rs::gso_split(packet, header, &mut packets, &mut sizes, 0, is_v6)?;
@@ -236,7 +253,10 @@ pub(super) fn normalize(
                 datagrams.push_back(packet);
             }
             match datagrams.pop_front() {
-                Some(packet) => copy_packet(&packet, output),
+                Some(packet) => {
+                    capacity.complete(packet.len(), Instant::now());
+                    copy_packet(&packet, output)
+                }
                 None => Ok(0),
             }
         }

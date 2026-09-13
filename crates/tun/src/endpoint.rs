@@ -4,18 +4,16 @@ use crate::{
     worker::{self, Shared},
 };
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
-use kotoconn_protocol::ServerContext;
+use bytes::Bytes;
+use kotoconn_protocol::{ServerContext, queue};
 use std::{
     collections::hash_map::RandomState,
     future::poll_fn,
     io,
-    sync::{Arc, Mutex},
+    sync::Arc,
     task::{Context, Poll},
 };
-use tokio::{
-    sync::{Semaphore, mpsc},
-    task::JoinSet,
-};
+use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
@@ -31,10 +29,7 @@ pub trait PacketSend: Send {
 
     /// Send only packets already available. Cancellation may transmit a prefix;
     /// the caller must not retry a cancelled batch.
-    fn send_batch(
-        &mut self,
-        packets: &mut [Vec<u8>],
-    ) -> impl Future<Output = io::Result<()>> + Send {
+    fn send_batch(&mut self, packets: &[Bytes]) -> impl Future<Output = io::Result<()>> + Send {
         async move {
             for (index, packet) in packets.iter().enumerate() {
                 let len = poll_fn(|cx| self.poll_send(cx, packet)).await?;
@@ -74,25 +69,23 @@ pub async fn run<R: PacketReceive + 'static, W: PacketSend + 'static>(
     // Local failure cancels this endpoint's connections, without closing other inbounds.
     context.scope = context.scope.child();
     let _connections = ConnectionGuard(context.scope.clone());
-    let (inboxes, receivers): (Vec<_>, Vec<_>) =
-        (0..queues.len()).map(|_| mpsc::channel(128)).unzip();
+    let (inboxes, receivers): (Vec<_>, Vec<_>) = (0..queues.len())
+        .map(|_| queue::channel(queue::INITIAL_BYTES, worker::Forwarded::size))
+        .unzip();
+    let (drained, mut drains) = mpsc::unbounded_channel();
     let shared = Arc::new(Shared {
+        drained,
         hash: RandomState::new(),
         inboxes,
-        tcp_slots: Arc::new(Semaphore::new(worker::MAX_TCP_CONNECTIONS)),
-        udp_slots: Arc::new(Semaphore::new(worker::MAX_UDP_ASSOCIATIONS)),
-        tcp_bytes: Arc::new(Semaphore::new(worker::INGRESS_BYTES)),
-        udp_bytes: Arc::new(Semaphore::new(worker::INGRESS_BYTES)),
-        transit_bytes: Arc::new(Semaphore::new(worker::INGRESS_BYTES)),
         reassembly: Default::default(),
         stop: CancellationToken::new(),
     });
-    // Only UDP packetization shares mutable state: IP fragment IDs span flows.
-    // Encoding never awaits and writers release this lock before touching a FD.
-    let encoder = Arc::new(Mutex::new(udp::Encoder::new(mtu)));
+    // Each writer owns its packet storage; only atomic fragment IDs are shared.
+    let encoder = udp::Encoder::new(mtu);
     let mut workers: JoinSet<Result<()>> = JoinSet::new();
+    let count = queues.len();
     for (id, ((read, write), inbox)) in queues.into_iter().zip(receivers).enumerate() {
-        let (output, packets) = mpsc::channel(128);
+        let (output, packets) = queue::channel(queue::INITIAL_BYTES, Transmit::size);
         let state = shared.clone();
         let context = context.clone();
         let encoder = encoder.clone();
@@ -119,19 +112,20 @@ pub async fn run<R: PacketReceive + 'static, W: PacketSend + 'static>(
     }
 
     let result = async {
-        // Holding all admission permits prevents a late SYN racing the drain.
-        let _drained = tokio::select! {
-            biased;
-            _ = context.scope.cancelled() => return Ok(()),
-            permits = async {
-                context.stopping.cancelled().await;
-                shared.tcp_slots.clone().acquire_many_owned(worker::MAX_TCP_CONNECTIONS as u32).await
-            } => permits?,
-            result = workers.join_next() => {
-                result.ok_or_else(|| anyhow!("TUN has no workers"))??.context("TUN worker failed")?;
-                bail!("TUN worker stopped before shutdown");
-            },
-        };
+        // A worker reports only after observing stop and removing every TCP
+        // driver. No finite connection permit set is needed for graceful drain.
+        let mut remaining = count;
+        while remaining > 0 {
+            tokio::select! {
+                biased;
+                _ = context.scope.cancelled() => return Ok(()),
+                Some(_) = drains.recv() => remaining -= 1,
+                result = workers.join_next() => {
+                    result.ok_or_else(|| anyhow!("TUN has no workers"))??.context("TUN worker failed")?;
+                    bail!("TUN worker stopped before shutdown");
+                },
+            }
+        }
         shared.stop.cancel();
         loop {
             // Forced shutdown also interrupts blocked transmitters during graceful drain.
@@ -158,8 +152,8 @@ pub async fn run<R: PacketReceive + 'static, W: PacketSend + 'static>(
 async fn transmit<W: PacketSend>(
     id: usize,
     mut device: W,
-    mut input: mpsc::Receiver<Transmit>,
-    encoder: Arc<Mutex<udp::Encoder>>,
+    mut input: queue::Receiver<Transmit>,
+    mut encoder: udp::Encoder,
 ) -> Result<()> {
     let mut items = Vec::with_capacity(64);
     let mut packets = Vec::with_capacity(64);
@@ -175,17 +169,14 @@ async fn transmit<W: PacketSend>(
                     destination,
                     payload,
                 } => {
-                    let datagram = encoder
-                        .lock()
-                        .map_err(|_| anyhow!("TUN UDP encoder lock poisoned"))?
-                        .encode(source, destination, &payload);
+                    let datagram = encoder.encode(source, destination, &payload);
                     if let Some(datagram) = datagram {
                         packets.extend(datagram);
                     }
                 }
             }
         }
-        device.send_batch(&mut packets).await?;
+        device.send_batch(&packets).await?;
         sent_packets += packets.len() as u64;
         sent_bytes += packets.iter().map(|p| p.len() as u64).sum::<u64>();
         packets.clear();
@@ -218,10 +209,10 @@ mod tests {
     async fn udp_replies_share_packetization_and_preserve_complete_datagrams() {
         let source: std::net::SocketAddr = "198.51.100.1:443".parse().unwrap();
         let destination = "192.0.2.2:12345".parse().unwrap();
-        let (output0, packets0) = mpsc::channel(1);
-        let (output1, packets1) = mpsc::channel(1);
+        let (output0, packets0) = queue::channel(1, Transmit::size);
+        let (output1, packets1) = queue::channel(1, Transmit::size);
         let (sink, mut received) = mpsc::channel(16);
-        let encoder = Arc::new(Mutex::new(udp::Encoder::new(1280)));
+        let encoder = udp::Encoder::new(1280);
         let writer0 = transmit(0, Sink(sink.clone()), packets0, encoder.clone());
         let writer1 = transmit(1, Sink(sink), packets1, encoder);
         let producer = async {

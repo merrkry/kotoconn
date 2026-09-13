@@ -1,4 +1,4 @@
-use crate::{Scope, Target};
+use crate::{Scope, Target, queue};
 use anyhow::Result;
 use bytes::Bytes;
 use std::{
@@ -6,10 +6,7 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
-    sync::mpsc,
-};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub trait Stream: AsyncRead + AsyncWrite + Send {}
 
@@ -27,8 +24,8 @@ pub struct Packet {
 /// Each message is one complete datagram. No framing, mux or retransmission here.
 /// Ingress on a shared socket uses try_send: a full session queue drops that packet.
 pub struct Datagram {
-    pub tx: mpsc::Sender<Packet>,
-    pub rx: mpsc::Receiver<Packet>,
+    pub tx: queue::Sender<Packet>,
+    pub rx: queue::Receiver<Packet>,
     pub scope: Scope,
 }
 
@@ -39,8 +36,8 @@ impl Drop for Datagram {
 }
 
 pub fn packet_pair(scope: Scope) -> (Datagram, Datagram) {
-    let (a_tx, b_rx) = mpsc::channel(64);
-    let (b_tx, a_rx) = mpsc::channel(64);
+    let (a_tx, b_rx) = queue::channel(queue::INITIAL_BYTES, |packet: &Packet| packet.payload.len());
+    let (b_tx, a_rx) = queue::channel(queue::INITIAL_BYTES, |packet: &Packet| packet.payload.len());
 
     (
         Datagram {
@@ -62,7 +59,7 @@ pub fn stream_task(
     scope: Scope,
     connect: impl Future<Output = Result<BoxStream>> + Send + 'static,
 ) -> Result<BoxStream> {
-    let (local, mut remote) = tokio::io::duplex(64 * 1024);
+    let (local, mut remote) = crate::stream_buffer::duplex();
     let handle = scope.clone();
 
     scope.spawn(async move {
@@ -77,7 +74,7 @@ pub fn stream_task(
 }
 
 struct OwnedStream {
-    inner: tokio::io::DuplexStream,
+    inner: crate::stream_buffer::BufferedStream,
     scope: Scope,
 }
 

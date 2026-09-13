@@ -1,11 +1,8 @@
 //! Validate and normalize IP before allocating transport state. Reassembly is
 //! shared by TCP and UDP, including fragmented initial SYNs.
 use smoltcp::{phy::ChecksumCapabilities, wire::*};
-use std::{borrow::Cow, collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use std::{borrow::Cow, collections::HashMap, net::SocketAddr, time::Duration};
 use tokio::time::Instant;
-
-const MAX_DATAGRAMS: usize = 64;
 
 const REASSEMBLY_LIFETIME: Duration = Duration::from_secs(60);
 
@@ -28,18 +25,34 @@ impl Packet<'_> {
         }
     }
 
+    pub fn storage_size(&self) -> usize {
+        self.ip.header_len()
+            + match &self.payload {
+                Cow::Borrowed(bytes) => bytes.len(),
+                Cow::Owned(bytes) => bytes.capacity(),
+            }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
-        // SAFETY: Decoder normalizes the IP payload length after reassembly;
-        // outbound encoders construct it from their transport buffer length.
-        // The allocation must fit both the emitted header and payload copy.
+        let mut data = Vec::with_capacity(self.ip.buffer_len());
+        // Initialize only the header; the payload is copied in full below.
+        data.resize(self.ip.header_len(), 0);
+        // SAFETY: IpRepr emits only the header, whose storage is initialized.
+        self.ip.emit(&mut data, &ChecksumCapabilities::default());
+        data.extend_from_slice(&self.payload);
+        data
+    }
+
+    pub fn emit(&self, data: &mut [u8]) {
+        // SAFETY: Decoders normalize payload length, and encoders derive it from
+        // their transport data. Callers allocate the complete IP packet length.
         debug_assert_eq!(
             self.ip.buffer_len(),
             self.ip.header_len() + self.payload.len()
         );
-        let mut data = vec![0; self.ip.buffer_len()];
-        self.ip.emit(&mut data, &ChecksumCapabilities::default());
+        debug_assert_eq!(data.len(), self.ip.buffer_len());
+        self.ip.emit(&mut *data, &ChecksumCapabilities::default());
         data[self.ip.header_len()..].copy_from_slice(&self.payload);
-        data
     }
 
     pub fn tcp(&self) -> Option<(Flow, TcpRepr<'_>)> {
@@ -85,6 +98,7 @@ impl Packet<'_> {
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 struct FragmentKey {
+    ipv4_protocol: Option<IpProtocol>,
     source: IpAddress,
     destination: IpAddress,
     id: u32,
@@ -99,7 +113,7 @@ struct Fragment {
 }
 
 struct Assembly {
-    _permit: OwnedSemaphorePermit,
+    lease: crate::reassembly::Lease,
     expires: Instant,
     ranges: smoltcp::storage::Assembler,
     data: Vec<u8>,
@@ -109,10 +123,13 @@ struct Assembly {
     poisoned: bool,
 }
 
+const ASSEMBLY_METADATA: usize = std::mem::size_of::<(FragmentKey, Assembly)>();
+
 impl Assembly {
     fn poison(&mut self) {
         self.ranges.clear();
-        self.data.clear();
+        self.data = Vec::new();
+        self.lease.resize(ASSEMBLY_METADATA, Instant::now());
         self.poisoned = true;
     }
 }
@@ -134,7 +151,6 @@ pub(crate) enum RouteKey {
 }
 
 pub(crate) struct Parsed<'a> {
-    bytes: &'a [u8],
     ip: IpRepr,
     payload: &'a [u8],
     fragment: Option<Fragment>,
@@ -177,13 +193,10 @@ impl<'a> Parsed<'a> {
     }
 
     pub fn decode(self, decoder: &mut Decoder, now: Instant) -> Option<Packet<'a>> {
-        if self.fragment.is_some() && matches!(self.ip, IpRepr::Ipv4(_)) {
-            let assembled = decoder.ipv4.process(self.bytes, now)?;
-            return decoder.decode(&assembled, now).map(Packet::into_owned);
-        }
         let mut ip = self.ip;
         let payload = if let Some(fragment) = self.fragment {
             let key = FragmentKey {
+                ipv4_protocol: matches!(ip, IpRepr::Ipv4(_)).then_some(ip.next_header()),
                 source: ip.src_addr(),
                 destination: ip.dst_addr(),
                 id: fragment.id,
@@ -203,7 +216,20 @@ pub(crate) fn parse(data: &[u8]) -> Option<Parsed<'_>> {
     let (ip, payload, fragment) = match IpVersion::of_packet(data).ok()? {
         IpVersion::Ipv4 => {
             let packet = Ipv4Packet::new_checked(data).ok()?;
-            let repr = Ipv4Repr::parse(&packet, &ChecksumCapabilities::default()).ok()?;
+            // Repr::parse rejects fragments unless smoltcp's per-interface
+            // fragment storage is enabled. Reassembly belongs to this decoder,
+            // so validate the wire header without allocating that storage in
+            // every TCP interface.
+            if packet.version() != 4 || !packet.verify_checksum() {
+                return None;
+            }
+            let repr = Ipv4Repr {
+                src_addr: packet.src_addr(),
+                dst_addr: packet.dst_addr(),
+                next_header: packet.next_header(),
+                payload_len: packet.payload().len(),
+                hop_limit: packet.hop_limit(),
+            };
             // SAFETY: Successful checked parsing establishes the fixed
             // header and the complete options slice within this buffer.
             debug_assert!((20..=data.len()).contains(&usize::from(packet.header_len())));
@@ -230,7 +256,7 @@ pub(crate) fn parse(data: &[u8]) -> Option<Parsed<'_>> {
                     id,
                     offset,
                     more,
-                    prefix_len: 0,
+                    prefix_len: usize::from(packet.header_len()),
                 }),
             )
         }
@@ -249,32 +275,18 @@ pub(crate) fn parse(data: &[u8]) -> Option<Parsed<'_>> {
         return None;
     }
     Some(Parsed {
-        bytes: data,
         ip,
         payload,
         fragment,
     })
 }
 
-#[derive(Clone)]
-pub(crate) struct ReassemblyLimits {
-    ipv4: Arc<Semaphore>,
-    ipv6: Arc<Semaphore>,
-}
-
-impl Default for ReassemblyLimits {
-    fn default() -> Self {
-        Self {
-            ipv4: Arc::new(Semaphore::new(smoltcp::config::REASSEMBLY_BUFFER_COUNT)),
-            ipv6: Arc::new(Semaphore::new(MAX_DATAGRAMS)),
-        }
-    }
-}
+pub(crate) use crate::reassembly::Limits as ReassemblyLimits;
 
 pub(crate) struct Decoder {
     fragments: HashMap<FragmentKey, Assembly>,
-    slots: Arc<Semaphore>,
-    ipv4: crate::reassembly::Ipv4Reassembly,
+    limits: ReassemblyLimits,
+    next_expiry: Option<Instant>,
 }
 
 impl Default for Decoder {
@@ -287,22 +299,26 @@ impl Decoder {
     pub fn new(limits: ReassemblyLimits) -> Self {
         Self {
             fragments: HashMap::new(),
-            slots: limits.ipv6,
-            ipv4: crate::reassembly::Ipv4Reassembly::new(limits.ipv4),
+            limits,
+            next_expiry: None,
         }
     }
 
     pub fn deadline(&self) -> Option<Instant> {
-        self.fragments
-            .values()
-            .map(|a| a.expires)
-            .chain(self.ipv4.deadline())
-            .min()
+        if self.fragments.is_empty() {
+            None
+        } else {
+            self.next_expiry
+        }
     }
 
     pub fn expire(&mut self, now: Instant) {
-        self.fragments.retain(|_, a| a.expires > now);
-        self.ipv4.expire(now);
+        // Ordinary packet processing must not scan an unbounded fragment table.
+        // A completed earliest assembly may cause one early wake, which is safe.
+        if self.next_expiry.is_some_and(|at| at <= now) {
+            self.fragments.retain(|_, a| a.expires > now);
+            self.next_expiry = self.fragments.values().map(|a| a.expires).min();
+        }
     }
 
     pub fn decode<'a>(&mut self, data: &'a [u8], now: Instant) -> Option<Packet<'a>> {
@@ -323,17 +339,19 @@ impl Decoder {
             prefix_len,
             ..
         } = fragment;
-        // SAFETY: ipv6_extensions derives these values from a checked IPv6
-        // payload length and the fragment header's 13-bit offset field.
+        // SAFETY: Parsing validates the IP length and derives the byte offset
+        // from the fragment header's 13-bit field for either address family.
         debug_assert!(prefix_len <= 65535);
         debug_assert!(offset <= 0xfff8 && offset.is_multiple_of(8));
         self.expire(now);
 
         if let std::collections::hash_map::Entry::Vacant(entry) = self.fragments.entry(key) {
-            let permit = self.slots.clone().try_acquire_owned().ok()?;
+            let lease = self.limits.reserve(ASSEMBLY_METADATA, now)?;
+            let expires = now + REASSEMBLY_LIFETIME;
+            self.next_expiry = Some(self.next_expiry.map_or(expires, |at| at.min(expires)));
             entry.insert(Assembly {
-                _permit: permit,
-                expires: now + REASSEMBLY_LIFETIME,
+                lease,
+                expires,
                 ranges: smoltcp::storage::Assembler::new(),
                 data: Vec::new(),
                 protocol,
@@ -348,23 +366,43 @@ impl Decoder {
         }
 
         let end = offset + data.len();
+        let ipv4 = key.ipv4_protocol.is_some();
+        if ipv4 {
+            assembly.prefix_len = assembly.prefix_len.max(prefix_len);
+        }
+        let prefix_len = if ipv4 {
+            assembly.prefix_len
+        } else {
+            prefix_len
+        };
         if data.is_empty()
             || end > 65535 - prefix_len
             || prefix_len != assembly.prefix_len
-            || (offset == 0 && !complete_transport_header(protocol, data))
+            || (!ipv4 && offset == 0 && !complete_transport_header(protocol, data))
             || protocol != assembly.protocol
             || (more && !data.len().is_multiple_of(8))
             || assembly
                 .total
                 .is_some_and(|total| end > total || (!more && end != total))
             || (!more && assembly.data.len() > end)
-            || assembly
-                .ranges
-                .iter_data()
-                .any(|(start, stop)| start < end && stop > offset)
+            || (!ipv4
+                && assembly
+                    .ranges
+                    .iter_data()
+                    .any(|(start, stop)| start < end && stop > offset))
+            || assembly.data.len() > 65535 - prefix_len
         {
             // RFC 5722: poison the whole IPv6 datagram until its original expiry.
             assembly.poison();
+            return None;
+        }
+        let length = assembly.data.len().max(end);
+        assembly.data.resize(length, 0);
+        if !assembly
+            .lease
+            .resize(ASSEMBLY_METADATA + assembly.data.capacity(), now)
+        {
+            self.fragments.remove(&key);
             return None;
         }
         if assembly.ranges.add(offset, data.len()).is_err() {
@@ -375,7 +413,6 @@ impl Decoder {
             assembly.total = Some(end);
         }
 
-        assembly.data.resize(assembly.data.len().max(end), 0);
         // SAFETY: The validated fragment fits the resized buffer, and end was
         // computed from this offset and this exact fragment's length.
         debug_assert!(offset <= end && end <= assembly.data.len());
@@ -384,7 +421,9 @@ impl Decoder {
         if assembly.total != Some(assembly.ranges.peek_front()) {
             return None;
         }
-        Some(self.fragments.remove(&key)?.data)
+        let assembly = self.fragments.remove(&key)?;
+        assembly.lease.complete(now);
+        Some(assembly.data)
     }
 }
 

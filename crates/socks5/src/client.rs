@@ -89,7 +89,7 @@ impl p::Client for Client {
                                     });
                                     if matches!(
                                         result,
-                                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+                                        Err(kotoconn_protocol::queue::Error::Closed)
                                     ) {
                                         return Ok(());
                                     }

@@ -28,8 +28,9 @@ When changing coverage, see [run.py](run.py) for scenarios and
 [traffic.py](traffic.py) for traffic assertions and sing-box limitations.
 
 Linux TUN tests run the real CLI against the kernel TCP/IP stack in a separate
-network namespace. They cover IPv4/IPv6, fragmented UDP, concurrent TCP, half-close,
-server-first traffic, malformed packets and device cleanup on shutdown:
+network namespace. They cover IPv4/IPv6, fragmented UDP, concurrent TCP/UDP
+connections, half-close, server-first traffic, malformed packets and device
+cleanup on shutdown:
 
 ```sh
 cargo build -p kotoconn-cli
