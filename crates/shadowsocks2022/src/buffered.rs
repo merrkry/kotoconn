@@ -11,6 +11,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 /// length when that frame finishes. Tokio's copy can grow that input meanwhile.
 /// Retain the original input until the write completes, without delaying writes
 /// until flush. A retry may append bytes, but must preserve the pending prefix.
+///
+/// Upstream issue: <https://github.com/shadowsocks/shadowsocks-rust/issues/2175>.
 pub(super) struct Buffered<S> {
     stream: S,
     pending: Option<Vec<u8>>,
