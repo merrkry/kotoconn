@@ -2,6 +2,8 @@ name: Checks
 
 on:
   push:
+    branches:
+      - master
   pull_request:
   workflow_dispatch:
 
@@ -32,7 +34,7 @@ jobs:
           version: 11.25.0
       - uses: actions/setup-node@v6
         with:
-          node-version: '24'
+          node-version: "24"
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
       - name: Install TypeScript dependencies
