@@ -1,4 +1,5 @@
 //! Single-user Shadowsocks 2022 AES-128-GCM adapters.
+mod buffered;
 mod client;
 mod server;
 mod tcp;
