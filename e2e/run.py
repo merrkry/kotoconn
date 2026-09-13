@@ -12,6 +12,8 @@ import time
 import uuid
 from pathlib import Path
 
+from lifecycle import has_event
+
 LOGGER = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent
@@ -136,11 +138,16 @@ class Scenario:
             )
         return result
 
-    def ready(self, service, marker):
+    def ready(self, service):
         deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
-            logs = self.compose("logs", "--no-color", service).stdout
-            if marker in logs:
+            logs = self.compose("logs", "--no-color", "--no-log-prefix", service).stdout
+            ready = (
+                has_event(logs.splitlines(), "daemon_ready")
+                if service in ("kotoconn", "gateway")
+                else "sing-box started" in logs
+            )
+            if ready:
                 return
             status = self.compose("ps", "--all", "--format", "json", service).stdout
             # Docker Compose emits either a JSON array or one object per line.
@@ -157,7 +164,7 @@ class Scenario:
                 raise RuntimeError(
                     f"{self.name}: {service} exited before readiness:\n{logs}"
                 )
-            # Poll external state; readiness is established only by the marker.
+            # Poll external state; readiness is established by the startup event.
             time.sleep(0.1)
         raise TimeoutError(f"{self.name}: {service} did not become ready")
 
@@ -222,12 +229,7 @@ class Scenario:
             )
             for service in services:
                 self.compose("up", "-d", service)
-                self.ready(
-                    service,
-                    "Daemon ready:"
-                    if service in ("kotoconn", "gateway")
-                    else "sing-box started",
-                )
+                self.ready(service)
             for transport in ("tcp", "udp"):
                 if transport == "udp" and self.suite == "http":
                     continue  # HTTP CONNECT has no UDP support.
@@ -280,8 +282,8 @@ class Scenario:
                 ("kotoconn", "gateway") if self.suite == "nested" else ("kotoconn",)
             ):
                 self.compose("stop", "-t", "8", service)
-                logs = self.compose("logs", "--no-color", service).stdout
-                if "Daemon stopped." not in logs:
+                logs = self.compose("logs", "--no-color", "--no-log-prefix", service).stdout
+                if not has_event(logs.splitlines(), "daemon_stopped"):
                     raise AssertionError(f"{service} did not shut down cleanly")
                 container = self.compose(
                     "ps", "--all", "--quiet", service

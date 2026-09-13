@@ -1,13 +1,22 @@
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use kotoconn_daemon::{Daemon, Shutdown};
-use std::{path::PathBuf, time::Duration};
+use std::{io::IsTerminal, path::PathBuf, time::Duration};
 
 #[derive(Parser)]
 #[command(name = "kotoconn", version, about = "Programmable proxy daemon")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Log output format on stderr; RUST_LOG controls filtering.
+    #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
+    log_format: LogFormat,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum LogFormat {
+    Text,
+    Json,
 }
 
 #[derive(Subcommand)]
@@ -23,8 +32,23 @@ enum Command {
     },
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<std::process::ExitCode> {
     let cli = Cli::parse();
+    init_logging(cli.log_format)?;
+
+    let result = execute(cli);
+    if let Err(error) = &result {
+        tracing::error!(event = "daemon_failed", error = %format_args!("{error:#}"), "daemon failed");
+    }
+
+    Ok(if result.is_ok() {
+        std::process::ExitCode::SUCCESS
+    } else {
+        std::process::ExitCode::FAILURE
+    })
+}
+
+fn execute(cli: Cli) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -32,10 +56,29 @@ fn main() -> Result<()> {
     // The daemon already drained or cancelled its work. OS resolver calls may be
     // uncancellable; they must not extend the shutdown deadline during runtime drop.
     runtime.shutdown_background();
+
     result
 }
 
-async fn run(Cli { command }: Cli) -> Result<()> {
+fn init_logging(format: LogFormat) -> Result<()> {
+    let filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(tracing::level_filters::LevelFilter::INFO.into())
+        .from_env()
+        .context("invalid RUST_LOG filter")?;
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr);
+
+    match format {
+        LogFormat::Text => subscriber
+            .with_ansi(std::io::stderr().is_terminal())
+            .try_init(),
+        LogFormat::Json => subscriber.json().try_init(),
+    }
+    .map_err(|error| anyhow::anyhow!("initialize logging: {error}"))
+}
+
+async fn run(Cli { command, .. }: Cli) -> Result<()> {
     match command {
         Command::Run {
             config,
@@ -52,16 +95,17 @@ async fn run(Cli { command }: Cli) -> Result<()> {
                 }
                 result = Daemon::start(config, Duration::from_secs(shutdown_timeout)) => result?,
             };
-            eprintln!(
-                "Daemon ready: {} inbounds, {} dialers.",
-                daemon.policy().config().inbounds.len(),
-                daemon.policy().config().dialers.len()
+            tracing::info!(
+                event = "daemon_ready",
+                inbounds = daemon.policy().config().inbounds.len(),
+                dialers = daemon.policy().config().dialers.len(),
+                "daemon ready"
             );
 
             tokio::select! {
                 result = &mut signal => {
                     daemon.stop();
-                    eprintln!("Daemon stopping.");
+                    tracing::info!(event = "daemon_stopping", "daemon stopping");
                     // Even a signal registration error must finish cleanup.
                     let shutdown = daemon.wait().await?;
                     result?;
@@ -74,7 +118,7 @@ async fn run(Cli { command }: Cli) -> Result<()> {
                     bail!("policy worker stopped unexpectedly");
                 }
             }
-            eprintln!("Daemon stopped.");
+            tracing::info!(event = "daemon_stopped", "daemon stopped");
         }
     }
     Ok(())

@@ -15,6 +15,7 @@ use std::{
     sync::Arc,
 };
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
+use tracing::Instrument;
 
 pub(crate) struct Network {
     pub addresses: HashMap<InboundId, SocketAddr>,
@@ -86,22 +87,27 @@ impl Network {
                 addresses.insert(*id, *address);
             }
             inbound_addresses.insert(*id, server.address.clone());
-            bound.push(server);
+            tracing::info!(inbound_id = id.0.get(), address = ?server.address, "inbound bound");
+            bound.push((*id, server));
         }
 
         let (failed, failure) = tokio::sync::watch::channel(None);
-        for server in bound {
+        for (id, server) in bound {
             let failed = failed.clone();
             let stop = stopping.clone();
             let control = scope.clone();
-            scope.spawn(async move {
-                let result = server.run.await;
-                if let Err(error) = &result {
-                    failed.send_replace(Some(format!("{error:#}")));
-                    stop.cancel();
-                    control.close();
-                }
-                result
+            let span = tracing::info_span!("inbound", inbound_id = id.0.get());
+            span.in_scope(|| {
+                scope.spawn(async move {
+                    let result = server.run.await;
+                    if let Err(error) = &result {
+                        tracing::error!(error = %format_args!("{error:#}"), "inbound failed");
+                        failed.send_replace(Some(format!("{error:#}")));
+                        stop.cancel();
+                        control.close();
+                    }
+                    result
+                })
             })?;
         }
 
@@ -220,40 +226,63 @@ impl p::Handler for SessionHandler {
         mut stream: BoxStream,
         scope: Scope,
     ) -> BoxFuture<'_, Result<()>> {
-        Box::pin(async move {
-            let _registration = self
-                .sessions
-                .register(destination.clone(), TransportProtocol::Tcp, scope.clone())
-                .await?;
+        let span = tracing::info_span!(
+            "session",
+            protocol = "tcp",
+            ?destination,
+            session_id = tracing::field::Empty
+        );
+        Box::pin(
+            async move {
+                let registration = self
+                    .sessions
+                    .register(destination.clone(), TransportProtocol::Tcp, scope.clone())
+                    .await?;
+                tracing::Span::current().record("session_id", registration.id.0);
+                tracing::debug!("session started");
 
-            scope
-                .run(async {
-                    let decision = self
-                        .policy
-                        .route(
-                            self.routing,
-                            Flow {
-                                protocol: TransportProtocol::Tcp,
-                                dest: destination,
-                            },
-                        )
-                        .await?;
-                    let RouteDecision::Route { dialer, target } = decision else {
-                        bail!("TCP session rejected");
-                    };
-                    let client = self.clients.get(&dialer).context("unknown dialer")?;
-                    let control = client.control(TransportProtocol::Tcp);
+                let result = scope
+                    .run(async {
+                        let decision = self
+                            .policy
+                            .route(
+                                self.routing,
+                                Flow {
+                                    protocol: TransportProtocol::Tcp,
+                                    dest: destination,
+                                },
+                            )
+                            .await?;
+                        let RouteDecision::Route { dialer, target } = decision else {
+                            bail!("TCP session rejected");
+                        };
+                        tracing::debug!(dialer_id = dialer.0.get(), ?target, "TCP route selected");
 
-                    control
-                        .run(async {
-                            let mut outbound = client.tcp_scoped(target, scope.clone()).await?;
-                            tokio::io::copy_bidirectional(&mut stream, &mut outbound).await?;
-                            Ok(())
-                        })
-                        .await
-                })
-                .await
-        })
+                        let client = self.clients.get(&dialer).context("unknown dialer")?;
+                        let control = client.control(TransportProtocol::Tcp);
+
+                        control
+                            .run(async {
+                                let mut outbound = client.tcp_scoped(target, scope.clone()).await?;
+                                let (sent_bytes, received_bytes) =
+                                    tokio::io::copy_bidirectional(&mut stream, &mut outbound)
+                                        .await?;
+                                tracing::debug!(sent_bytes, received_bytes, "TCP relay completed");
+                                Ok(())
+                            })
+                            .await
+                    })
+                    .await;
+                if let Err(error) = &result
+                    && !scope.is_closed()
+                {
+                    tracing::warn!(error = %format_args!("{error:#}"), "TCP session failed");
+                }
+                tracing::debug!("session finished");
+                result
+            }
+            .instrument(span),
+        )
     }
 
     fn udp(&self, packets: Datagram) -> BoxFuture<'_, Result<()>> {

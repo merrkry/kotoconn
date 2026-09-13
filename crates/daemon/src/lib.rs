@@ -9,6 +9,7 @@ use tokio::{
     sync::{mpsc, oneshot, watch},
 };
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
+use tracing::Instrument;
 
 mod network;
 mod source;
@@ -55,7 +56,7 @@ enum Command {
 /// Cloneable shared reference. Only owned Rust values cross the JS thread boundary.
 #[derive(Clone)]
 pub struct Policy {
-    commands: mpsc::Sender<Command>,
+    commands: mpsc::Sender<(tracing::Span, Command)>,
     stopping: CancellationToken,
     config: Arc<Config>,
 }
@@ -65,18 +66,21 @@ impl Policy {
         &self.config
     }
 
+    #[tracing::instrument(skip_all, fields(handler_id = id.0.get()), err)]
     pub async fn route(&self, id: RoutingHandlerId, flow: Flow) -> Result<RouteDecision, Error> {
         let (reply, result) = oneshot::channel();
         self.send(Command::Route(id, flow, reply)).await?;
         result.await.map_err(|_| Error::Closed)?
     }
 
+    #[tracing::instrument(skip_all, fields(handler_id = id.0.get(), %name), err)]
     pub async fn resolve(&self, id: ResolveHandlerId, name: String) -> Result<Vec<IpAddr>, Error> {
         let (reply, result) = oneshot::channel();
         self.send(Command::Resolve(id, name, reply)).await?;
         result.await.map_err(|_| Error::Closed)?
     }
 
+    #[tracing::instrument(skip_all, fields(handler_id = id.0.get()), err)]
     pub async fn dns(
         &self,
         id: DnsHandlerId,
@@ -92,7 +96,7 @@ impl Policy {
         tokio::select! {
             biased;
             _ = self.stopping.cancelled() => Err(Error::Closed),
-            result = self.commands.send(command) => result.map_err(|_| Error::Closed),
+            result = self.commands.send((tracing::Span::current(), command)) => result.map_err(|_| Error::Closed),
         }
     }
 }
@@ -161,9 +165,14 @@ impl Daemon {
             _deadline: AbortOnDropHandle::new(deadline),
         };
 
+        // The dedicated worker needs the caller's subscriber as well as its span.
+        let span = tracing::Span::current();
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
         std::thread::Builder::new()
             .name("kotoconn-policy".into())
             .spawn(move || {
+                let _dispatch = tracing::dispatcher::set_default(&dispatch);
+                let _span = span.enter();
                 let result = runtime.block_on(async {
                     let interrupt = force.clone();
 
@@ -291,7 +300,7 @@ impl Drop for Worker {
 
 async fn serve(
     script: &Script,
-    mut commands: mpsc::Receiver<Command>,
+    mut commands: mpsc::Receiver<(tracing::Span, Command)>,
     stopping: CancellationToken,
     force: CancellationToken,
 ) -> Result<Shutdown, Error> {
@@ -320,8 +329,8 @@ async fn serve(
             _ = calls.next(), if !calls.is_empty() => {}
             command = commands.recv(), if !exhausted && calls.len() < CAPACITY => {
                 match command {
-                    Some(command) => {
-                        calls.push(dispatch(script, command));
+                    Some((span, command)) => {
+                        calls.push(dispatch(script, command).instrument(span));
                     }
                     None => exhausted = true,
                 }
@@ -332,6 +341,8 @@ async fn serve(
 }
 
 async fn dispatch(script: &Script, command: Command) {
+    tracing::debug!("dispatching policy call");
+
     match command {
         Command::Route(id, flow, reply) => {
             let _ = reply.send(script.route(id, flow).await.map_err(Into::into));

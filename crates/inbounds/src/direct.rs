@@ -132,7 +132,7 @@ async fn udp(socket: UdpSocket, target: Target, context: ServerContext) -> Resul
                     association.active = tokio::time::Instant::now();
 
                     if let Err(error) = socket.send_to(&packet.payload, peer).await {
-                        eprintln!("direct UDP reply: {error}");
+                        tracing::warn!(error = %format_args!("{error:#}"), "direct UDP reply");
                     }
                 }
             }

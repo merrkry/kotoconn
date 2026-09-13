@@ -94,7 +94,7 @@ impl p::Client for Client {
                                         return Ok(());
                                     }
                                 },
-                                Err(error) => eprintln!("SOCKS UDP drop: {error}"),
+                                Err(error) => tracing::warn!(error = %format_args!("{error:#}"), "SOCKS UDP drop"),
                             }
                         }
                     }

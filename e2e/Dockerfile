@@ -19,4 +19,4 @@ RUN cargo build --locked -p kotoconn-cli
 FROM docker.io/library/debian:bookworm-slim@sha256:5ae3c39ebd15e229dcedd5cee596b2497182493d41ff162e824ba13fc1b2b867
 COPY --from=build /src/target/debug/kotoconn /usr/local/bin/kotoconn
 ENTRYPOINT ["kotoconn"]
-CMD ["run", "--config", "/config/main.ts", "--shutdown-timeout", "3"]
+CMD ["--log-format", "json", "run", "--config", "/config/main.ts", "--shutdown-timeout", "3"]

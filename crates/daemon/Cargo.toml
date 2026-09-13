@@ -5,6 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+tracing.workspace = true
 anyhow.workspace = true
 kotoconn-protocol.workspace = true
 kotoconn-inbounds.workspace = true
@@ -17,6 +18,7 @@ thiserror.workspace = true
 futures-util.workspace = true
 
 [dev-dependencies]
+tracing-subscriber.workspace = true
 shadowsocks.workspace = true
 bytes.workspace = true
 fast-socks5.workspace = true

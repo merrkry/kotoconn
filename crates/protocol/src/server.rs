@@ -65,7 +65,11 @@ where
 
                 let scope = context.scope.child();
                 let work = accept(Box::pin(stream), peer, local, scope.clone());
-                scope.spawn(async move { let _permit = permit; work.await })?;
+                let span = tracing::info_span!("connection", %peer, %local);
+                span.in_scope(|| scope.spawn(async move {
+                    let _permit = permit;
+                    work.await
+                }))?;
             }
         }
     }

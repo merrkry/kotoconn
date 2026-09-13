@@ -25,6 +25,7 @@ impl Carrier for System {
     fn tcp_scoped(&self, target: Target, caller: Scope) -> BoxFuture<'_, Result<BoxStream>> {
         Box::pin(async move {
             let address = socket_addr(&target)?;
+            tracing::debug!(%address, "connecting TCP socket");
             stream_task(self.scope.child().tracked_by(&caller), async move {
                 Ok(Box::pin(TcpStream::connect(address).await?) as BoxStream)
             })
@@ -42,6 +43,7 @@ impl Carrier for System {
             })
             .await?;
             socket.connect(peer).await?;
+            tracing::debug!(%peer, "connected UDP socket");
 
             let scope = self.scope.child().tracked_by(&caller);
             let (user, mut driver) = packet_pair(scope.clone());
@@ -60,7 +62,7 @@ impl Carrier for System {
                                             payload: buffer[..n].to_vec().into(),
                                         });
                                 }
-                                Err(error) => eprintln!("UDP receive: {error}"),
+                                Err(error) => tracing::warn!(error = %format_args!("{error:#}"), "UDP receive"),
                             }
                         }
                         packet = driver.rx.recv() => {
@@ -71,7 +73,7 @@ impl Carrier for System {
                             }
 
                             if let Err(error) = socket.send(&packet.payload).await {
-                                eprintln!("UDP send: {error}");
+                                tracing::warn!(error = %format_args!("{error:#}"), "UDP send");
                             }
                         }
                     }

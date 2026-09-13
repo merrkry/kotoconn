@@ -36,6 +36,8 @@ rquickjs = { version = "0.13", features = ["macro", "loader", "futures"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = "1"
 futures-util = "0.3.34"
 thiserror = "2.0.20"

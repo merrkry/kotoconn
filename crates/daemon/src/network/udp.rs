@@ -58,6 +58,7 @@ pub(super) async fn association(handler: SessionHandler, mut packets: Datagram) 
                     let destination = target.clone();
                     let control = scope.clone();
 
+                    let span = tracing::info_span!("session", protocol = "udp", ?destination, session_id = tracing::field::Empty);
                     scope.spawn(async move {
                         let result =
                             control
@@ -69,11 +70,17 @@ pub(super) async fn association(handler: SessionHandler, mut packets: Datagram) 
                                     control.clone(),
                                 ))
                                 .await;
+                        if let Err(error) = &result
+                            && !control.is_closed()
+                        {
+                            tracing::warn!(error = %format_args!("{error:#}"), "UDP session failed");
+                        }
+                        tracing::debug!("session finished");
                         control.close();
                         let _ = done.send((destination, generation));
 
                         result
-                    })?;
+                    }.instrument(span))?;
 
                     sessions.insert(target.clone(), Entry { tx, scope, generation });
                 }
@@ -91,10 +98,12 @@ async fn session(
     replies: mpsc::Sender<Packet>,
     scope: Scope,
 ) -> Result<()> {
-    let _registration = handler
+    let registration = handler
         .sessions
         .register(destination.clone(), TransportProtocol::Udp, scope.clone())
         .await?;
+    tracing::Span::current().record("session_id", registration.id.0);
+    tracing::debug!("session started");
 
     let (activity, last_activity) = watch::channel(Instant::now());
     let work = async {
@@ -112,6 +121,8 @@ async fn session(
         let RouteDecision::Udp { dialer } = decision else {
             bail!("UDP session rejected");
         };
+
+        tracing::debug!(dialer_id = dialer.0.get(), "UDP route selected");
 
         let client = handler.clients.get(&dialer).context("unknown dialer")?;
 
@@ -141,7 +152,10 @@ async fn session(
     };
     tokio::select! {
         biased;
-        _ = until_idle(handler.idle, last_activity) => Ok(()),
+        _ = until_idle(handler.idle, last_activity) => {
+            tracing::debug!("UDP session idle timeout");
+            Ok(())
+        },
         result = work => result,
     }
 }

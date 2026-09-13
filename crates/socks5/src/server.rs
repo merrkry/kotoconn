@@ -91,7 +91,7 @@ impl p::Server for Server {
                                                     && let Err(error) =
                                                         socket.send_to(&wire, client).await
                                                 {
-                                                    eprintln!("SOCKS UDP reply: {error}");
+                                                    tracing::warn!(error = %format_args!("{error:#}"), "SOCKS UDP reply");
                                                 }
                                             }
                                         }
