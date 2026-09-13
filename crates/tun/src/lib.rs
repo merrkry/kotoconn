@@ -1,5 +1,4 @@
-//! Linux TUN packet processing and independently driven smoltcp connections.
-mod device;
+//! Linux TUN packet processing and worker-owned TCP connections.
 mod endpoint;
 mod linux;
 #[cfg(target_os = "linux")]
@@ -8,6 +7,8 @@ mod packet;
 mod reassembly;
 mod storage;
 mod tcp;
+mod tcp_storage;
+mod transmit;
 mod udp;
 mod worker;
 

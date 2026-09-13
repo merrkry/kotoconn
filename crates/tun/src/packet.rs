@@ -33,6 +33,7 @@ impl Packet<'_> {
             }
     }
 
+    #[cfg(test)]
     pub fn encode(&self) -> Vec<u8> {
         let mut data = Vec::with_capacity(self.ip.buffer_len());
         // Initialize only the header; the payload is copied in full below.
@@ -41,18 +42,6 @@ impl Packet<'_> {
         self.ip.emit(&mut data, &ChecksumCapabilities::default());
         data.extend_from_slice(&self.payload);
         data
-    }
-
-    pub fn emit(&self, data: &mut [u8]) {
-        // SAFETY: Decoders normalize payload length, and encoders derive it from
-        // their transport data. Callers allocate the complete IP packet length.
-        debug_assert_eq!(
-            self.ip.buffer_len(),
-            self.ip.header_len() + self.payload.len()
-        );
-        debug_assert_eq!(data.len(), self.ip.buffer_len());
-        self.ip.emit(&mut *data, &ChecksumCapabilities::default());
-        data[self.ip.header_len()..].copy_from_slice(&self.payload);
     }
 
     pub fn tcp(&self) -> Option<(Flow, TcpRepr<'_>)> {

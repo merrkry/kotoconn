@@ -1,5 +1,5 @@
 use crate::{
-    device::Transmit,
+    transmit::Transmit,
     udp,
     worker::{self, Shared},
 };
@@ -113,7 +113,7 @@ pub async fn run<R: PacketReceive + 'static, W: PacketSend + 'static>(
 
     let result = async {
         // A worker reports only after observing stop and removing every TCP
-        // driver. No finite connection permit set is needed for graceful drain.
+        // connection. No finite connection permit set is needed for graceful drain.
         let mut remaining = count;
         while remaining > 0 {
             tokio::select! {

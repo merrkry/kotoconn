@@ -1,15 +1,16 @@
 use crate::{
     PacketReceive,
-    device::Transmit,
     packet::{self, Decoder, Flow, Packet, ReassemblyLimits, RouteKey},
-    tcp, udp,
+    tcp,
+    transmit::Transmit,
+    udp,
 };
 use anyhow::Result;
 use bytes::Bytes;
 use kotoconn_protocol::{self as p, Scope, ServerContext, queue};
 use smoltcp::wire::{IpProtocol, TcpControl};
 use std::{
-    collections::{HashMap, hash_map::RandomState},
+    collections::{BTreeMap, HashMap, VecDeque, hash_map::RandomState},
     future::poll_fn,
     hash::BuildHasher,
     sync::Arc,
@@ -80,8 +81,11 @@ impl Drop for Statistics {
 }
 
 struct TcpEntry {
-    packets: queue::Sender<tcp::QueuedPacket>,
+    connection: tcp::Connection,
     generation: u64,
+    deadline: Option<Instant>,
+    blocked: bool,
+    _tracking: p::WorkGuard,
 }
 
 struct UdpEntry {
@@ -99,7 +103,6 @@ impl Drop for UdpEntry {
 
 #[derive(Clone, Copy)]
 enum Protocol {
-    Tcp,
     Udp,
 }
 
@@ -125,6 +128,11 @@ struct Worker {
     udp: HashMap<Flow, UdpEntry>,
     done: mpsc::UnboundedSender<(Protocol, Flow, u64)>,
     output: queue::Sender<Transmit>,
+    ready: mpsc::UnboundedSender<tcp::Ready>,
+    timers: BTreeMap<(Instant, u64), Flow>,
+    blocked: VecDeque<(tcp::Ready, usize)>,
+    pool: crate::tcp_storage::Pool,
+    arena: crate::storage::PacketArena,
     rejector: tcp::Rejector,
     generation: u64,
     stopping: bool,
@@ -132,6 +140,42 @@ struct Worker {
 }
 
 impl Worker {
+    fn drive(&mut self, id: tcp::Ready) {
+        let (flow, generation) = id;
+        let Some(entry) = self
+            .tcp
+            .get_mut(&flow)
+            .filter(|e| e.generation == generation)
+        else {
+            return;
+        };
+        if let Some(at) = entry.deadline.take() {
+            self.timers.remove(&(at, generation));
+        }
+        entry.connection.begin_turn();
+        match entry
+            .connection
+            .poll(Instant::now(), self.stopping, &self.output, &mut self.arena)
+        {
+            tcp::Progress::Idle(deadline) => {
+                entry.deadline = deadline;
+                if let Some(at) = deadline {
+                    self.timers.insert((at, generation), flow);
+                }
+            }
+            tcp::Progress::Again => entry.connection.wake(),
+            tcp::Progress::Blocked(bytes) => {
+                if !entry.blocked {
+                    entry.blocked = true;
+                    self.blocked.push_back((id, bytes));
+                }
+            }
+            tcp::Progress::Closed => {
+                self.tcp.remove(&flow);
+            }
+        }
+    }
+
     fn forward_raw(&mut self, bytes: &[u8], owner: usize) {
         // SAFETY: owner comes from Shared::owner, and receive buffers hold at most 65575 bytes.
         debug_assert!(owner < self.shared.inboxes.len());
@@ -176,10 +220,6 @@ impl Worker {
                     return Ok(());
                 }
 
-                if self.tcp.get(&flow).is_some_and(|e| e.packets.is_closed()) {
-                    self.tcp.remove(&flow);
-                }
-
                 if !self.tcp.contains_key(&flow) {
                     if repr.control != TcpControl::Syn || repr.ack_number.is_some() || self.stopping
                     {
@@ -198,18 +238,19 @@ impl Worker {
                         .generation
                         .checked_add(1)
                         .expect("TUN connection generation exhausted");
-                    let conn = tcp::connection(
+                    let (connection, accepted) = tcp::Connection::new(
                         flow,
                         self.mtu,
-                        self.output.clone(),
-                        self.context.stopping.clone(),
-                    );
+                        self.ready.clone(),
+                        self.generation,
+                        self.pool.clone(),
+                    )?;
                     let session = self.context.scope.child();
+                    let tracking = session.track()?;
                     let handler = self.context.handler.clone();
                     let admission_scope = session.clone();
-
                     session.spawn(async move {
-                        let stream = conn.accepted.await?;
+                        let stream = accepted.await?;
                         handler
                             .tcp(
                                 p::target(flow.destination),
@@ -218,42 +259,30 @@ impl Worker {
                             )
                             .await
                     })?;
-                    // Track FIN/RST cleanup in the session, but only forced listener
-                    // cancellation may interrupt the driver while it sends that cleanup.
-                    let driver_scope = self.context.scope.child().tracked_by(&session);
-                    let completion = Completion {
-                        tx: self.done.clone(),
-                        protocol: Protocol::Tcp,
-                        flow,
-                        generation: self.generation,
-                    };
-
-                    driver_scope.spawn(async move {
-                        let _completion = completion;
-                        if conn.driver.await.is_err() {
-                            session.close();
-                        }
-                        Ok(())
-                    })?;
-
                     self.tcp.insert(
                         flow,
                         TcpEntry {
-                            packets: conn.packets,
+                            connection,
                             generation: self.generation,
+                            deadline: None,
+                            blocked: false,
+                            _tracking: tracking,
                         },
                     );
                 }
 
-                // SAFETY: Only dispatch mutates this map; the flow was admitted above.
-                debug_assert!(self.tcp.contains_key(&flow));
-                let entry = &self.tcp[&flow];
-                match entry.packets.try_reserve(packet.ip.buffer_len()) {
-                    Ok(permit) => permit.send(tcp::QueuedPacket {
-                        bytes: packet.encode(),
-                    }),
-                    Err(_) => self.stats.capacity_drops += 1,
-                }
+                // SAFETY: The flow was admitted above and only this worker mutates the map.
+                self.tcp
+                    .get_mut(&flow)
+                    .expect("admitted TCP flow missing")
+                    .connection
+                    .input(
+                        &packet.ip,
+                        &repr,
+                        Instant::now(),
+                        &self.output,
+                        &mut self.arena,
+                    );
             }
             IpProtocol::Udp if !self.stopping => {
                 let Some((flow, payload)) = packet.udp() else {
@@ -361,6 +390,7 @@ pub(crate) async fn dispatch<R: PacketReceive>(
     output: queue::Sender<Transmit>,
 ) -> Result<()> {
     let (done, mut completed) = mpsc::unbounded_channel();
+    let (ready, mut runnable) = mpsc::unbounded_channel();
     let mut worker = Worker {
         id,
         mtu,
@@ -370,6 +400,11 @@ pub(crate) async fn dispatch<R: PacketReceive>(
         udp: HashMap::new(),
         done,
         output,
+        ready,
+        timers: BTreeMap::new(),
+        blocked: VecDeque::new(),
+        pool: Default::default(),
+        arena: Default::default(),
         rejector: tcp::Rejector::new(mtu),
         generation: 0,
         stopping: false,
@@ -399,19 +434,20 @@ pub(crate) async fn dispatch<R: PacketReceive>(
             turns = 0;
         }
         let expiry = decoder.deadline();
+        let tcp_deadline = worker.timers.first_key_value().map(|(&(at, _), _)| at);
+        let blocked = worker.blocked.front().copied();
+        let writable = worker.output.clone();
         let event = tokio::select! {
-            biased;
             _ = shared.stop.cancelled() => return Ok(()),
             _ = worker.context.stopping.cancelled(), if !worker.stopping => {
                 worker.stopping = true;
                 worker.udp.clear();
+                for entry in worker.tcp.values() { entry.connection.wake(); }
+                worker.pool.trim();
                 continue;
             },
             Some((protocol, flow, generation)) = completed.recv() => {
                 match protocol {
-                    Protocol::Tcp if worker.tcp.get(&flow).is_some_and(|e| e.generation == generation) => {
-                        worker.tcp.remove(&flow);
-                    },
                     Protocol::Udp if worker.udp.get(&flow).is_some_and(|e| e.generation == generation) => {
                         worker.udp.remove(&flow);
                     },
@@ -426,6 +462,30 @@ pub(crate) async fn dispatch<R: PacketReceive>(
                 }
             } => {
                 decoder.expire(Instant::now());
+                continue;
+            },
+            Some(id) = runnable.recv() => {
+                worker.drive(id);
+                continue;
+            },
+            _ = async {
+                match tcp_deadline {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(((at, generation), flow)) = worker.timers.pop_first() {
+                    debug_assert!(at <= Instant::now());
+                    worker.drive((flow, generation));
+                }
+                continue;
+            },
+            permit = writable.reserve(blocked.map_or(0, |(_, bytes)| bytes)), if blocked.is_some() => {
+                drop(permit?);
+                if let Some((id, _)) = worker.blocked.pop_front() {
+                    if let Some(entry) = worker.tcp.get_mut(&id.0).filter(|e| e.generation == id.1) { entry.blocked = false; }
+                    worker.drive(id);
+                }
                 continue;
             },
             event = async {
