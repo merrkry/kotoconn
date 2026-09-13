@@ -1,7 +1,7 @@
 //! TCP payload ownership. The worker owns the index; immutable blocks can move
 //! to/from the application without copying their payload or sharing the socket.
+use crate::pool::Pool;
 use bytes::Bytes;
-use crossbeam_queue::SegQueue;
 use smoltcp::socket::tcp::Buffer;
 use std::{
     collections::BTreeMap,
@@ -10,88 +10,6 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
 };
-
-const CLASSES: usize = 17;
-const CACHED_PER_CLASS: usize = 32;
-
-#[derive(Default)]
-struct Class {
-    blocks: SegQueue<Vec<u8>>,
-    cached: AtomicUsize,
-}
-
-/// Free blocks are a bounded cache, never an admission limit for live data.
-#[derive(Clone)]
-pub(crate) struct Pool(Arc<[Class; CLASSES]>);
-
-impl Default for Pool {
-    fn default() -> Self {
-        Self(Arc::new(std::array::from_fn(|_| Class::default())))
-    }
-}
-
-struct Allocation {
-    bytes: Vec<u8>,
-    pool: Pool,
-    class: usize,
-}
-
-impl AsRef<[u8]> for Allocation {
-    fn as_ref(&self) -> &[u8] {
-        &self.bytes
-    }
-}
-
-impl Drop for Allocation {
-    fn drop(&mut self) {
-        let class = &self.pool.0[self.class];
-        if class
-            .cached
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                (n < CACHED_PER_CLASS).then_some(n + 1)
-            })
-            .is_ok()
-        {
-            class.blocks.push(std::mem::take(&mut self.bytes));
-        }
-    }
-}
-
-impl Pool {
-    pub fn copy(&self, bytes: &[u8]) -> Bytes {
-        self.fill(bytes.len(), |out| out.copy_from_slice(bytes))
-    }
-
-    pub fn fill(&self, length: usize, fill: impl FnOnce(&mut [u8])) -> Bytes {
-        // SAFETY: Callers pass at most one IP-sized segment or one application chunk.
-        assert!(length <= 65536);
-        let capacity = length.max(256).next_power_of_two();
-        let index = capacity.trailing_zeros() as usize;
-        let class = &self.0[index];
-        let mut bytes = match class.blocks.pop() {
-            Some(bytes) => {
-                class.cached.fetch_sub(1, Ordering::Relaxed);
-                bytes
-            }
-            None => Vec::with_capacity(capacity),
-        };
-        bytes.resize(length, 0);
-        fill(&mut bytes);
-        Bytes::from_owner(Allocation {
-            bytes,
-            pool: self.clone(),
-            class: index,
-        })
-    }
-
-    pub fn trim(&self) {
-        for class in self.0.iter() {
-            while class.blocks.pop().is_some() {
-                class.cached.fetch_sub(1, Ordering::Relaxed);
-            }
-        }
-    }
-}
 
 /// Sparse logical offsets preserve out-of-order data without allocating holes.
 /// A block is immutable after insertion; replacing overlaps splits its views.
@@ -104,6 +22,7 @@ pub(crate) struct Storage {
     pub released: Arc<AtomicUsize>,
     tx: bool,
     pool: Pool,
+    scratch: Bytes,
 }
 
 impl Storage {
@@ -123,6 +42,7 @@ impl Storage {
             released,
             tx,
             pool,
+            scratch: Bytes::new(),
         }
     }
 
@@ -242,6 +162,25 @@ impl Buffer for Storage {
         &bytes[local..bytes.len().min(local + size.min(self.length - offset))]
     }
 
+    fn get_segment(&mut self, offset: usize, size: usize) -> &[u8] {
+        let wanted = size.min(self.length.saturating_sub(offset));
+        if self.get_allocated(offset, wanted).len() == wanted {
+            return self.get_allocated(offset, wanted);
+        }
+        // Only a segment crossing a block boundary needs gathering. Full MSS
+        // packets let the Linux writer keep coalescing across application writes.
+        self.scratch = self.pool.fill(wanted, |out| {
+            let mut n = 0;
+            while n < wanted {
+                let bytes = self.get_allocated(offset + n, wanted - n);
+                debug_assert!(!bytes.is_empty());
+                out[n..n + bytes.len()].copy_from_slice(bytes);
+                n += bytes.len();
+            }
+        });
+        &self.scratch
+    }
+
     fn read_allocated(&mut self, offset: usize, out: &mut [u8]) -> usize {
         let mut n = 0;
         while n < out.len() {
@@ -283,6 +222,9 @@ impl Buffer for Storage {
         }
         self.head = end;
         self.length -= count;
+        if self.length == 0 {
+            self.scratch = Bytes::new();
+        }
         if self.tx && count != 0 {
             let old = self.outstanding.fetch_sub(count, Ordering::AcqRel);
             debug_assert!(old >= count);
@@ -328,6 +270,18 @@ mod tests {
     }
 
     #[test]
+    fn wire_segments_cross_application_blocks_without_shortening() {
+        let mut tx = storage(true);
+        tx.push(tx.pool.copy(&[1; 8192]));
+        tx.push(tx.pool.copy(&[2; 8192]));
+        let segment = tx.get_segment(8000, 1460);
+        assert_eq!(segment.len(), 1460);
+        assert_eq!(&segment[..192], &[1; 192]);
+        assert_eq!(&segment[192..], &[2; 1268]);
+        assert_eq!(tx.get_allocated(8000, 1460), &[1; 192]);
+    }
+
+    #[test]
     fn immutable_transmit_blocks_survive_partial_ack_without_copying() {
         let mut tx = storage(true);
         let bytes = tx.pool.copy(b"abcdefgh");
@@ -343,23 +297,5 @@ mod tests {
         tx.dequeue_allocated(5);
         assert!(tx.blocks.is_empty());
         assert_eq!(tx.released.load(Ordering::Acquire), 8);
-    }
-
-    #[test]
-    fn pool_reuses_storage_only_after_last_view_is_dropped() {
-        let pool = Pool::default();
-        let bytes = pool.copy(&[7; 1000]);
-        let view = bytes.slice(123..456);
-        let ptr = bytes.as_ptr();
-        drop(bytes);
-        assert_eq!(pool.0[10].cached.load(Ordering::Relaxed), 0);
-        assert_eq!(view, [7; 333][..]);
-        drop(view);
-        let reused = pool.copy(&[9; 1000]);
-        assert_eq!(reused.as_ptr(), ptr);
-        assert_eq!(reused, [9; 1000][..]);
-        drop(reused);
-        pool.trim();
-        assert_eq!(pool.0[10].cached.load(Ordering::Relaxed), 0);
     }
 }

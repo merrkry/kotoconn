@@ -16,7 +16,7 @@ futures-util.workspace = true
 kotoconn-config.workspace = true
 kotoconn-protocol.workspace = true
 rand.workspace = true
-smoltcp = { workspace = true, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-tcp-cubic", "assembler-max-segment-count-32"] }
+smoltcp = { workspace = true, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-tcp-cubic", "assembler-max-segment-count-32", "segmentation-offload"] }
 tokio = { workspace = true, features = ["io-util", "sync", "time"] }
 tokio-util = { workspace = true, features = ["rt"] }
 tracing.workspace = true

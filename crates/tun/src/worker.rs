@@ -101,37 +101,31 @@ impl Drop for UdpEntry {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Protocol {
-    Udp,
-}
-
 struct Completion {
-    tx: mpsc::UnboundedSender<(Protocol, Flow, u64)>,
-    protocol: Protocol,
+    tx: mpsc::UnboundedSender<(Flow, u64)>,
     flow: Flow,
     generation: u64,
 }
 
 impl Drop for Completion {
     fn drop(&mut self) {
-        let _ = self.tx.send((self.protocol, self.flow, self.generation));
+        let _ = self.tx.send((self.flow, self.generation));
     }
 }
 
 struct Worker {
     id: usize,
-    mtu: usize,
+    link: tcp::Link,
     context: ServerContext,
     shared: Arc<Shared>,
     tcp: HashMap<Flow, TcpEntry>,
     udp: HashMap<Flow, UdpEntry>,
-    done: mpsc::UnboundedSender<(Protocol, Flow, u64)>,
+    done: mpsc::UnboundedSender<(Flow, u64)>,
     output: queue::Sender<Transmit>,
     ready: mpsc::UnboundedSender<tcp::Ready>,
     timers: BTreeMap<(Instant, u64), Flow>,
     blocked: VecDeque<(tcp::Ready, usize)>,
-    pool: crate::tcp_storage::Pool,
+    pool: crate::pool::Pool,
     arena: crate::storage::PacketArena,
     rejector: tcp::Rejector,
     generation: u64,
@@ -240,7 +234,7 @@ impl Worker {
                         .expect("TUN connection generation exhausted");
                     let (connection, accepted) = tcp::Connection::new(
                         flow,
-                        self.mtu,
+                        self.link,
                         self.ready.clone(),
                         self.generation,
                         self.pool.clone(),
@@ -320,7 +314,6 @@ impl Worker {
                     let output = self.output.clone();
                     let completion = Completion {
                         tx: self.done.clone(),
-                        protocol: Protocol::Udp,
                         flow,
                         generation: self.generation,
                     };
@@ -385,15 +378,16 @@ pub(crate) async fn dispatch<R: PacketReceive>(
     mut device: R,
     mut inbox: queue::Receiver<Forwarded>,
     shared: Arc<Shared>,
-    mtu: usize,
+    link: tcp::Link,
     context: ServerContext,
     output: queue::Sender<Transmit>,
 ) -> Result<()> {
     let (done, mut completed) = mpsc::unbounded_channel();
     let (ready, mut runnable) = mpsc::unbounded_channel();
+    let pool = crate::pool::Pool::default();
     let mut worker = Worker {
         id,
-        mtu,
+        link,
         context,
         shared: shared.clone(),
         tcp: HashMap::new(),
@@ -403,9 +397,9 @@ pub(crate) async fn dispatch<R: PacketReceive>(
         ready,
         timers: BTreeMap::new(),
         blocked: VecDeque::new(),
-        pool: Default::default(),
-        arena: Default::default(),
-        rejector: tcp::Rejector::new(mtu),
+        pool: pool.clone(),
+        arena: crate::storage::PacketArena::with_pool(pool),
+        rejector: tcp::Rejector::new(link.mtu),
         generation: 0,
         stopping: false,
         stats: Statistics {
@@ -442,16 +436,15 @@ pub(crate) async fn dispatch<R: PacketReceive>(
             _ = worker.context.stopping.cancelled(), if !worker.stopping => {
                 worker.stopping = true;
                 worker.udp.clear();
-                for entry in worker.tcp.values() { entry.connection.wake(); }
+                for entry in worker.tcp.values() {
+                    entry.connection.wake();
+                }
                 worker.pool.trim();
                 continue;
             },
-            Some((protocol, flow, generation)) = completed.recv() => {
-                match protocol {
-                    Protocol::Udp if worker.udp.get(&flow).is_some_and(|e| e.generation == generation) => {
-                        worker.udp.remove(&flow);
-                    },
-                    _ => {},
+            Some((flow, generation)) = completed.recv() => {
+                if worker.udp.get(&flow).is_some_and(|e| e.generation == generation) {
+                    worker.udp.remove(&flow);
                 }
                 continue;
             },
@@ -483,7 +476,9 @@ pub(crate) async fn dispatch<R: PacketReceive>(
             permit = writable.reserve(blocked.map_or(0, |(_, bytes)| bytes)), if blocked.is_some() => {
                 drop(permit?);
                 if let Some((id, _)) = worker.blocked.pop_front() {
-                    if let Some(entry) = worker.tcp.get_mut(&id.0).filter(|e| e.generation == id.1) { entry.blocked = false; }
+                    if let Some(entry) = worker.tcp.get_mut(&id.0).filter(|e| e.generation == id.1) {
+                        entry.blocked = false;
+                    }
                     worker.drive(id);
                 }
                 continue;

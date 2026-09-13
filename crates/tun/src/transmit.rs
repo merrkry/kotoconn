@@ -7,6 +7,10 @@ use std::net::SocketAddr;
 #[derive(Debug)]
 pub(crate) enum Transmit {
     Packet(Bytes),
+    TcpGso {
+        packet: Bytes,
+        segment_size: u16,
+    },
     Datagram {
         source: SocketAddr,
         destination: SocketAddr,
@@ -17,7 +21,7 @@ pub(crate) enum Transmit {
 impl Transmit {
     pub(crate) fn size(&self) -> usize {
         match self {
-            Self::Packet(packet) => storage::charge(packet.len()),
+            Self::Packet(packet) | Self::TcpGso { packet, .. } => storage::charge(packet.len()),
             Self::Datagram { payload, .. } => payload.len() + 48,
         }
     }

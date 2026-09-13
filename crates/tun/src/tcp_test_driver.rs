@@ -18,7 +18,8 @@ pub(crate) fn connection(
     stopping: tokio_util::sync::CancellationToken,
 ) -> TestConnection {
     let (ready, mut runnable) = mpsc::unbounded_channel();
-    let (mut conn, accepted) = Connection::new(flow, mtu, ready, 1, Pool::default()).unwrap();
+    let (mut conn, accepted) =
+        Connection::new(flow, Link { mtu, gso: false }, ready, 1, Pool::default()).unwrap();
     let (packets, mut input) = queue::channel(INITIAL, |packet: &QueuedPacket| packet.bytes.len());
     let driver = Box::pin(async move {
         let mut arena = PacketArena::default();

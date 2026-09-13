@@ -11,7 +11,7 @@ The fork exposes direct TCP driving, a small host-context interface, and replace
 Test the fork separately because it is excluded from the parent workspace:
 
 ```sh
-cargo test --manifest-path external/smoltcp/Cargo.toml --lib --no-default-features --features std,medium-ip,proto-ipv4,proto-ipv6,socket-tcp,socket-tcp-cubic,assembler-max-segment-count-32
+cargo test --manifest-path external/smoltcp/Cargo.toml --lib --no-default-features --features std,medium-ip,proto-ipv4,proto-ipv6,socket-tcp,socket-tcp-cubic,assembler-max-segment-count-32,segmentation-offload
 ```
 
 Commit and push fork changes before updating the parent submodule pointer. Retain upstream history and keep fork changes in focused commits.

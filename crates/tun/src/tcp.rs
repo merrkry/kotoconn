@@ -2,8 +2,9 @@
 //! payload blocks and consumption notifications without locking the socket.
 use crate::{
     packet::{Flow, Packet},
+    pool::Pool,
     storage::PacketArena,
-    tcp_storage::{Pool, Storage},
+    tcp_storage::Storage,
     transmit::Transmit,
 };
 use bytes::{Buf, Bytes};
@@ -39,6 +40,12 @@ use tokio::{
 const INITIAL: usize = 128 * 1024;
 const MAX_WINDOW: usize = (u16::MAX as usize) << 7;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy)]
+pub(crate) struct Link {
+    pub mtu: usize,
+    pub gso: bool,
+}
 
 pub(crate) type Ready = (Flow, u64);
 
@@ -225,6 +232,7 @@ struct Host {
     now: smoltcp::time::Instant,
     mtu: usize,
     local: IpAddress,
+    gso: bool,
 }
 
 impl tcp::TcpContext for Host {
@@ -238,6 +246,18 @@ impl tcp::TcpContext for Host {
 
     fn ip_mtu(&self) -> usize {
         self.mtu
+    }
+
+    fn segmentation_caps(&self) -> smoltcp::phy::SegmentationCapabilities {
+        let capacity = if self.gso {
+            std::num::NonZeroUsize::new(65535)
+        } else {
+            None
+        };
+        let mut caps = smoltcp::phy::SegmentationCapabilities::default();
+        caps.tcpv4 = capacity;
+        caps.tcpv6 = capacity;
+        caps
     }
 
     fn has_ip_addr(&self, address: IpAddress) -> bool {
@@ -271,7 +291,7 @@ pub(crate) enum Progress {
 impl Connection {
     pub fn new(
         flow: Flow,
-        mtu: usize,
+        link: Link,
         ready: mpsc::UnboundedSender<Ready>,
         generation: u64,
         pool: Pool,
@@ -338,7 +358,8 @@ impl Connection {
                 admission: Some((sender, stream)),
                 host: Host {
                     now: smoltcp::time::Instant::ZERO,
-                    mtu,
+                    mtu: link.mtu,
+                    gso: link.gso,
                     local: flow.destination.ip().into(),
                 },
                 epoch: Instant::now(),
@@ -393,7 +414,7 @@ impl Connection {
         if let Some((ip, repr)) = self.socket.process(&mut self.host, ip, repr) {
             // Immediate ACKs may be lost like network packets. Data ownership is
             // unaffected; the peer retries and TCP still schedules later ACKs.
-            let _ = emit(arena, output, ip, repr);
+            let _ = emit(arena, output, ip, repr, None);
         }
         if self.socket.state() == State::TimeWait
             || (previous == State::LastAck
@@ -484,8 +505,8 @@ impl Connection {
         }
         for _ in 0..32 {
             let mut sent = false;
-            let result = self.socket.dispatch(&mut self.host, |_, _, (ip, repr)| {
-                let result = emit(arena, output, ip, repr);
+            let result = self.socket.dispatch(&mut self.host, |_, meta, (ip, repr)| {
+                let result = emit(arena, output, ip, repr, meta.segmentation_offload_size);
                 sent = result.is_ok();
                 result
             });
@@ -537,21 +558,43 @@ fn emit(
     output: &queue::Sender<Transmit>,
     ip: IpRepr,
     repr: TcpRepr<'_>,
+    segment_size: Option<std::num::NonZeroU16>,
 ) -> Result<(), (queue::Error, usize)> {
     let cost = crate::storage::charge(ip.buffer_len());
     let permit = output.try_reserve(cost).map_err(|error| (error, cost))?;
     let (_, packet) = arena.encode(ip.buffer_len(), |bytes| {
         let (header, payload) = bytes.split_at_mut(ip.header_len());
         ip.emit(header, &ChecksumCapabilities::default());
+        let mut checksums = ChecksumCapabilities::default();
+        if segment_size.is_some() {
+            checksums.tcp = smoltcp::phy::Checksum::Rx;
+        }
         // SAFETY: The arena allocated the complete IP/TCP packet length.
         repr.emit(
-            &mut TcpPacket::new_unchecked(payload),
+            &mut TcpPacket::new_unchecked(&mut *payload),
             &ip.src_addr(),
             &ip.dst_addr(),
-            &ChecksumCapabilities::default(),
+            &checksums,
         );
+        if segment_size.is_some() {
+            // CHECKSUM_PARTIAL carries the folded pseudo-header sum, without
+            // complement. Linux completes the TCP checksum and segmentation.
+            let seed = checksum::pseudo_header(
+                &ip.src_addr(),
+                &ip.dst_addr(),
+                IpProtocol::Tcp,
+                repr.buffer_len() as u32,
+            );
+            TcpPacket::new_unchecked(payload).set_checksum(seed);
+        }
     });
-    permit.send(Transmit::Packet(packet));
+    permit.send(match segment_size {
+        Some(size) => Transmit::TcpGso {
+            packet,
+            segment_size: size.get(),
+        },
+        None => Transmit::Packet(packet),
+    });
     Ok(())
 }
 
@@ -578,7 +621,7 @@ impl Rejector {
             return Ok(());
         }
         let (ip, repr) = tcp::Socket::<tcp::SocketBuffer>::rst_reply(&packet.ip, &repr);
-        emit(&mut self.arena, output, ip, repr).map_err(|(error, _)| error)
+        emit(&mut self.arena, output, ip, repr, None).map_err(|(error, _)| error)
     }
 }
 
@@ -593,6 +636,77 @@ mod tests {
     use super::*;
     use crate::packet::Decoder;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_gso_preserves_dual_stack_payload_sequence_and_checksums() {
+        for ipv6 in [false, true] {
+            let source: IpAddress = if ipv6 { "fd00::1" } else { "192.0.2.1" }.parse().unwrap();
+            let destination: IpAddress =
+                if ipv6 { "fd00::2" } else { "192.0.2.2" }.parse().unwrap();
+            let data: Vec<u8> = (0..60001).map(|n| (n % 251) as u8).collect();
+            let repr = TcpRepr {
+                src_port: 443,
+                dst_port: 12345,
+                control: TcpControl::Psh,
+                seq_number: TcpSeqNumber(100),
+                ack_number: Some(TcpSeqNumber(77)),
+                window_len: 1234,
+                window_scale: None,
+                max_seg_size: None,
+                sack_permitted: false,
+                sack_ranges: [None; 3],
+                timestamp: None,
+                payload: &data,
+            };
+            let ip = IpRepr::new(source, destination, IpProtocol::Tcp, repr.buffer_len(), 64);
+            let (output, mut input) = queue::channel(INITIAL, Transmit::size);
+            emit(
+                &mut PacketArena::default(),
+                &output,
+                ip,
+                repr,
+                std::num::NonZeroU16::new(1200),
+            )
+            .unwrap();
+            let Transmit::TcpGso {
+                packet,
+                segment_size,
+            } = input.try_recv().unwrap()
+            else {
+                panic!()
+            };
+            let header = crate::offload::tcp_gso_header(&packet, segment_size).unwrap();
+            let header = tun_rs::VirtioNetHdr::decode(&header).unwrap();
+            assert_eq!(header.flags, 1);
+            assert_eq!(header.gso_size, 1200);
+            let mut frames = vec![vec![0; 1280]; 51];
+            let mut sizes = vec![0; frames.len()];
+            let count = tun_rs::gso_split(
+                &mut packet.to_vec(),
+                header,
+                &mut frames,
+                &mut sizes,
+                0,
+                ipv6,
+            )
+            .unwrap();
+            let mut reconstructed = Vec::new();
+            for (index, (frame, len)) in frames.iter().zip(sizes).take(count).enumerate() {
+                let packet = Decoder::default()
+                    .decode(&frame[..len], Instant::now())
+                    .unwrap()
+                    .into_owned();
+                let (_, tcp) = packet.tcp().unwrap();
+                assert_eq!(tcp.seq_number, TcpSeqNumber(100) + reconstructed.len());
+                assert_eq!(tcp.ack_number, Some(TcpSeqNumber(77)));
+                assert!(tcp.payload.len() <= 1200);
+                assert_eq!(tcp.control == TcpControl::Psh, index + 1 == count);
+                reconstructed.extend_from_slice(tcp.payload);
+            }
+            assert_eq!(reconstructed, data);
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn dynamic_receive_window_preserves_advertised_space_when_target_falls() {
         let flow = Flow {
@@ -600,7 +714,17 @@ mod tests {
             destination: "198.51.100.1:443".parse().unwrap(),
         };
         let (ready, _runnable) = mpsc::unbounded_channel();
-        let (mut conn, accepted) = Connection::new(flow, 1280, ready, 1, Pool::default()).unwrap();
+        let (mut conn, accepted) = Connection::new(
+            flow,
+            Link {
+                mtu: 1280,
+                gso: false,
+            },
+            ready,
+            1,
+            Pool::default(),
+        )
+        .unwrap();
         let (output, mut replies) = queue::channel(INITIAL, Transmit::size);
         let mut arena = PacketArena::default();
         let mut repr = TcpRepr {

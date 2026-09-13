@@ -4,6 +4,7 @@ mod linux;
 #[cfg(target_os = "linux")]
 mod offload;
 mod packet;
+mod pool;
 mod reassembly;
 mod storage;
 mod tcp;
