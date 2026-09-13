@@ -10,7 +10,7 @@ The worker publishes contiguous RX blocks directly to Stream. Consumption return
 
 Each direction starts with a 128 KiB target and adapts to its own completed bytes using the common `Capacity` feedback. Receive completion means application consumption; transmit completion means ACK. Stalled consumers cannot grow the target merely by adding arrivals. Window scale 7 is selected for the fast local TUN leg, giving 128-byte granularity and a negotiated receive range just below 8 MiB. No outbound transport parameters enter this calculation. A peer without window scaling retains the ordinary 65535-byte wire limit.
 
-Lowering a receive target does not retract an advertised window. In-flight segments covered by the old window remain acceptable even when the new target is smaller. Payload storage is released as blocks are consumed or acknowledged, independently of the window target. FIN preserves unread bytes and the other direction; RST or cancellation reports a connection error.
+Lowering a receive target preserves the largest promised receive right edge in byte precision. In-flight segments covered by the old window remain acceptable even when the new target is smaller. The scaled wire field rounds down, so its right edge may differ by at most 127 bytes; that rounding never grants new credit to a stalled reader. Payload storage is released as blocks are consumed or acknowledged, independently of the window target. FIN preserves unread bytes and the other direction; RST or cancellation reports a connection error.
 
 ## Pools and packet storage
 

@@ -778,7 +778,8 @@ mod tests {
         assert!(right > 101 + 65535);
 
         // Lower the desired window, then receive a segment inside the previously
-        // advertised range. Its ACK must not retract that range.
+        // advertised range. Scaling may round the wire edge down by 127 bytes,
+        // but all previously promised bytes must remain acceptable.
         conn.rx_capacity = Capacity::new(16384);
         repr.payload = b"payload";
         conn.input(&ip, &repr, now, &output, &mut arena);
@@ -788,10 +789,39 @@ mod tests {
             let packet = Decoder::default().decode(&bytes, now).unwrap().into_owned();
             let (_, ack) = packet.tcp().unwrap();
             let new_right = ack.ack_number.unwrap().0 as usize + ((ack.window_len as usize) << 7);
-            assert!(new_right >= right);
+            assert!((right - 127..=right).contains(&new_right));
             observed = true;
         }
         assert!(observed);
+
+        // Leave the application stalled. Fill the old window, including its
+        // quantized tail, then probe past it with one-byte segments. Repeated
+        // ACK rounding must not create fresh credit or discard the old tail.
+        let fill = vec![0; 60000];
+        let mut sent = repr.payload.len();
+        while sent < INITIAL - 128 {
+            let n = fill.len().min(INITIAL - 128 - sent);
+            repr.seq_number = TcpSeqNumber(101) + sent;
+            repr.payload = &fill[..n];
+            conn.input(&ip, &repr, now, &output, &mut arena);
+            conn.poll(now + Duration::from_millis(20), false, &output, &mut arena);
+            while replies.try_recv().is_ok() {}
+            sent += n;
+        }
+        let mut final_ack = None;
+        for offset in sent..INITIAL + 256 {
+            repr.seq_number = TcpSeqNumber(101) + offset;
+            repr.payload = b"x";
+            conn.input(&ip, &repr, now, &output, &mut arena);
+            conn.poll(now + Duration::from_millis(20), false, &output, &mut arena);
+            while let Ok(Transmit::Packet(bytes)) = replies.try_recv() {
+                let packet = Decoder::default().decode(&bytes, now).unwrap().into_owned();
+                let (_, ack) = packet.tcp().unwrap();
+                final_ack = Some((ack.ack_number.unwrap(), ack.window_len));
+            }
+        }
+        assert_eq!(conn.shared.rx_used.load(Ordering::Acquire), INITIAL);
+        assert_eq!(final_ack, Some((TcpSeqNumber(101) + INITIAL, 0)));
         drop(stream);
     }
 }
