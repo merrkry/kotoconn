@@ -146,6 +146,13 @@ impl Worker {
         if let Some(at) = entry.deadline.take() {
             self.timers.remove(&(at, generation));
         }
+        // Ingress or application readiness can supersede an output wait.
+        // Remove its old cost even when this turn becomes idle or closes TCP.
+        if entry.blocked {
+            self.blocked.retain(|(waiting, _)| *waiting != id);
+            entry.blocked = false;
+        }
+
         entry.connection.begin_turn();
         match entry
             .connection
@@ -159,10 +166,8 @@ impl Worker {
             }
             tcp::Progress::Again => entry.connection.wake(),
             tcp::Progress::Blocked(bytes) => {
-                if !entry.blocked {
-                    entry.blocked = true;
-                    self.blocked.push_back((id, bytes));
-                }
+                entry.blocked = true;
+                self.blocked.push_back((id, bytes));
             }
             tcp::Progress::Closed => {
                 self.tcp.remove(&flow);
@@ -559,5 +564,122 @@ async fn until_idle(mut activity: watch::Receiver<Instant>, idle: std::time::Dur
             _ = tokio::time::sleep_until(deadline) => return,
             result = activity.changed() => { if result.is_err() { return; } },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smoltcp::wire::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_a_blocked_handshake_replaces_its_wait_and_releases_it_on_close() {
+        let context = crate::parallel_tests::context();
+        let (output, mut packets) = queue::channel(512, Transmit::size);
+        output
+            .try_reserve(512)
+            .unwrap()
+            .send(Transmit::Packet(Bytes::from(vec![0; 256])));
+        let (ready, _runnable) = mpsc::unbounded_channel();
+        let (done, _completed) = mpsc::unbounded_channel();
+        let (drained, _draining) = mpsc::unbounded_channel();
+        let pool = crate::pool::Pool::default();
+        let link = tcp::Link {
+            mtu: 1280,
+            gso: false,
+        };
+        let flow = Flow {
+            source: "192.0.2.2:12345".parse().unwrap(),
+            destination: "198.51.100.1:443".parse().unwrap(),
+        };
+        let (mut connection, accepted) =
+            tcp::Connection::new(flow, link, ready.clone(), 1, pool.clone()).unwrap();
+        let mut arena = crate::storage::PacketArena::with_pool(pool.clone());
+        let syn = TcpRepr {
+            src_port: flow.source.port(),
+            dst_port: flow.destination.port(),
+            control: TcpControl::Syn,
+            seq_number: TcpSeqNumber(100),
+            ack_number: None,
+            window_len: 65535,
+            window_scale: Some(7),
+            max_seg_size: Some(1220),
+            sack_permitted: false,
+            sack_ranges: [None; 3],
+            timestamp: None,
+            payload: &[],
+        };
+        let ip = IpRepr::new(
+            flow.source.ip().into(),
+            flow.destination.ip().into(),
+            IpProtocol::Tcp,
+            syn.buffer_len(),
+            64,
+        );
+        connection.input(&ip, &syn, Instant::now(), &output, &mut arena);
+        let entry = TcpEntry {
+            connection,
+            generation: 1,
+            deadline: None,
+            blocked: false,
+            _tracking: context.scope.track().unwrap(),
+        };
+        let mut worker = Worker {
+            id: 0,
+            link,
+            context,
+            shared: Arc::new(Shared {
+                drained,
+                hash: RandomState::new(),
+                inboxes: vec![],
+                reassembly: ReassemblyLimits::default(),
+                stop: CancellationToken::new(),
+            }),
+            tcp: HashMap::from([(flow, entry)]),
+            udp: HashMap::new(),
+            done,
+            output,
+            ready,
+            timers: BTreeMap::new(),
+            blocked: VecDeque::new(),
+            pool,
+            arena,
+            rejector: tcp::Rejector::new(link.mtu),
+            generation: 1,
+            stopping: false,
+            stats: Statistics {
+                queue: 0,
+                received_packets: 0,
+                received_bytes: 0,
+                forwarded_packets: 0,
+                processed_packets: 0,
+                capacity_drops: 0,
+                forwarding_drops: 0,
+            },
+        };
+
+        worker.drive((flow, 1));
+        let syn_cost = worker.blocked.front().unwrap().1;
+        assert_eq!(worker.blocked.len(), 1);
+
+        // Cancellation supersedes the pending SYN-ACK with a smaller reset.
+        // The output queue remains full while another readiness event runs TCP.
+        drop(accepted);
+        worker.drive((flow, 1));
+        assert_eq!(worker.blocked.len(), 1);
+        assert!(worker.blocked.front().unwrap().1 < syn_cost);
+
+        packets.try_recv().unwrap();
+        worker.drive((flow, 1));
+        assert!(worker.tcp.is_empty());
+        assert!(worker.blocked.is_empty());
+        let Transmit::Packet(bytes) = packets.try_recv().unwrap() else {
+            panic!()
+        };
+        let packet = Decoder::default()
+            .decode(&bytes, Instant::now())
+            .unwrap()
+            .into_owned();
+        assert_eq!(packet.tcp().unwrap().1.control, TcpControl::Rst);
     }
 }

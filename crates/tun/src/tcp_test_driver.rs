@@ -23,7 +23,8 @@ pub(crate) fn connection(
     let (packets, mut input) = queue::channel(INITIAL, |packet: &QueuedPacket| packet.bytes.len());
     let driver = Box::pin(async move {
         let mut arena = PacketArena::default();
-        let mut progress = conn.poll(Instant::now(), stopping.is_cancelled(), &output, &mut arena);
+        let mut stopped = stopping.is_cancelled();
+        let mut progress = conn.poll(Instant::now(), stopped, &output, &mut arena);
         loop {
             let deadline = match progress {
                 Progress::Idle(at) => at,
@@ -45,6 +46,7 @@ pub(crate) fn connection(
                     tokio::task::yield_now().await;
                 }
                 _ => tokio::select! {
+                    _ = stopping.cancelled(), if !stopped => { stopped = true; },
                     _ = runnable.recv() => {},
                     _ = async { match deadline { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await } } => {},
                     permit = output.reserve(blocked.unwrap_or(0)), if blocked.is_some() => { drop(permit.map_err(io::Error::from)?); },
@@ -57,7 +59,8 @@ pub(crate) fn connection(
                 },
             }
             conn.begin_turn();
-            progress = conn.poll(Instant::now(), stopping.is_cancelled(), &output, &mut arena);
+            stopped |= stopping.is_cancelled();
+            progress = conn.poll(Instant::now(), stopped, &output, &mut arena);
         }
     });
     TestConnection {

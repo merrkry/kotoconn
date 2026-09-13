@@ -63,7 +63,7 @@ impl p::Handler for Echo {
     }
 }
 
-fn context() -> ServerContext {
+pub(super) fn context() -> ServerContext {
     ServerContext {
         handler: Arc::new(Echo),
         scope: Scope::new(),
