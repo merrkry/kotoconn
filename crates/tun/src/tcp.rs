@@ -30,6 +30,13 @@ const BUFFER_SIZE: usize = 64 * 1024;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
+// SAFETY: Each TCP interface needs one address and one route. Reject smoltcp
+// configurations without that capacity before the insertion unwraps can run.
+const _: () = {
+    assert!(smoltcp::config::IFACE_MAX_ADDR_COUNT > 0);
+    assert!(smoltcp::config::IFACE_MAX_ROUTE_COUNT > 0);
+};
+
 pub(crate) struct Stream {
     inner: DuplexStream,
     reset: Arc<AtomicBool>,
@@ -132,6 +139,14 @@ pub(crate) fn connection(
     output: mpsc::Sender<Transmit>,
     stopping: tokio_util::sync::CancellationToken,
 ) -> Connection {
+    // SAFETY: Dispatch constructs flows from validated unicast IP packets and
+    // run validates the MTU before constructing any connection.
+    debug_assert_eq!(flow.source.is_ipv4(), flow.destination.is_ipv4());
+    debug_assert!(crate::packet::unicast(flow.source.ip().into()));
+    debug_assert!(crate::packet::unicast(flow.destination.ip().into()));
+    debug_assert_ne!(flow.destination.port(), 0);
+    debug_assert!((1280..=65535).contains(&mtu));
+
     let (packets, mut incoming) = mpsc::channel::<QueuedPacket>(32);
     let (accepted_tx, accepted) = oneshot::channel();
     let (local, mut app) = tokio::io::duplex(BUFFER_SIZE);
@@ -157,6 +172,10 @@ pub(crate) fn connection(
         let destination: IpAddress = flow.destination.ip().into();
         let source: IpAddress = flow.source.ip().into();
         iface.update_ip_addrs(|addrs| {
+            // SAFETY: This is a fresh interface and the capacity is checked
+            // above at compile time. Only this destination is inserted.
+            debug_assert!(addrs.is_empty());
+            debug_assert!(addrs.len() < addrs.capacity());
             addrs
                 .push(IpCidr::new(
                     destination,
@@ -165,6 +184,12 @@ pub(crate) fn connection(
                 .unwrap();
         });
 
+        // SAFETY: Both match arms insert one route into this fresh table;
+        // the compile-time capacity assertion guarantees a free slot.
+        iface.routes_mut().update(|routes| {
+            debug_assert!(routes.is_empty());
+            debug_assert!(routes.len() < routes.capacity());
+        });
         match source {
             IpAddress::Ipv4(ip) => {
                 iface.routes_mut().add_default_ipv4_route(ip).unwrap();
@@ -198,6 +223,13 @@ pub(crate) fn connection(
         loop {
             let now = smoltcp::time::Instant::from_micros(epoch.elapsed().as_micros() as i64);
             iface.poll(now, &mut device, &mut sockets);
+            // SAFETY: The set owns exactly this TCP socket. Neither polling nor
+            // any select branch removes it, so all get_mut calls keep this type
+            // and handle for the driver's entire lifetime.
+            debug_assert_eq!(sockets.iter().count(), 1);
+            debug_assert!(sockets.iter().any(|(id, socket)| {
+                id == handle && matches!(socket, smoltcp::socket::Socket::Tcp(_))
+            }));
             let socket = sockets.get_mut::<tcp::Socket>(handle);
             if socket.state() == State::SynReceived {
                 handshake_started = true;
@@ -262,6 +294,10 @@ pub(crate) fn connection(
                     sockets.get_mut::<tcp::Socket>(handle).abort();
                 }
                 permit = output.reserve(), if !device.outgoing.is_empty() => {
+                    // SAFETY: The select guard observed a packet. This driver
+                    // alone owns the queue, and no other branch handler runs
+                    // between that guard and this pop.
+                    debug_assert!(!device.outgoing.is_empty());
                     permit
                         .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?
                         .send(Transmit::Packet(device.outgoing.pop_front().unwrap()));
@@ -381,6 +417,9 @@ impl Rejector {
     pub fn reject(&mut self, packet: &crate::packet::Packet) -> Vec<Vec<u8>> {
         self.iface.update_ip_addrs(|addrs| {
             addrs.clear();
+            // SAFETY: Clearing the address list makes room for this single
+            // destination; the capacity is checked above at compile time.
+            debug_assert!(addrs.len() < addrs.capacity());
             addrs
                 .push(IpCidr::new(
                     packet.ip.dst_addr(),

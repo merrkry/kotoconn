@@ -70,7 +70,13 @@ impl Ipv4Reassembly {
         self.iface
             .poll_ingress_single(now, &mut self.device, &mut self.sockets);
         self.device.outgoing.clear();
+        // SAFETY: Default inserted this IPv4 raw socket; process never removes
+        // it. A received buffer includes the IPv4 header emitted by smoltcp.
+        debug_assert!(self.sockets.iter().any(|(id, socket)| {
+            id == self.raw && matches!(socket, smoltcp::socket::Socket::Raw(_))
+        }));
         let assembled = self.sockets.get_mut::<raw::Socket>(self.raw).recv().ok()?;
+        debug_assert!(assembled.len() >= 20);
         // Raw sockets re-emit a 20-byte header, dropping IPv4 options. Retain
         // only header metadata to enforce the original 65535-byte IP limit;
         // smoltcp still owns all fragment storage and reassembly decisions.

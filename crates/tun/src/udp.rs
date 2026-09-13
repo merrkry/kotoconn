@@ -23,6 +23,9 @@ pub(crate) struct Encoder {
 
 impl Encoder {
     pub fn new(mtu: usize) -> Self {
+        // SAFETY: run validates the MTU. IPv6 fragmentation later subtracts
+        // 48 header bytes and requires a nonzero, eight-byte-aligned chunk.
+        debug_assert!((1280..=65535).contains(&mtu));
         let mut device = Device::new(mtu);
         let mut config = Config::new(HardwareAddress::Ip);
         config.random_seed = rand::random();
@@ -64,6 +67,9 @@ impl Encoder {
         let source_ip = source.ip().into();
         let destination_ip = destination.ip().into();
         let mut transport = vec![0; 8 + payload.len()];
+        // SAFETY: The buffer includes the UDP header and complete payload;
+        // the size and matching address families were validated above.
+        debug_assert!(u16::try_from(transport.len()).is_ok());
         udp.emit(
             &mut UdpPacket::new_unchecked(&mut transport),
             &source_ip,
@@ -89,6 +95,10 @@ impl Encoder {
             return Some(vec![packet.encode()]);
         }
         if source.is_ipv4() {
+            // SAFETY: new inserted this raw socket and no method removes it.
+            debug_assert!(self.sockets.iter().any(|(id, socket)| {
+                id == self.raw && matches!(socket, smoltcp::socket::Socket::Raw(_))
+            }));
             self.sockets
                 .get_mut::<raw::Socket>(self.raw)
                 .send_slice(&packet.encode())
@@ -108,10 +118,15 @@ impl Encoder {
             return Some(frames);
         }
 
+        // SAFETY: IpRepr was built from matching address families, and the
+        // IPv4 branch returned above. Only the IPv6 variant can reach here.
+        debug_assert!(source.is_ipv6() && destination.is_ipv6());
+        debug_assert!(matches!(packet.ip, IpRepr::Ipv6(_)));
         let IpRepr::Ipv6(mut repr) = packet.ip else {
             unreachable!()
         };
         let size = (self.mtu - 48) / 8 * 8;
+        debug_assert!(size > 0 && size.is_multiple_of(8));
         let id = self.ipv6_id;
         self.ipv6_id = self.ipv6_id.wrapping_add(1);
         let chunks = packet.payload.chunks(size);
@@ -123,6 +138,12 @@ impl Encoder {
                     repr.next_header = IpProtocol::Ipv6Frag;
                     repr.payload_len = data.len() + 8;
                     let mut bytes = vec![0; 48 + data.len()];
+                    // SAFETY: Each buffer holds the 40-byte IPv6 header,
+                    // 8-byte fragment header and this chunk. Validated UDP
+                    // size also bounds every fragment offset to 13 bits.
+                    debug_assert!(bytes.len() <= self.mtu);
+                    debug_assert_eq!(bytes.len(), 40 + repr.payload_len);
+                    debug_assert!(i * size / 8 <= 0x1fff);
                     repr.emit(&mut Ipv6Packet::new_unchecked(&mut bytes));
                     bytes[40] = u8::from(IpProtocol::Udp);
                     Ipv6FragmentRepr {

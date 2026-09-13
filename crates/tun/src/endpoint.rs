@@ -27,6 +27,8 @@ const INGRESS_BYTES: usize = 8 * 1024 * 1024;
 
 /// Packet boundaries are preserved. A successful send consumes exactly one IP
 /// packet. Implementations must register readiness with the supplied context.
+/// A successful receive returns the number of bytes written into `bytes`,
+/// which must not exceed its length.
 pub trait PacketIo: Send + Sync {
     fn poll_recv(&self, cx: &mut Context<'_>, bytes: &mut [u8]) -> Poll<io::Result<usize>>;
     fn poll_send(&self, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>>;
@@ -194,6 +196,9 @@ async fn dispatch<D: PacketIo>(
             }
             len = poll_fn(|cx| device.poll_recv(cx, &mut buffer)) => {
                 let len = len?;
+                // SAFETY: PacketIo reports bytes written into the supplied
+                // buffer. Invalid packet contents still go through Decoder.
+                debug_assert!(len <= buffer.len(), "PacketIo returned an invalid receive length");
                 let Some(packet) = decoder.decode(&buffer[..len], Instant::now()) else { continue; };
 
                 match packet.ip.next_header() {
@@ -216,6 +221,9 @@ async fn dispatch<D: PacketIo>(
                                 continue;
                             }
 
+                            // SAFETY: IDs must never repeat while old completions may
+                            // still be queued. Exhaustion must fail even in release.
+                            debug_assert_ne!(generation, u64::MAX, "TUN connection generation exhausted");
                             generation = generation.checked_add(1).expect("TUN connection generation exhausted");
                             let conn = tcp::connection(flow, mtu, output.clone(), context.stopping.clone());
                             let session = context.scope.child();
@@ -257,6 +265,9 @@ async fn dispatch<D: PacketIo>(
                             .clone()
                             .try_acquire_many_owned(packet.ip.buffer_len() as u32)
                         {
+                            // SAFETY: The flow was found or inserted above. Only
+                            // dispatch mutates this map; tasks only send completions.
+                            debug_assert!(tcp.contains_key(&flow));
                             let _ = tcp[&flow].packets.try_send(tcp::QueuedPacket {
                                 bytes: packet.encode(),
                                 _permit: Some(permit),
@@ -276,6 +287,9 @@ async fn dispatch<D: PacketIo>(
                                 continue;
                             }
 
+                            // SAFETY: IDs must never repeat while old completions may
+                            // still be queued. Exhaustion must fail even in release.
+                            debug_assert_ne!(generation, u64::MAX, "TUN connection generation exhausted");
                             generation = generation.checked_add(1).expect("TUN connection generation exhausted");
                             let scope = context.scope.child();
                             let (association, driver) = p::packet_pair(scope.clone());
@@ -318,6 +332,9 @@ async fn dispatch<D: PacketIo>(
                             );
                         }
 
+                        // SAFETY: The flow was found or inserted above. Only
+                        // dispatch mutates this map; tasks only send completions.
+                        debug_assert!(udp.contains_key(&flow));
                         let entry = &udp[&flow];
                         if entry
                             .packets

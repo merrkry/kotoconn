@@ -21,6 +21,13 @@ pub(crate) struct Packet {
 
 impl Packet {
     pub fn encode(&self) -> Vec<u8> {
+        // SAFETY: Decoder normalizes the IP payload length after reassembly;
+        // outbound encoders construct it from their transport buffer length.
+        // The allocation must fit both the emitted header and payload copy.
+        debug_assert_eq!(
+            self.ip.buffer_len(),
+            self.ip.header_len() + self.payload.len()
+        );
         let mut data = vec![0; self.ip.buffer_len()];
         self.ip.emit(&mut data, &ChecksumCapabilities::default());
         data[self.ip.header_len()..].copy_from_slice(&self.payload);
@@ -123,6 +130,9 @@ impl Decoder {
             IpVersion::Ipv4 => {
                 let packet = Ipv4Packet::new_checked(data).ok()?;
                 let repr = Ipv4Repr::parse(&packet, &ChecksumCapabilities::default()).ok()?;
+                // SAFETY: Successful checked parsing establishes the fixed
+                // header and the complete options slice within this buffer.
+                debug_assert!((20..=data.len()).contains(&usize::from(packet.header_len())));
                 // Source routing is deliberately outside this unicast proxy's policy.
                 if !ipv4_options(&data[20..packet.header_len() as usize]) {
                     return None;
@@ -187,6 +197,10 @@ impl Decoder {
             prefix_len,
             ..
         } = fragment;
+        // SAFETY: ipv6_extensions derives these values from a checked IPv6
+        // payload length and the fragment header's 13-bit offset field.
+        debug_assert!(prefix_len <= 65535);
+        debug_assert!(offset <= 0xfff8 && offset.is_multiple_of(8));
         self.expire(now);
 
         if !self.fragments.contains_key(&key) && self.fragments.len() >= MAX_DATAGRAMS {
@@ -234,6 +248,10 @@ impl Decoder {
         }
 
         assembly.data.resize(assembly.data.len().max(end), 0);
+        // SAFETY: The validated fragment fits the resized buffer, and end was
+        // computed from this offset and this exact fragment's length.
+        debug_assert!(offset <= end && end <= assembly.data.len());
+        debug_assert_eq!(end - offset, data.len());
         assembly.data[offset..end].copy_from_slice(data);
         if assembly.total != Some(assembly.ranges.peek_front()) {
             return None;
@@ -302,10 +320,16 @@ fn ipv6_extensions(
                     }
                 }
                 protocol = repr.next_header;
+                // SAFETY: The checked extension header and parsed option data
+                // both borrow this payload and include the complete header.
+                debug_assert!(repr.header_len() + repr.data.len() <= payload.len());
                 payload = &payload[repr.header_len() + repr.data.len()..];
             }
             IpProtocol::Ipv6Frag => {
                 let header = payload.get(..8)?;
+                // SAFETY: get above established all eight fragment-header
+                // bytes, including the fields after the first two bytes.
+                debug_assert!(payload.len() >= 8);
                 let fragment = Ipv6FragmentHeader::new_checked(&header[2..]).ok()?;
                 let fragment = Ipv6FragmentRepr::parse(&fragment).ok()?;
                 protocol = IpProtocol::from(header[0]);

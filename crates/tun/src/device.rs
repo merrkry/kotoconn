@@ -70,6 +70,9 @@ pub(crate) struct Tx<'a>(&'a mut VecDeque<Vec<u8>>);
 
 impl phy::TxToken for Tx<'_> {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
+        // SAFETY: receive/transmit issue a token only below the queue limit.
+        // Its exclusive borrow prevents another token from filling this slot.
+        debug_assert!(self.0.len() < 32);
         let mut packet = vec![0; len];
         let result = f(&mut packet);
         self.0.push_back(packet);
