@@ -8,7 +8,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-fn flow(ipv6: bool) -> Flow {
+pub(super) fn flow(ipv6: bool) -> Flow {
     Flow {
         source: if ipv6 {
             "[fd00::2]:12345"
@@ -27,7 +27,7 @@ fn flow(ipv6: bool) -> Flow {
     }
 }
 
-fn segment(
+pub(super) fn segment(
     flow: Flow,
     seq: i32,
     ack: Option<i32>,
@@ -71,7 +71,7 @@ fn segment(
     }
 }
 
-fn decoded(bytes: &[u8]) -> Packet<'static> {
+pub(super) fn decoded(bytes: &[u8]) -> Packet<'static> {
     Decoder::default()
         .decode(bytes, Instant::now())
         .unwrap()

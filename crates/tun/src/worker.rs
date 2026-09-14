@@ -268,6 +268,32 @@ impl Worker {
                     return Ok(());
                 }
 
+                let mut initial_sequence = None;
+                if !self.stopping
+                    && repr.control == TcpControl::Syn
+                    && repr.ack_number.is_none()
+                    && let Some(entry) = self.tcp.get(&flow).filter(|e| e.connection.is_time_wait())
+                {
+                    // FIN and the next SYN can arrive in the same receive batch.
+                    // Publish the old EOF before deciding whether it can retire.
+                    self.drive((flow, entry.generation));
+                    initial_sequence = self
+                        .tcp
+                        .get(&flow)
+                        .and_then(|entry| entry.connection.reuse_sequence(&packet.ip, &repr));
+                    if initial_sequence.is_some()
+                        && let Some(entry) = self.tcp.remove(&flow)
+                    {
+                        if let Some(at) = entry.deadline {
+                            self.timers.remove(&(at, entry.generation));
+                        }
+                        if entry.blocked {
+                            self.blocked
+                                .retain(|(id, _)| *id != (flow, entry.generation));
+                        }
+                    }
+                }
+
                 if !self.tcp.contains_key(&flow) {
                     if repr.control != TcpControl::Syn || repr.ack_number.is_some() || self.stopping
                     {
@@ -286,13 +312,16 @@ impl Worker {
                         .generation
                         .checked_add(1)
                         .expect("TUN connection generation exhausted");
-                    let (connection, accepted) = tcp::Connection::new(
+                    let (mut connection, accepted) = tcp::Connection::new(
                         flow,
                         self.link,
                         self.ready.clone(),
                         self.generation,
                         self.pool.clone(),
                     )?;
+                    if let Some(sequence) = initial_sequence {
+                        connection.set_initial_sequence(sequence);
+                    }
                     let session = self.context.scope.child();
                     let tracking = session.track()?;
                     let handler = self.context.handler.clone();

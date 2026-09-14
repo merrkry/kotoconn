@@ -52,6 +52,10 @@ adding the interfaces this crate needs:
 - Dynamic receive windows preserve previously advertised space when a target
   falls. Scaling does not create extra credit, and a larger window waits for
   handshake completion instead of repeatedly transmitting SYN-ACK.
+- `time_wait_reuse` checks a new SYN against a TIME-WAIT tuple's sequence
+  boundaries and returns a safe local ISN. Tests cover old duplicates, wrapping
+  sequence numbers and unread FIN payload. The worker retires old application
+  I/O before installing a new generation for that tuple.
 
 The ordinary Interface and ring-buffer APIs remain available. Runtime scheduling,
 allocation policy, pools and worker ownership stay in Kotoconn. See

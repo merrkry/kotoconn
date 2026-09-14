@@ -72,6 +72,130 @@ pub(super) fn context() -> ServerContext {
     }
 }
 
+struct TcpAcceptor(mpsc::UnboundedSender<p::BoxStream>);
+
+impl p::Handler for TcpAcceptor {
+    fn tcp(&self, _: p::Target, stream: p::BoxStream, _: Scope) -> BoxFuture<'_, Result<()>> {
+        self.0.send(stream).unwrap();
+        Box::pin(async { Ok(()) })
+    }
+
+    fn udp(&self, _: p::Datagram) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { bail!("UDP is not used in this test") })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn tcp_reuses_time_wait_without_losing_old_eof_or_accepting_old_syn() {
+    use crate::tests::{decoded, flow, segment};
+    use smoltcp::wire::{TcpControl, TcpSeqNumber};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn control(
+        received: &mut mpsc::UnboundedReceiver<(usize, Vec<u8>)>,
+        control: TcpControl,
+    ) -> (TcpSeqNumber, Option<TcpSeqNumber>) {
+        loop {
+            let (_, bytes) = received.recv().await.unwrap();
+            let packet = decoded(&bytes);
+            let (_, repr) = packet.tcp().unwrap();
+            assert_ne!(repr.control, TcpControl::Rst);
+            if repr.control == control {
+                return (repr.seq_number, repr.ack_number);
+            }
+        }
+    }
+
+    for ipv6 in [false, true] {
+        let flow = flow(ipv6);
+        let mut context = context();
+        let (accepted, mut streams) = mpsc::unbounded_channel();
+        context.handler = Arc::new(TcpAcceptor(accepted));
+        let (input, packets) = mpsc::channel(16);
+        let (output, mut received) = mpsc::unbounded_channel();
+        let endpoint = tokio::spawn(run(
+            vec![(
+                Receiver {
+                    packets,
+                    dropped: None,
+                },
+                Sender {
+                    queue: 0,
+                    packets: output,
+                },
+            )],
+            1280,
+            context.clone(),
+        ));
+        let started = tokio::time::Instant::now();
+        input
+            .send(segment(flow, 100, None, TcpControl::Syn, &[]).bytes)
+            .await
+            .unwrap();
+        let (isn, ack) = control(&mut received, TcpControl::Syn).await;
+        assert_eq!(ack, Some(TcpSeqNumber(101)));
+        input
+            .send(segment(flow, 101, Some((isn + 1).0), TcpControl::None, &[]).bytes)
+            .await
+            .unwrap();
+        let mut old = streams.recv().await.unwrap();
+        old.shutdown().await.unwrap();
+        let (fin, _) = control(&mut received, TcpControl::Fin).await;
+
+        // Queue FIN with unread data, a duplicate SYN, and a new incarnation
+        // together. The worker must finish old I/O even within one ingress batch.
+        input
+            .send(segment(flow, 101, Some((fin + 1).0), TcpControl::Fin, b"tail").bytes)
+            .await
+            .unwrap();
+        input
+            .send(segment(flow, 100, None, TcpControl::Syn, &[]).bytes)
+            .await
+            .unwrap();
+        input
+            .send(segment(flow, 65536, None, TcpControl::Syn, &[]).bytes)
+            .await
+            .unwrap();
+        let (next_isn, ack) = control(&mut received, TcpControl::Syn).await;
+        assert_eq!(ack, Some(TcpSeqNumber(65537)));
+        assert!(next_isn > fin);
+        let mut tail = Vec::new();
+        old.read_to_end(&mut tail).await.unwrap();
+        assert_eq!(tail, b"tail");
+        drop(old); // Its final readiness event must not affect the new generation.
+
+        input
+            .send(
+                segment(
+                    flow,
+                    65537,
+                    Some((next_isn + 1).0),
+                    TcpControl::None,
+                    b"next",
+                )
+                .bytes,
+            )
+            .await
+            .unwrap();
+        let mut new = streams.recv().await.unwrap();
+        let mut data = [0; 4];
+        new.read_exact(&mut data).await.unwrap();
+        assert_eq!(&data, b"next");
+        new.shutdown().await.unwrap();
+        let (fin, _) = control(&mut received, TcpControl::Fin).await;
+        input
+            .send(segment(flow, 65541, Some((fin + 1).0), TcpControl::Fin, &[]).bytes)
+            .await
+            .unwrap();
+        assert_eq!(new.read(&mut data).await.unwrap(), 0);
+        assert_eq!(tokio::time::Instant::now(), started);
+
+        context.stopping.cancel();
+        endpoint.await.unwrap().unwrap();
+        context.scope.wait().await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fragments_cross_receive_queues_and_replies_keep_the_flow_owner() {
     let context = context();

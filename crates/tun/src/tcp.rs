@@ -341,6 +341,7 @@ struct Host {
     mtu: usize,
     local: IpAddress,
     gso: bool,
+    initial_sequence: Option<TcpSeqNumber>,
 }
 
 impl tcp::TcpContext for Host {
@@ -349,7 +350,9 @@ impl tcp::TcpContext for Host {
     }
 
     fn random_u32(&mut self) -> u32 {
-        rand::random()
+        self.initial_sequence
+            .take()
+            .map_or_else(rand::random, |sequence| sequence.0 as u32)
     }
 
     fn ip_mtu(&self) -> usize {
@@ -474,6 +477,7 @@ impl Connection {
                     mtu: link.mtu,
                     gso: link.gso,
                     local: flow.destination.ip().into(),
+                    initial_sequence: None,
                 },
                 epoch: Instant::now(),
                 started: false,
@@ -489,6 +493,29 @@ impl Connection {
 
     pub fn wake(&self) {
         self.shared.wake();
+    }
+
+    pub fn is_time_wait(&self) -> bool {
+        self.socket.state() == State::TimeWait
+    }
+
+    pub fn reuse_sequence(&self, ip: &IpRepr, repr: &TcpRepr<'_>) -> Option<TcpSeqNumber> {
+        // Finish the old application's EOF before retiring its protocol state.
+        if self.direct.is_some()
+            || self.admission.is_some()
+            || (!self.handed_over && !self.shared.eof.load(Ordering::Acquire))
+        {
+            return None;
+        }
+        self.socket.time_wait_reuse(ip, repr)
+    }
+
+    pub fn set_initial_sequence(&mut self, sequence: TcpSeqNumber) {
+        // SAFETY: Only a newly constructed listener accepts an ISN override.
+        // Its first random_u32 call generates the SYN-ACK sequence number.
+        debug_assert_eq!(self.socket.state(), State::Listen);
+        debug_assert!(!self.started);
+        self.host.initial_sequence = Some(sequence);
     }
 
     pub fn begin_turn(&self) {
