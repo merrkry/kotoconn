@@ -72,6 +72,7 @@ def main():
     base = ROOT / "target/e2e"
     base.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix="parallel-", dir=base))
+    directory.chmod(0o755)
     before = snapshot()
     (directory / "parent-before.json").write_text(json.dumps(before, indent=2))
     parent = os.readlink("/proc/self/ns/net")

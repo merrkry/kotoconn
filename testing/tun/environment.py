@@ -46,6 +46,9 @@ def enter(args, script, category):
     base = (args.output or ROOT / "target" / category).resolve()
     base.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix="tun-", dir=base))
+    # CI runs this script with sudo but uploads its synthetic traffic artifacts
+    # as the runner user. Keep the unique directory traversable for that step.
+    directory.chmod(0o755)
     argv = ["unshare", "--net"]
     if os.getuid() != 0:
         argv += ["--user", "--map-root-user"]
