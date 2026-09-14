@@ -114,6 +114,8 @@ and binary hash. The verified release is
 [1.15.0-alpha.3](https://github.com/SagerNet/sing-box/releases/tag/v1.15.0-alpha.3).
 Reference binaries are supplied by the caller, never downloaded or rebuilt
 implicitly. Omitting `--sing-box` runs only Kotoconn.
+The reference logs warnings and errors. Readiness observes its TUN device,
+so per-connection INFO logging does not enter churn measurements.
 
 Both implementations receive the same addresses, MTU, payload seed and workload.
 The reference runs only clean traffic. `mixed-malformed` measures Kotoconn alone;

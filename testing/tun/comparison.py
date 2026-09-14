@@ -1,8 +1,9 @@
 """Performance reference only. E2E never starts a reference proxy."""
 
 import json
+import time
 
-from .environment import NAME, Daemon, Process, configure_routes
+from .environment import NAME, Daemon, Process, configure_routes, ip
 
 
 class SingBox(Process):
@@ -12,7 +13,7 @@ class SingBox(Process):
         path.write_text(
             json.dumps(
                 {
-                    "log": {"level": "info"},
+                    "log": {"level": "warn"},
                     "inbounds": [
                         {
                             "type": "tun",
@@ -34,11 +35,26 @@ class SingBox(Process):
             argv = ["taskset", "--cpu-list", cpus, *argv]
         super().__init__(argv, directory / "daemon.log")
         try:
-            self.event("sing-box started")
+            self.ready()
             configure_routes()
         except BaseException:
             self.close()
             raise
+
+    def ready(self):
+        # INFO logs include every connection and distort churn measurements.
+        # Observe the real device instead; socket workloads verify end-to-end I/O.
+        deadline = time.monotonic() + 15
+        while self.process.poll() is None:
+            links = json.loads(ip("-j", "link", "show"))
+            if any(link["ifname"] == NAME and "UP" in link["flags"] for link in links):
+                return
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"reference TUN did not come up; see {self.log.name}"
+                )
+            time.sleep(0.01)
+        raise RuntimeError(f"reference exited during startup; see {self.log.name}")
 
     def finish(self):
         # Verified measurement is complete. Reference lifecycle conformance is

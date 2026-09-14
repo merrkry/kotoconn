@@ -196,8 +196,6 @@ class Process:
                 raise RuntimeError(f"process exited before {name}; see {self.log.name}")
             if value.get("event", value.get("fields", {}).get("event")) == name:
                 return value
-            if name == "sing-box started" and name in value.get("text", ""):
-                return value
 
     def send(self, value):
         self.process.stdin.write(value + "\n")
