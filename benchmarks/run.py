@@ -1,499 +1,323 @@
-"""Build and run the isolated TUN loopback benchmark."""
+"""Measure verified TUN workloads in a private network namespace."""
 
 import argparse
-import hashlib
-import json
-import os
-import platform
-import signal
-import statistics
-import subprocess
-import threading
-import time
+import sys
 from pathlib import Path
 
-
-CLIENT = "192.0.2.2"
-REMOTE = "198.18.0.1"
-PORT = 5201
-TUN = "bench0"
-ROOT = Path(__file__).resolve().parent.parent
-SING_BOX_REF = "68b74f9516a2b2e126065e71f31344e2802ce507"
-
-
-def command(*args, check=True, timeout=15):
-    return subprocess.run(
-        args,
-        check=check,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=timeout,
-    )
-
-
-class Daemon:
-    def __init__(self, argv, ready_text, log_path):
-        self.lines = []
-        self.condition = threading.Condition()
-        self.log = log_path.open("w")
-        self.process = subprocess.Popen(
-            argv,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
-        self.reader = threading.Thread(target=self.read, daemon=True)
-        self.reader.start()
-        self.wait_ready(ready_text)
-
-    def read(self):
-        for line in self.process.stdout:
-            self.log.write(line)
-            self.log.flush()
-            with self.condition:
-                self.lines.append(line)
-                self.condition.notify_all()
-        with self.condition:
-            self.condition.notify_all()
-
-    def wait_ready(self, ready_text):
-        deadline = time.monotonic() + 20
-        with self.condition:
-            while ready_text not in "".join(self.lines):
-                if self.process.poll() is not None:
-                    raise RuntimeError("daemon exited:\n" + "".join(self.lines))
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("daemon readiness timed out")
-                self.condition.wait(remaining)
-
-    def close(self):
-        if self.process.poll() is None:
-            self.process.send_signal(signal.SIGTERM)
-            try:
-                self.process.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
-        self.reader.join(timeout=5)
-        self.log.close()
-        if self.process.returncode:
-            raise RuntimeError(
-                f"daemon exited with {self.process.returncode}:\n" + "".join(self.lines)
-            )
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from e2e.tun_support.comparison import SingBox
+from e2e.tun_support.environment import (
+    CLIENT,
+    REMOTE,
+    SERVER_PORTS,
+    Daemon,
+    add_arguments,
+    command,
+    configure_network,
+    enter,
+    traffic,
+)
+from e2e.tun_support.measurement import (
+    comparisons,
+    metadata,
+    metrics,
+    resource_metrics,
+    save,
+    write_csv,
+)
+from e2e.tun_support.packets import Injector
 
 
-def configure_network():
-    command("ip", "link", "set", "lo", "up")
-    command("ip", "addr", "add", f"{CLIENT}/32", "dev", "lo")
-    command("ip", "addr", "add", f"{REMOTE}/32", "dev", "lo")
-    command("ip", "rule", "add", "priority", "1000", "lookup", "local")
-    command("ip", "rule", "del", "priority", "0")
-    command(
-        "ip",
-        "rule",
-        "add",
-        "priority",
-        "100",
-        # TIME_WAIT ACKs use the kernel's UID, not the original application's.
-        # Keep those packets on the same proxy path as the bound client socket.
-        "from",
-        f"{CLIENT}/32",
-        "lookup",
-        "100",
-    )
-
-
-def configure_tun_route():
-    command("ip", "route", "replace", "default", "dev", TUN, "table", "100")
-
-
-def wait_for_server(server):
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        listeners = command("ss", "-H", "-ltn", check=False).stdout
-        if f"{REMOTE}:{PORT}" in listeners:
-            return
-        if server.poll() is not None:
-            raise RuntimeError("iperf3 server exited before listening")
-        time.sleep(0.05)
-    raise TimeoutError("iperf3 server did not listen")
-
-
-def write_configs(directory):
-    policy = directory / "kotoconn.ts"
-    policy.write_text(
-        """import { kotoconn as k } from '@kotoconn/bindings';
-const resolver = k.resolve_handler(name => k.lookup(name));
-const direct = k.dialer({dialer: null, outbound: {resolve_handler: resolver, implementation: k.direct_outbound({})}});
-const routing = k.routing_handler(flow => flow.protocol === 'udp' ? k.route_udp(direct) : k.route(direct, flow.dest));
-k.inbound({implementation: k.tun_inbound({name: 'bench0', mtu: 1500, addresses: [
-    {address: k.ip('172.19.0.1'), prefix: 30}
-]}), routing_handler: routing, udp_idle_timeout: k.timeout(30000)});
-"""
-    )
-    config = {
-        "log": {"level": "info", "timestamp": False},
-        "inbounds": [
+def cases(args):
+    recipes = [
+        ("tcp-bulk-1", {"connections": 1, "direction": "duplex"}),
+        ("tcp-bulk-4", {"connections": 4, "direction": "duplex"}),
+        ("tcp-churn", {"workload": "churn", "connections": 8}),
+        ("tcp-sparse", {"workload": "sparse", "connections": 64}),
+        (
+            "udp-paced",
             {
-                "type": "tun",
-                "tag": "tun-in",
-                "interface_name": TUN,
-                "address": ["172.19.0.1/30"],
-                "mtu": 1500,
-                "auto_route": False,
-                "stack": "go",
-            }
-        ],
-        "outbounds": [{"type": "direct", "tag": "direct"}],
-        "route": {"final": "direct"},
-    }
-    (directory / "sing-box.json").write_text(json.dumps(config, indent=2))
-
-
-def start_daemon(implementation, directory):
-    log_path = directory / f"{implementation}.log"
-    if implementation == "kotoconn":
-        return Daemon(
-            [
-                "/opt/kotoconn",
-                "--log-format",
-                "json",
-                "run",
-                "--config",
-                str(directory / "kotoconn.ts"),
-            ],
-            '"event":"daemon_ready"',
-            log_path,
-        )
-    return Daemon(
-        ["/opt/sing-box", "run", "-c", str(directory / "sing-box.json")],
-        "sing-box started",
-        log_path,
-    )
-
-
-def iperf(direction, streams, duration):
-    argv = [
-        "setpriv",
-        "--reuid=1000",
-        "--regid=1000",
-        "--clear-groups",
-        "iperf3",
-        "--client",
-        REMOTE,
-        "--port",
-        str(PORT),
-        "--bind",
-        CLIENT,
-        "--parallel",
-        str(streams),
-        "--omit",
-        "1",
-        "--time",
-        str(duration),
-        "--json",
+                "protocol": "udp",
+                "connections": 4,
+                "rate": args.udp_rate,
+                "allow_loss": True,
+            },
+        ),
+        (
+            "mixed-malformed",
+            {
+                "workload": "mixed",
+                "connections": 16,
+                "rate": args.udp_rate,
+                "allow_loss": True,
+            },
+        ),
     ]
-    if direction == "download":
-        argv.append("--reverse")
-    result = command(*argv, check=False, timeout=duration + 20)
-    try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError as error:
-        raise RuntimeError(f"iperf3 returned invalid JSON:\n{result.stdout}") from error
-    if result.returncode or "error" in payload:
-        raise RuntimeError(f"iperf3 failed:\n{result.stdout}")
-    summary = payload["end"]["sum_received"]
-    return {
-        "bits_per_second": summary["bits_per_second"],
-        "bytes": summary["bytes"],
-        "seconds": summary["seconds"],
-    }
+    if args.profile == "full":
+        recipes += [
+            ("tcp-upload-1", {"direction": "upload"}),
+            ("tcp-download-1", {"direction": "download"}),
+            ("tcp-upload-16", {"direction": "upload", "connections": 16}),
+            ("tcp-download-16", {"direction": "download", "connections": 16}),
+            ("tcp-sparse-256", {"workload": "sparse", "connections": 256}),
+            (
+                "udp-paced-1",
+                {"protocol": "udp", "rate": args.udp_rate, "allow_loss": True},
+            ),
+            (
+                "udp-small",
+                {
+                    "protocol": "udp",
+                    "rate": args.udp_rate,
+                    "datagram_bytes": 64,
+                    "allow_loss": True,
+                },
+            ),
+            ("udp-churn", {"protocol": "udp", "workload": "churn", "connections": 8}),
+            (
+                "udp-sparse",
+                {"protocol": "udp", "workload": "sparse", "connections": 64},
+            ),
+            ("udp-boundaries", {"protocol": "udp", "workload": "boundaries"}),
+            (
+                "mixed-clean",
+                {
+                    "workload": "mixed",
+                    "connections": 16,
+                    "rate": args.udp_rate,
+                    "allow_loss": True,
+                },
+            ),
+        ]
+    for mtu in args.mtu:
+        for family in args.family:
+            for name, spec in recipes:
+                if args.case and name not in args.case:
+                    continue
+                yield (
+                    f"mtu{mtu}-v{family}-{name}",
+                    name,
+                    {
+                        "source": CLIENT[int(family == 6)],
+                        "target": REMOTE[int(family == 6)],
+                        "mtu": mtu,
+                        "bytes": 1048577,
+                        "close_mode": "exchange",
+                        "duration_ms": round(args.duration * 1000),
+                        **spec,
+                    },
+                )
 
 
-def read_text(path):
-    try:
-        return Path(path).read_text().strip()
-    except FileNotFoundError:
-        return None
+def implementations(args, case_name):
+    if args.sing_box and case_name != "mixed-malformed":
+        return ["candidate", "sing-box-go"]
+    return ["candidate"]
 
 
-def process_cpu_seconds(process):
-    fields = Path(f"/proc/{process.pid}/stat").read_text().rsplit(")", 1)[1].split()
-    ticks = int(fields[11]) + int(fields[12])
-    return ticks / os.sysconf("SC_CLK_TCK")
-
-
-def link_stats():
-    link = json.loads(command("ip", "-j", "-s", "link", "show", "dev", TUN).stdout)[0]
-    return {
-        f"{direction}_{metric}": link["stats64"][direction][metric]
-        for direction in ("rx", "tx")
-        for metric in ("bytes", "packets")
-    }
-
-
-def metadata(duration, repetitions):
-    cpu_model = "unknown"
-    for line in Path("/proc/cpuinfo").read_text().splitlines():
-        if line.startswith("model name"):
-            cpu_model = line.split(":", 1)[1].strip()
-            break
-    return {
-        "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "kernel": platform.release(),
-        "machine": platform.machine(),
-        "cpu_model": cpu_model,
-        "available_cpus": len(os.sched_getaffinity(0)),
-        "cpu_max": read_text("/sys/fs/cgroup/cpu.max"),
-        "memory_max": read_text("/sys/fs/cgroup/memory.max"),
-        "mtu": 1500,
-        "duration_seconds": duration,
-        "omit_seconds": 1,
-        "repetitions": repetitions,
-        "sing_box_version": command("/opt/sing-box", "version").stdout.splitlines()[0],
-        "sing_box_commit": os.environ.get("SING_BOX_COMMIT"),
-        "kotoconn_version": command("/opt/kotoconn", "--version").stdout.strip(),
-        "kotoconn_commit": os.environ.get("KOTOCONN_COMMIT"),
-        "kotoconn_source_diff_sha256": os.environ.get("KOTOCONN_SOURCE_DIFF_SHA256"),
-    }
-
-
-def run_inside(output, duration, repetitions):
-    output.parent.mkdir(parents=True, exist_ok=True)
-    work = output.parent / "run"
-    work.mkdir(exist_ok=True)
-
+def run(args):
     configure_network()
-    write_configs(work)
-    server_log = (work / "iperf3-server.log").open("w")
-    server = subprocess.Popen(
-        ["iperf3", "--server", "--bind", REMOTE, "--port", str(PORT)],
-        stdout=server_log,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    wait_for_server(server)
-
-    results = {
-        "schema_version": 1,
-        "suite": "tun-loopback",
-        "metadata": metadata(duration, repetitions),
+    binaries = {"candidate": args.binary}
+    if args.sing_box:
+        binaries["sing-box-go"] = args.sing_box
+    result = {
+        "schema_version": 2,
+        "suite": "tun-workloads",
+        "status": "running",
+        "metadata": metadata(binaries, args.traffic_binary),
+        "settings": {
+            "duration_seconds": args.duration,
+            "warmup_seconds": args.warmup,
+            "repetitions": args.repetitions,
+            "seed": args.seed,
+            "daemon_cpus": args.daemon_cpus,
+        },
         "runs": [],
     }
-    implementations = ("kotoconn", "sing-box-go")
+    if args.sing_box:
+        result["metadata"]["reference_version"] = args.reference_version
+        result["metadata"]["reference_scope"] = "clean traffic only"
+        result["metadata"]["reference_cleanup"] = (
+            "process killed after verified measurement"
+        )
+    path = args.output / "results.json"
     try:
-        for implementation in implementations:
-            print(f"Starting {implementation}", flush=True)
-            daemon = start_daemon(implementation, work)
-            try:
-                configure_tun_route()
-                for streams in (1, 4):
-                    for direction in ("upload", "download"):
-                        values = []
-                        for repetition in range(1, repetitions + 1):
-                            cpu_before = process_cpu_seconds(daemon.process)
-                            link_before = link_stats()
-                            wall_before = time.monotonic()
-                            value = iperf(direction, streams, duration)
-                            wall_seconds = time.monotonic() - wall_before
-                            cpu_seconds = process_cpu_seconds(daemon.process) - cpu_before
-                            link_after = link_stats()
-                            value.update(
-                                implementation=implementation,
-                                direction=direction,
-                                streams=streams,
-                                repetition=repetition,
-                                daemon_cpu_seconds=cpu_seconds,
-                                daemon_cpu_cores=cpu_seconds / wall_seconds,
-                                daemon_cpu_ns_per_byte=cpu_seconds * 1e9 / value["bytes"],
-                                **{
-                                    f"tun_{key}": link_after[key] - link_before[key]
-                                    for key in link_before
+        for case_id, name, spec in cases(args):
+            # Compare the mixed flow set without raw injection in mixed-clean.
+            names = implementations(args, name)
+            for repetition in range(args.repetitions):
+                # Alternate order within each pair; every sample starts a fresh daemon.
+                order = names if repetition % 2 == 0 else list(reversed(names))
+                for implementation in order:
+                    directory = args.output / f"{case_id}-{repetition}-{implementation}"
+                    directory.mkdir()
+                    entry = {
+                        "case": case_id,
+                        "implementation": implementation,
+                        "repetition": repetition,
+                        "status": "running",
+                        "result": str(
+                            (directory / "measure" / "result.json").relative_to(
+                                args.output
+                            )
+                        ),
+                    }
+                    result["runs"].append(entry)
+                    save(path, result)
+                    daemon = None
+                    try:
+                        if implementation == "sing-box-go":
+                            daemon = SingBox(
+                                binaries[implementation],
+                                directory / "daemon",
+                                spec["mtu"],
+                                args.daemon_cpus,
+                            )
+                        else:
+                            daemon = Daemon(
+                                binaries[implementation],
+                                directory / "daemon",
+                                spec["mtu"],
+                                cpus=args.daemon_cpus,
+                            )
+                        sample_spec = {**spec, "seed": args.seed + repetition}
+                        if args.warmup:
+                            warmup = directory / "warmup"
+                            warmup.mkdir()
+                            traffic(
+                                args.traffic_binary,
+                                daemon,
+                                warmup,
+                                {
+                                    **sample_spec,
+                                    "duration_ms": round(args.warmup * 1000),
                                 },
                             )
-                            results["runs"].append(value)
-                            output.write_text(json.dumps(results, indent=2) + "\n")
-                            values.append(value["bits_per_second"] / 1e9)
-                            print(
-                                f"  {streams} stream(s) {direction} {repetition}: "
-                                f"{values[-1]:.3f} Gbit/s",
-                                flush=True,
+                        measure = directory / "measure"
+                        measure.mkdir()
+                        injector = (
+                            Injector(
+                                spec["source"] == CLIENT[1], seed=sample_spec["seed"]
                             )
-                        print(f"  median: {statistics.median(values):.3f} Gbit/s")
-            finally:
-                daemon.close()
+                            if name == "mixed-malformed"
+                            else None
+                        )
+                        try:
+                            sample = traffic(
+                                args.traffic_binary,
+                                daemon,
+                                measure,
+                                sample_spec,
+                                inject=injector,
+                            )
+                            if injector:
+                                if (
+                                    not injector.counts["positive-control"]
+                                    or not sample["positive_controls"]
+                                ):
+                                    raise RuntimeError(
+                                        "mixed raw input did not reach the traffic server"
+                                    )
+                                entry["injected"] = dict(injector.counts)
+                        finally:
+                            if injector:
+                                injector.close()
+                        entry.update(
+                            status="passed",
+                            metrics=metrics(sample),
+                            resources=resource_metrics(sample),
+                        )
+                        goodput = entry["metrics"][
+                            "confirmed_bidirectional_bytes_per_second"
+                        ]
+                        entry["resources"]["daemon"]["cpu_ns_per_confirmed_byte"] = (
+                            entry["resources"]["daemon"]["cpu_seconds"]
+                            * 1e9
+                            / (goodput * sample["wall_seconds"])
+                            if goodput
+                            else None
+                        )
+                        daemon.finish()
+                        print(
+                            f"{case_id} {implementation} {repetition}: {goodput * 8 / 1e9:.3f} Gbit/s, "
+                            f"lost={entry['metrics']['totals']['lost_datagrams']}",
+                            flush=True,
+                        )
+                    except BaseException as error:
+                        entry.update(status="failed", error=str(error))
+                        raise
+                    finally:
+                        if daemon:
+                            daemon.close()
+                        save(path, result)
+        if not result["runs"]:
+            raise ValueError("no matching benchmark cases")
+        result.update(status="passed", comparisons=comparisons(result["runs"]))
+    except BaseException:
+        result["status"] = "failed"
+        raise
     finally:
-        server.send_signal(signal.SIGTERM)
-        server.wait(timeout=5)
-        server_log.close()
-
-    output.write_text(json.dumps(results, indent=2) + "\n")
-    print(f"Results: {output}", flush=True)
-
-
-def run_checked(argv, *, cwd=None, env=None):
-    subprocess.run(argv, cwd=cwd, env=env, check=True)
-
-
-def run_host(output, duration, repetitions):
-    sing_box_source = ROOT / "target/sing-box"
-    sing_box_binary = ROOT / "target/sing-box-main"
-    kotoconn_binary = (
-        ROOT / "target/x86_64-unknown-linux-musl/release/kotoconn"
-    )
-    sing_box_ref = os.environ.get("SING_BOX_REF", SING_BOX_REF)
-
-    output.parent.mkdir(parents=True, exist_ok=True)
-    if not (sing_box_source / ".git").is_dir():
-        run_checked(
-            [
-                "git",
-                "clone",
-                "--depth",
-                "1",
-                "--branch",
-                "testing",
-                "--filter=blob:none",
-                "https://github.com/SagerNet/sing-box.git",
-                str(sing_box_source),
-            ]
-        )
-    run_checked(
-        ["git", "fetch", "--depth", "1", "origin", sing_box_ref],
-        cwd=sing_box_source,
-    )
-    run_checked(["git", "checkout", "--detach", "FETCH_HEAD"], cwd=sing_box_source)
-
-    run_checked(
-        [
-            "cargo",
-            "zigbuild",
-            "--release",
-            "--locked",
-            "-p",
-            "kotoconn-cli",
-            "--target",
-            "x86_64-unknown-linux-musl",
-        ],
-        cwd=ROOT,
-    )
-    sing_box_commit = command(
-        "git", "-C", str(sing_box_source), "rev-parse", "HEAD", timeout=10
-    ).stdout.strip()
-    go_env = dict(os.environ, CGO_ENABLED="0")
-    run_checked(
-        [
-            "go",
-            "build",
-            "-trimpath",
-            "-tags",
-            "with_gvisor",
-            "-ldflags",
-            f"-X github.com/sagernet/sing-box/constant.Version=main-{sing_box_commit[:12]} -s -w -buildid=",
-            "-o",
-            str(sing_box_binary),
-            "./cmd/sing-box",
-        ],
-        cwd=sing_box_source,
-        env=go_env,
-    )
-    run_checked(
-        [
-            "docker",
-            "build",
-            "--tag",
-            "kotoconn-tun-benchmark:local",
-            "--file",
-            str(ROOT / "benchmarks/tun-loopback/Dockerfile"),
-            str(ROOT),
-        ]
-    )
-
-    source_diff = command(
-        "git",
-        "-C",
-        str(ROOT),
-        "diff",
-        "--",
-        "crates",
-        "Cargo.toml",
-        "Cargo.lock",
-        timeout=10,
-    ).stdout.encode()
-    source_digest = hashlib.sha256(source_diff).hexdigest()
-    kotoconn_commit = command(
-        "git", "-C", str(ROOT), "rev-parse", "HEAD", timeout=10
-    ).stdout.strip()
-    run_checked(
-        [
-            "docker",
-            "run",
-            "--rm",
-            "--cap-add",
-            "NET_ADMIN",
-            "--device",
-            "/dev/net/tun",
-            "--cpus",
-            "4",
-            "--memory",
-            "2g",
-            "--sysctl",
-            "net.ipv4.conf.all.rp_filter=0",
-            "--sysctl",
-            "net.ipv4.conf.default.rp_filter=0",
-            "--sysctl",
-            "net.ipv4.conf.all.accept_local=1",
-            "--sysctl",
-            "net.ipv4.conf.default.accept_local=1",
-            "--env",
-            f"KOTOCONN_COMMIT={kotoconn_commit}",
-            "--env",
-            f"KOTOCONN_SOURCE_DIFF_SHA256={source_digest}",
-            "--env",
-            f"SING_BOX_COMMIT={sing_box_commit}",
-            "--volume",
-            f"{kotoconn_binary}:/opt/kotoconn:ro",
-            "--volume",
-            f"{sing_box_binary}:/opt/sing-box:ro",
-            "--volume",
-            f"{output.parent}:/output",
-            "kotoconn-tun-benchmark:local",
-            "--inside",
-            "--output",
-            f"/output/{output.name}",
-            "--duration",
-            str(duration),
-            "--repetitions",
-            str(repetitions),
-        ]
-    )
+        save(path, result)
+        write_csv(args.output / "samples.csv", result["runs"])
+    print(f"Results: {path}", flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--inside", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--output", type=Path)
-    parser.add_argument("--duration", type=int, default=3)
-    parser.add_argument("--repetitions", type=int, default=5)
+    add_arguments(parser, release=True)
+    parser.add_argument("--profile", choices=("quick", "full"), default="quick")
+    parser.add_argument(
+        "--mtu", action="append", type=int, choices=(1280, 1500, 9000, 65535)
+    )
+    parser.add_argument("--family", action="append", type=int, choices=(4, 6))
+    parser.add_argument("--case", action="append")
+    parser.add_argument("--duration", type=float, default=3)
+    parser.add_argument("--warmup", type=float, default=1)
+    parser.add_argument("--repetitions", type=int, default=3)
+    parser.add_argument(
+        "--udp-rate", type=int, default=10000, help="offered datagrams/s per UDP flow"
+    )
+    parser.add_argument(
+        "--sing-box",
+        type=Path,
+        help="optional sing-box 1.15 reference with the go TUN stack",
+    )
     args = parser.parse_args()
-
-    if args.inside:
-        run_inside(
-            args.output or Path("/output/results.json"),
-            args.duration,
-            args.repetitions,
+    args.binary = args.binary.resolve(strict=True)
+    args.traffic_binary = args.traffic_binary.resolve(strict=True)
+    if args.sing_box:
+        args.sing_box = args.sing_box.resolve(strict=True)
+        args.reference_version = command(str(args.sing_box), "version").stdout.strip()
+        if not args.reference_version.startswith("sing-box version 1.15."):
+            parser.error("the reference must be sing-box 1.15 with the go TUN stack")
+    args.mtu = list(dict.fromkeys(args.mtu or [1500, 9000]))
+    args.family = list(
+        dict.fromkeys(args.family or ([4, 6] if args.profile == "full" else [4]))
+    )
+    if (
+        args.duration < 0.2
+        or args.warmup < 0
+        or args.repetitions < 1
+        or args.udp_rate < 1
+    ):
+        parser.error(
+            "duration must be >= 0.2s, warmup >= 0, repetitions and UDP rate positive"
         )
-    else:
-        run_host(
-            (
-                args.output
-                or ROOT / "target/benchmarks/tun-loopback/results.json"
-            ).resolve(),
-            args.duration,
-            args.repetitions,
+    selected = list(cases(args))
+    if not selected:
+        parser.error("no matching benchmark cases")
+    required_ports = (
+        sum(len(implementations(args, name)) for _, name, _ in selected)
+        * args.repetitions
+        * (1 + bool(args.warmup))
+    )
+    if required_ports > len(SERVER_PORTS):
+        parser.error(
+            f"selected matrix needs {required_ports} traffic server ports; "
+            f"only {len(SERVER_PORTS)} are available; reduce repetitions or select fewer cases"
         )
+    if not enter(args, Path(__file__).resolve(), "benchmarks"):
+        run(args)
 
 
 if __name__ == "__main__":

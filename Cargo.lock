@@ -1038,6 +1038,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hdrhistogram"
+version = "7.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f49d1053f4708f0af3cf9fc5bffc7e68a914a3c45becb231c80068c9c3f78bea"
+dependencies = [
+ "byteorder",
+ "num-traits",
+]
+
+[[package]]
 name = "heapless"
 version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1573,6 +1583,18 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tun-rs",
+]
+
+[[package]]
+name = "kotoconn-tun-traffic"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hdrhistogram",
+ "libc",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

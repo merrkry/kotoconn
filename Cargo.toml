@@ -11,6 +11,7 @@ members = [
     "crates/shadowsocks2022",
     "crates/socks5",
     "crates/tun",
+    "crates/tun-traffic",
     "crates/typescript",
 ]
 resolver = "3"

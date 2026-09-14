@@ -1,4 +1,5 @@
 /target/
+__pycache__/
 node_modules/
 dist/
 /packages/bindings/src/generated.d.ts

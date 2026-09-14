@@ -30,8 +30,38 @@ Run the protocol tests and isolated Linux E2E tests with:
 
 ```sh
 cargo test -p kotoconn-tun
-cargo build -p kotoconn-cli
+cargo build -p kotoconn-cli -p kotoconn-tun-traffic
 python3 e2e/tun.py
 ```
 
-The E2E runner creates a network namespace, exercises the real CLI against Linux TCP/UDP sockets, injects malformed IP packets, and checks graceful and forced shutdown. It needs `unshare`, `iproute2`, and either unprivileged user namespaces or root. Logs and generated policy files are retained under `target/`.
+The E2E runner creates a network namespace, exercises the real CLI against Linux TCP/UDP sockets, injects malformed IP packets, and checks graceful and forced shutdown. It needs `unshare`, `iproute2`, and either unprivileged user namespaces or root. Each invocation owns a new network namespace and artifact directory, so workspaces can run concurrently. See [TUN test responsibilities](../../e2e/tun_support/README.md) for the quick/stress profiles, deterministic tests, mixed malformed traffic and isolation checks.
+
+## smoltcp fork
+
+Cargo patches smoltcp to `external/smoltcp`, based on upstream 0.14.0. The fork
+keeps TCP sequence handling, ACKs, retransmission and congestion control, while
+adding the interfaces this crate needs:
+
+- `TcpContext` and direct socket driving let the receive worker supply time,
+  addresses and link capabilities without a per-connection Interface or device.
+- Replaceable TCP byte storage accepts sparse immutable payload blocks. Receive
+  targets are independent of allocated bytes, and receive context preserves views
+  into owned input frames. Contiguous TX ranges may span multiple blocks.
+- `dispatch_scattered` returns headers and logical payload ranges. TUN can retain
+  their block views for vectored GSO output without gathering the data first.
+- Dynamic receive windows preserve previously advertised space when a target
+  falls. Scaling does not create extra credit, and a larger window waits for
+  handshake completion instead of repeatedly transmitting SYN-ACK.
+
+The ordinary Interface and ring-buffer APIs remain available. Runtime scheduling,
+allocation policy, pools and worker ownership stay in Kotoconn. See
+[TUN buffering](../../docs/tun-buffering.md) for their implementation.
+
+The fork is excluded from the parent Cargo workspace. Run its tests separately:
+
+```sh
+cargo test --manifest-path external/smoltcp/Cargo.toml --lib --no-default-features --features std,medium-ip,proto-ipv4,proto-ipv6,socket-tcp,socket-tcp-cubic,assembler-max-segment-count-32,segmentation-offload
+```
+
+Git branch and submodule operations are documented in
+[external sources](../../external/README.md).

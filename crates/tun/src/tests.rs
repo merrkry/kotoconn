@@ -273,30 +273,42 @@ fn udp_output_views_segment_into_valid_wire_datagrams() {
 
 #[test]
 fn udp_roundtrips_empty_and_fragmented_datagrams_in_both_families() {
-    for ipv6 in [false, true] {
-        let flow = flow(ipv6);
-        for size in [0, 1, 1232, 4096, if ipv6 { 65527 } else { 65507 }] {
-            let payload: Vec<_> = (0..size).map(|i| (i % 251) as u8).collect();
-            let mut encoder = udp::Encoder::new(1280);
-            let mut packets = encoder
-                .encode(flow.source, flow.destination, &payload)
-                .unwrap();
-            assert!(!packets.is_empty());
-            assert!(packets.iter().all(|p| p.len() <= 1280));
-            // The last fragment may arrive first.
-            packets.reverse();
-            let mut decoder = Decoder::default();
-            let now = Instant::now();
-            let mut completed = Vec::new();
-            for packet in packets {
-                if let Some(packet) = decoder.decode(&packet, now) {
-                    completed.push(packet.into_owned());
+    for mtu in [1280, 1500, 9000, 65535] {
+        for ipv6 in [false, true] {
+            let flow = flow(ipv6);
+            let boundary = mtu - if ipv6 { 48 } else { 28 };
+            let maximum = if ipv6 { 65527 } else { 65507 };
+            for size in [
+                0,
+                1,
+                boundary - 1,
+                boundary,
+                (boundary + 1).min(maximum),
+                4096,
+                maximum,
+            ] {
+                let payload: Vec<_> = (0..size).map(|i| (i % 251) as u8).collect();
+                let mut encoder = udp::Encoder::new(mtu);
+                let mut packets = encoder
+                    .encode(flow.source, flow.destination, &payload)
+                    .unwrap();
+                assert!(!packets.is_empty());
+                assert!(packets.iter().all(|p| p.len() <= mtu));
+                // The last fragment may arrive first.
+                packets.reverse();
+                let mut decoder = Decoder::default();
+                let now = Instant::now();
+                let mut completed = Vec::new();
+                for packet in packets {
+                    if let Some(packet) = decoder.decode(&packet, now) {
+                        completed.push(packet.into_owned());
+                    }
                 }
+                assert_eq!(completed.len(), 1, "IPv6={ipv6}, payload={size}");
+                let (received_flow, received) = completed[0].udp().unwrap();
+                assert_eq!(received_flow, flow);
+                assert_eq!(received, payload);
             }
-            assert_eq!(completed.len(), 1, "IPv6={ipv6}, payload={size}");
-            let (received_flow, received) = completed[0].udp().unwrap();
-            assert_eq!(received_flow, flow);
-            assert_eq!(received, payload);
         }
     }
 }
