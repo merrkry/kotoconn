@@ -265,8 +265,7 @@ impl p::Handler for SessionHandler {
                             .run(async {
                                 let mut outbound = client.tcp_scoped(target, scope.clone()).await?;
                                 let (sent_bytes, received_bytes) =
-                                    tokio::io::copy_bidirectional(&mut stream, &mut outbound)
-                                        .await?;
+                                    p::copy_bidirectional(&mut stream, &mut outbound).await?;
                                 tracing::debug!(sent_bytes, received_bytes, "TCP relay completed");
                                 Ok(())
                             })

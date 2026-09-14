@@ -1,16 +1,9 @@
 use crate::{Scope, Target, queue};
-use anyhow::Result;
 use bytes::Bytes;
-use std::{
-    future::Future,
-    pin::Pin,
-    task::{Context, Poll},
-};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use std::pin::Pin;
 
-pub trait Stream: AsyncRead + AsyncWrite + Send {}
-
-impl<T: AsyncRead + AsyncWrite + Send> Stream for T {}
+pub use crate::chunk::{ChunkBuffer, Stream, copy_bidirectional, prefix};
+pub use crate::scoped::stream_task;
 
 pub type BoxStream = Pin<Box<dyn Stream>>;
 
@@ -51,63 +44,4 @@ pub fn packet_pair(scope: Scope) -> (Datagram, Datagram) {
             scope,
         },
     )
-}
-
-/// Decouples protocol progress from the caller's read/write scheduling. Reading
-/// alone advances setup, including server-first protocols. Drop cancels setup/I/O.
-pub fn stream_task(
-    scope: Scope,
-    connect: impl Future<Output = Result<BoxStream>> + Send + 'static,
-) -> Result<BoxStream> {
-    let (local, mut remote) = crate::stream_buffer::duplex();
-    let handle = scope.clone();
-
-    scope.spawn(async move {
-        let mut stream = connect.await?;
-        tokio::io::copy_bidirectional(&mut remote, &mut stream).await?;
-        Ok(())
-    })?;
-    Ok(Box::pin(OwnedStream {
-        inner: local,
-        scope: handle,
-    }))
-}
-
-struct OwnedStream {
-    inner: crate::stream_buffer::BufferedStream,
-    scope: Scope,
-}
-
-impl Drop for OwnedStream {
-    fn drop(&mut self) {
-        self.scope.close();
-    }
-}
-
-impl AsyncRead for OwnedStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for OwnedStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
 }

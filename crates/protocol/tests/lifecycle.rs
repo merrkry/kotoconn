@@ -53,3 +53,23 @@ async fn dropping_an_unread_stream_cancels_its_setup_without_closing_siblings() 
     assert!(!sibling.is_closed());
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_revokes_an_established_stream_even_when_its_handle_is_idle() -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let scope = Scope::new();
+    let (socket, mut peer) = tokio::io::duplex(16);
+    let mut stream = stream_task(scope.clone(), async move {
+        Ok(Box::pin(socket) as kotoconn_protocol::BoxStream)
+    })?;
+    stream.write_all(b"ready").await?;
+    let mut message = [0; 5];
+    peer.read_exact(&mut message).await?;
+    assert_eq!(&message, b"ready");
+
+    scope.close();
+    tokio::time::timeout(Duration::from_secs(1), scope.wait()).await?;
+    assert_eq!(peer.read(&mut [0]).await?, 0);
+    assert_eq!(stream.read(&mut [0]).await?, 0);
+    Ok(())
+}

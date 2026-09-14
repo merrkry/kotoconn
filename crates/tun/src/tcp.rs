@@ -202,6 +202,75 @@ impl AsyncWrite for Stream {
     }
 }
 
+impl kotoconn_protocol::Stream for Stream {
+    fn poll_read_chunk(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        _: &mut kotoconn_protocol::ChunkBuffer,
+    ) -> Poll<io::Result<Bytes>> {
+        let budget = ready!(coop::poll_proceed(cx));
+        self.shared.reader.register(cx.waker());
+        if self.shared.reset.load(Ordering::Acquire) {
+            return Poll::Ready(Err(reset_error()));
+        }
+        if self.head.is_empty()
+            && let Some(bytes) = self.shared.incoming.pop()
+        {
+            self.head = bytes;
+        }
+        if !self.head.is_empty() {
+            budget.made_progress();
+            return Poll::Ready(Ok(std::mem::take(&mut self.head)));
+        }
+        if self.shared.eof.load(Ordering::Acquire) {
+            if let Some(bytes) = self.shared.incoming.pop() {
+                budget.made_progress();
+                return Poll::Ready(Ok(bytes));
+            }
+            self.read_eof = true;
+            Poll::Ready(Ok(Bytes::new()))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn consume_chunk(self: Pin<&mut Self>, n: usize) {
+        let old = self.shared.rx_used.fetch_sub(n, Ordering::AcqRel);
+        debug_assert!(old >= n);
+        self.shared.rx_consumed.fetch_add(n, Ordering::Release);
+        self.shared.wake();
+    }
+
+    fn poll_write_chunk(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &mut Bytes,
+    ) -> Poll<io::Result<usize>> {
+        let budget = ready!(coop::poll_proceed(cx));
+        self.shared.writer.register(cx.waker());
+        if self.shared.reset.load(Ordering::Acquire) {
+            return Poll::Ready(Err(reset_error()));
+        }
+        if self.write_eof {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+        let available = self
+            .shared
+            .tx_target
+            .load(Ordering::Acquire)
+            .saturating_sub(self.shared.tx_used.load(Ordering::Acquire));
+        let n = bytes.len().min(available);
+        if n == 0 {
+            return Poll::Pending;
+        }
+        self.shared.tx_used.fetch_add(n, Ordering::Release);
+        self.shared.outgoing.push(bytes.split_to(n));
+        self.shared.wake();
+        budget.made_progress();
+        Poll::Ready(Ok(n))
+    }
+}
+
 pub(crate) struct Accept {
     receiver: oneshot::Receiver<Stream>,
     shared: Arc<Shared>,
