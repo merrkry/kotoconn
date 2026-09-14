@@ -37,7 +37,7 @@ Packet queues reserve bytes atomically and consume batches. Worker-local direct 
 | Cross-worker ingress | Drop new packets |
 | TCP RX | Advertise available receive credit; retain already accepted data |
 | TCP TX | Apply Stream write backpressure until ACK returns credit |
-| TUN transmit queue | TCP connections retry from the worker's blocked list; ordinary UDP writers wait; direct UDP replies and immediate ACK/reset replies use nonblocking admission |
+| TUN transmit queue | TCP connections retry from the worker's blocked list; ordinary UDP writers wait; direct UDP retains one reply batch and retries from the worker's blocked list; immediate ACK/reset replies use nonblocking admission |
 | UDP association ingress | Drop new datagrams without blocking shared reception |
 | UDP GSO segments | Share one receive allocation; apply per-datagram admission before queueing views |
 | IP reassembly | Reject growth beyond shared allowance before allocation; expiry releases incomplete datagrams |

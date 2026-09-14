@@ -8,7 +8,7 @@ use std::{
     ptr,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicPtr, Ordering},
+        atomic::{AtomicPtr, Ordering},
     },
     task::{Context, Poll},
 };
@@ -21,7 +21,6 @@ struct Value<T> {
 
 pub(crate) struct Shared<T: Send> {
     value: AtomicPtr<Value<T>>,
-    pub(crate) closed: AtomicBool,
     pub(crate) reader: AtomicWaker,
     pub(crate) writer: AtomicWaker,
 }
@@ -34,32 +33,55 @@ impl<T: Send> Shared<T> {
         Some(result)
     }
 
-    fn take(&self) -> Option<Box<Value<T>>> {
-        let pointer = self.value.swap(ptr::null_mut(), Ordering::AcqRel);
-        if pointer.is_null() {
-            return None;
+    fn closed_pointer() -> *mut Value<T> {
+        // SAFETY: Value contains a WorkGuard with pointer-aligned storage, so 1
+        // can never equal a live allocation. This sentinel is never dereferenced.
+        const {
+            assert!(std::mem::align_of::<Value<T>>() >= 2);
         }
-        // SAFETY: swap transfers the slot's sole Box to this caller. Only put
-        // publishes pointers, and neither cancellation nor I/O can take it twice.
+        ptr::without_provenance_mut(1)
+    }
+
+    fn is_closed(&self) -> bool {
+        self.value.load(Ordering::Acquire) == Self::closed_pointer()
+    }
+
+    fn take(&self) -> Option<Box<Value<T>>> {
+        let pointer = self
+            .value
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pointer| {
+                (!pointer.is_null() && pointer != Self::closed_pointer()).then_some(ptr::null_mut())
+            })
+            .ok()?;
+        // SAFETY: The successful CAS takes the slot's sole live Box. The closed
+        // sentinel is excluded and remains installed permanently once observed.
         Some(unsafe { Box::from_raw(pointer) })
     }
 
     fn put(&self, value: Box<Value<T>>) {
-        if self.closed.load(Ordering::Acquire) {
-            return;
-        }
-        debug_assert!(self.value.load(Ordering::Relaxed).is_null());
-        self.value.store(Box::into_raw(value), Ordering::Release);
-        // Cancellation may have observed an empty slot while I/O held it.
-        // Recheck after publication so either cancellation or this owner drops it.
-        if self.closed.load(Ordering::Acquire) {
-            drop(self.take());
+        let pointer = Box::into_raw(value);
+        if let Err(state) = self.value.compare_exchange(
+            ptr::null_mut(),
+            pointer,
+            Ordering::Release,
+            Ordering::Relaxed,
+        ) {
+            // SAFETY: The CAS did not publish this Box, so this caller still owns
+            // it. Cancellation cannot take it and no future poll can acquire it.
+            drop(unsafe { Box::from_raw(pointer) });
+            // SAFETY: Only one I/O handle publishes; cancellation is the sole
+            // competing writer. It replaces an empty/busy slot with the sentinel.
+            assert_eq!(state, Self::closed_pointer(), "occupied I/O slot");
         }
     }
 
     pub(crate) fn close(&self) {
-        self.closed.store(true, Ordering::Release);
-        drop(self.take());
+        let pointer = self.value.swap(Self::closed_pointer(), Ordering::AcqRel);
+        if !pointer.is_null() && pointer != Self::closed_pointer() {
+            // SAFETY: swap takes ownership of the published Box exactly once.
+            // A concurrent poll either took it earlier or observes the sentinel.
+            drop(unsafe { Box::from_raw(pointer) });
+        }
         self.reader.wake();
         self.writer.wake();
     }
@@ -67,7 +89,7 @@ impl<T: Send> Shared<T> {
 
 impl<T: Send> Drop for Shared<T> {
     fn drop(&mut self) {
-        drop(self.take());
+        self.close();
     }
 }
 
@@ -87,7 +109,6 @@ pub fn stream_task(
 ) -> anyhow::Result<BoxStream> {
     let shared = Arc::new(Shared {
         value: AtomicPtr::new(ptr::null_mut()),
-        closed: AtomicBool::new(false),
         reader: AtomicWaker::new(),
         writer: AtomicWaker::new(),
     });
@@ -113,7 +134,6 @@ pub fn stream_task(
 pub(crate) fn installed<T: Send + 'static>(scope: &Scope, io: T) -> anyhow::Result<Arc<Shared<T>>> {
     let shared = Arc::new(Shared {
         value: AtomicPtr::new(ptr::null_mut()),
-        closed: AtomicBool::new(false),
         reader: AtomicWaker::new(),
         writer: AtomicWaker::new(),
     });
@@ -137,14 +157,11 @@ struct Scoped {
 
 impl Scoped {
     fn with<T>(&mut self, operation: impl FnOnce(Pin<&mut dyn Stream>) -> T) -> Option<T> {
-        let mut value = self.shared.take()?;
-        let result = operation(value.io.as_mut());
-        self.shared.put(value);
-        Some(result)
+        self.shared.with(|io| operation(io.as_mut()))
     }
 
     fn unavailable<T>(&self) -> Poll<io::Result<T>> {
-        if self.shared.closed.load(Ordering::Acquire) {
+        if self.shared.is_closed() {
             Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
         } else {
             Poll::Pending
@@ -168,7 +185,7 @@ impl AsyncRead for Scoped {
         self.shared.reader.register(cx.waker());
         self.with(|stream| stream.poll_read(cx, out))
             .unwrap_or_else(|| {
-                if self.shared.closed.load(Ordering::Acquire) {
+                if self.shared.is_closed() {
                     Poll::Ready(Ok(()))
                 } else {
                     Poll::Pending
@@ -213,7 +230,7 @@ impl Stream for Scoped {
         self.shared.reader.register(cx.waker());
         self.with(|stream| stream.poll_read_chunk(cx, buffer))
             .unwrap_or_else(|| {
-                if self.shared.closed.load(Ordering::Acquire) {
+                if self.shared.is_closed() {
                     Poll::Ready(Ok(Bytes::new()))
                 } else {
                     Poll::Pending
@@ -231,5 +248,57 @@ impl Stream for Scoped {
     }
     fn consume_chunk(mut self: Pin<&mut Self>, bytes: usize) {
         self.with(|stream| stream.consume_chunk(bytes));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    struct Resource(Arc<AtomicBool>);
+    impl Drop for Resource {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_waits_for_in_flight_io_and_prevents_republication() {
+        let scope = Scope::new();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let shared = installed(&scope, Resource(dropped.clone())).unwrap();
+        let io = shared.clone();
+        let (entered, executing) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            io.with(|_| {
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+            })
+        });
+        executing.await.unwrap();
+        scope.close();
+        std::future::poll_fn(|cx| {
+            shared.reader.register(cx.waker());
+            if shared.is_closed() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        tokio::select! {
+            biased;
+            _ = scope.wait() => panic!("scope finished while I/O retained its resource"),
+            _ = std::future::ready(()) => {},
+        }
+        assert!(!dropped.load(Ordering::Acquire));
+        release.send(()).unwrap();
+        assert_eq!(thread.join().unwrap(), Some(()));
+        scope.wait().await;
+        assert!(dropped.load(Ordering::Acquire));
+        assert!(shared.is_closed());
+        assert!(shared.with(|_| ()).is_none());
     }
 }

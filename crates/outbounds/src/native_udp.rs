@@ -4,7 +4,9 @@ use std::{
     io,
     task::{Context, Poll, ready},
 };
-use tokio::{io::Interest, net::UdpSocket, sync::oneshot};
+#[cfg(target_os = "linux")]
+use tokio::io::Interest;
+use tokio::{net::UdpSocket, sync::oneshot};
 
 struct Native {
     socket: UdpSocket,
@@ -74,7 +76,10 @@ impl PacketIo for Native {
             ready!(self.socket.poll_recv_ready(cx))?;
             let mut buffers: Vec<_> = (0..self.batch).map(|_| self.pool.acquire(65536)).collect();
             let mut lengths = [0; 32];
+            #[cfg(target_os = "linux")]
             let mut segments = [0; 32];
+            #[cfg(not(target_os = "linux"))]
+            let segments = [0; 32];
             #[cfg(target_os = "linux")]
             let result = self.socket.try_io(Interest::READABLE, || {
                 crate::udp_batch::receive(&self.socket, &mut buffers, &mut lengths, &mut segments)
@@ -126,7 +131,11 @@ impl PacketIo for Native {
             } else {
                 count.max(1)
             };
-            self.batch = messages.min((32 * count / datagrams.max(1)).max(1));
+            self.batch = if cfg!(target_os = "linux") {
+                messages.min((32 * count / datagrams.max(1)).max(1))
+            } else {
+                1
+            };
             if datagrams != 0 {
                 return Poll::Ready(Ok(datagrams));
             }
@@ -206,6 +215,7 @@ async fn drive(
             // No outgoing batch was consumed. Queued inbound replies stay owned
             // by the user's receiver and are drained before future native reads.
             driver.disarm();
+            drop(driver);
             let _ = reply.send(Some(native));
             return Ok(());
         }

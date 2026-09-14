@@ -92,6 +92,7 @@ struct UdpEntry {
     scope: Scope,
     generation: u64,
     direct: Option<crate::udp_direct::Direct>,
+    blocked: bool,
 }
 
 impl Drop for UdpEntry {
@@ -141,8 +142,24 @@ impl Worker {
             .filter(|entry| entry.generation == id.1)
             && let Some(direct) = &mut entry.direct
         {
-            if entry.scope.is_closed() || !direct.poll(&self.output, &entry.activity) {
-                self.udp.remove(&id.0);
+            if entry.blocked {
+                self.blocked.retain(|(waiting, _)| *waiting != id);
+                entry.blocked = false;
+            }
+            let progress = if entry.scope.is_closed() {
+                crate::udp_direct::Progress::Closed
+            } else {
+                direct.poll(&self.output, &entry.activity)
+            };
+            match progress {
+                crate::udp_direct::Progress::Idle => {}
+                crate::udp_direct::Progress::Blocked(bytes) => {
+                    entry.blocked = true;
+                    self.blocked.push_back((id, bytes));
+                }
+                crate::udp_direct::Progress::Closed => {
+                    self.udp.remove(&id.0);
+                }
             }
             return;
         }
@@ -327,8 +344,12 @@ impl Worker {
                     return Ok(());
                 }
 
-                if self.udp.get(&flow).is_some_and(|e| e.scope.is_closed()) {
-                    self.udp.remove(&flow);
+                if self.udp.get(&flow).is_some_and(|e| e.scope.is_closed())
+                    && let Some(entry) = self.udp.remove(&flow)
+                    && entry.blocked
+                {
+                    self.blocked
+                        .retain(|(id, _)| *id != (flow, entry.generation));
                 }
 
                 if !self.udp.contains_key(&flow) {
@@ -384,6 +405,7 @@ impl Worker {
                         UdpEntry {
                             packets,
                             direct: None,
+                            blocked: false,
                             activity,
                             scope,
                             generation: self.generation,
@@ -508,6 +530,7 @@ pub(crate) async fn dispatch<R: PacketReceive>(
             _ = worker.context.stopping.cancelled(), if !worker.stopping => {
                 worker.stopping = true;
                 worker.udp.clear();
+                worker.blocked.retain(|(id, _)| worker.tcp.get(&id.0).is_some_and(|entry| entry.generation == id.1));
                 for entry in worker.tcp.values() {
                     entry.connection.wake();
                 }
@@ -517,6 +540,7 @@ pub(crate) async fn dispatch<R: PacketReceive>(
             Some((flow, generation)) = completed.recv() => {
                 if worker.udp.get(&flow).is_some_and(|e| e.generation == generation) {
                     worker.udp.remove(&flow);
+                    worker.blocked.retain(|(id, _)| *id != (flow, generation));
                 }
                 continue;
             },
@@ -560,6 +584,9 @@ pub(crate) async fn dispatch<R: PacketReceive>(
                 drop(permit?);
                 if let Some((id, _)) = worker.blocked.pop_front() {
                     if let Some(entry) = worker.tcp.get_mut(&id.0).filter(|e| e.generation == id.1) {
+                        entry.blocked = false;
+                    }
+                    if let Some(entry) = worker.udp.get_mut(&id.0).filter(|e| e.generation == id.1) {
                         entry.blocked = false;
                     }
                     worker.drive(id);

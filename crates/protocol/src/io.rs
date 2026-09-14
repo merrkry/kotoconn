@@ -53,6 +53,8 @@ pub trait DatagramWorker: Send + Sync {
 }
 
 impl Datagram {
+    /// The driver must stop and drop its queue endpoints before delivering the
+    /// native transport. No later packet may be published to the old reply queue.
     pub fn offer_handoff(&mut self) -> oneshot::Receiver<oneshot::Sender<Option<BoxPacketIo>>> {
         let (sender, receiver) = oneshot::channel();
         self.handoff = Some(sender);
@@ -110,10 +112,11 @@ impl PacketIo for BufferedPackets {
             while out.len() - before < 32 {
                 match pending.try_recv() {
                     Ok(packet) => out.push(packet),
-                    Err(_) => {
+                    Err(queue::Error::Closed) => {
                         self.pending = None;
                         break;
                     }
+                    Err(queue::Error::Full) => break,
                 }
             }
             if out.len() != before {
