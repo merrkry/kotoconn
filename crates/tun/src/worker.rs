@@ -6,6 +6,7 @@ use crate::{
     udp,
 };
 use anyhow::Result;
+#[cfg(test)]
 use bytes::Bytes;
 use kotoconn_protocol::{self as p, Scope, ServerContext, queue};
 use smoltcp::wire::{IpProtocol, TcpControl};
@@ -41,14 +42,14 @@ pub(crate) struct Forwarded {
 impl Forwarded {
     pub(crate) fn size(&self) -> usize {
         match &self.packet {
-            ForwardedPacket::Frame(bytes) => bytes.len(),
+            ForwardedPacket::Frame(frame) => frame.bytes.len(),
             ForwardedPacket::Reassembled(packet) => packet.storage_size(),
         }
     }
 }
 
 enum ForwardedPacket {
-    Frame(Vec<u8>),
+    Frame(crate::Received),
     Reassembled(Packet<'static>),
 }
 
@@ -172,7 +173,8 @@ impl Worker {
         }
     }
 
-    fn forward_raw(&mut self, bytes: &[u8], owner: usize) {
+    fn forward_raw(&mut self, frame: crate::Received, owner: usize) {
+        let bytes = &frame.bytes;
         // SAFETY: owner comes from Shared::owner, and receive buffers hold at most 65575 bytes.
         debug_assert!(owner < self.shared.inboxes.len());
         debug_assert!(bytes.len() <= 65575);
@@ -180,9 +182,8 @@ impl Worker {
             self.stats.forwarding_drops += 1;
             return;
         };
-        let bytes = bytes.to_vec();
         entry.send(Forwarded {
-            packet: ForwardedPacket::Frame(bytes),
+            packet: ForwardedPacket::Frame(frame),
         });
         self.stats.forwarded_packets += 1;
     }
@@ -202,10 +203,12 @@ impl Worker {
         self.stats.forwarded_packets += 1;
     }
 
-    fn packet(&mut self, packet: Packet<'_>) -> Result<()> {
+    fn packet(&mut self, packet: Packet<'_>, frame: Option<&crate::Received>) -> Result<()> {
+        let verified = frame.is_some_and(|frame| frame.checksum_verified);
+        let backing = frame.map(|frame| &frame.bytes);
         match packet.ip.next_header() {
             IpProtocol::Tcp => {
-                let Some((flow, repr)) = packet.tcp() else {
+                let Some((flow, repr)) = packet.tcp_with_checksum(verified) else {
                     return Ok(());
                 };
                 let owner = self
@@ -272,16 +275,16 @@ impl Worker {
                     .get_mut(&flow)
                     .expect("admitted TCP flow missing")
                     .connection
-                    .input(
-                        &packet.ip,
+                    .input_owned(
+                        &packet,
                         &repr,
-                        Instant::now(),
+                        backing.cloned(),
                         &self.output,
                         &mut self.arena,
                     );
             }
             IpProtocol::Udp if !self.stopping => {
-                let Some((flow, payload)) = packet.udp() else {
+                let Some((flow, payload)) = packet.udp_with_checksum(verified) else {
                     return Ok(());
                 };
                 let owner = self
@@ -353,16 +356,29 @@ impl Worker {
                 // dispatch mutates this map; tasks only send completions.
                 debug_assert!(self.udp.contains_key(&flow));
                 let entry = &self.udp[&flow];
-                let Ok(permit) = entry.packets.try_reserve(payload.len()) else {
-                    self.stats.capacity_drops += 1;
-                    return Ok(());
-                };
-                let payload = Bytes::copy_from_slice(payload);
-                permit.send(p::Packet {
-                    target: p::target(flow.destination),
-                    payload,
-                });
-                entry.activity.record();
+                let segment = frame
+                    .and_then(|frame| frame.udp_segment_size)
+                    .map(usize::from)
+                    .unwrap_or(payload.len().max(1));
+                // Empty UDP payloads are still one complete datagram.
+                let mut parts = payload.chunks(segment).peekable();
+                let mut first = true;
+                while first || parts.peek().is_some() {
+                    first = false;
+                    let payload = parts.next().unwrap_or(&[]);
+                    let Ok(permit) = entry.packets.try_reserve(payload.len()) else {
+                        self.stats.capacity_drops += 1;
+                        return Ok(());
+                    };
+                    let payload = backing
+                        .and_then(|source| crate::storage::view(source, payload))
+                        .unwrap_or_else(|| self.pool.copy(payload));
+                    permit.send(p::Packet {
+                        target: p::target(flow.destination),
+                        payload,
+                    });
+                    entry.activity.record();
+                }
             }
             _ => {}
         }
@@ -373,7 +389,7 @@ impl Worker {
 
 enum Input {
     Forwarded(Forwarded),
-    Read(usize),
+    Read(crate::Received),
 }
 
 pub(crate) async fn dispatch<R: PacketReceive>(
@@ -416,10 +432,11 @@ pub(crate) async fn dispatch<R: PacketReceive>(
         },
     };
     let mut decoder = Decoder::new(shared.reassembly.clone());
-    let mut buffer = vec![0; 65575];
+    let mut buffer = crate::ReceiveBuffer::default();
     let mut turns = 0;
     let mut reported_drained = false;
 
+    let writable = worker.output.clone();
     loop {
         if worker.stopping && worker.tcp.is_empty() && !reported_drained {
             let _ = shared.drained.send(id);
@@ -433,7 +450,6 @@ pub(crate) async fn dispatch<R: PacketReceive>(
         let expiry = decoder.deadline();
         let tcp_deadline = worker.timers.first_key_value().map(|(&(at, _), _)| at);
         let blocked = worker.blocked.front().copied();
-        let writable = worker.output.clone();
         let event = tokio::select! {
             _ = shared.stop.cancelled() => return Ok(()),
             _ = worker.context.stopping.cancelled(), if !worker.stopping => {
@@ -490,24 +506,23 @@ pub(crate) async fn dispatch<R: PacketReceive>(
                 // Neither forwarded traffic nor a busy kernel queue gets priority.
                 tokio::select! {
                     Some(forwarded) = inbox.recv() => Ok(Input::Forwarded(forwarded)),
-                    len = poll_fn(|cx| device.poll_recv(cx, &mut buffer)) => len.map(Input::Read),
+                    len = poll_fn(|cx| device.poll_frame(cx, &mut buffer)) => len.map(Input::Read),
                 }
             } => event?,
         };
 
         match event {
             Input::Forwarded(forwarded) => match forwarded.packet {
-                ForwardedPacket::Frame(bytes) => {
-                    if let Some(packet) = decoder.decode(&bytes, Instant::now()) {
-                        worker.packet(packet)?;
+                ForwardedPacket::Frame(frame) => {
+                    if let Some(packet) = decoder.decode(&frame.bytes, Instant::now()) {
+                        worker.packet(packet, Some(&frame))?;
                     }
                 }
-                ForwardedPacket::Reassembled(packet) => worker.packet(packet)?,
+                ForwardedPacket::Reassembled(packet) => worker.packet(packet, None)?,
             },
-            Input::Read(len) => {
-                // SAFETY: PacketReceive reports bytes written into buffer.
-                debug_assert!(len <= buffer.len());
-                let bytes = &buffer[..len];
+            Input::Read(frame) => {
+                let bytes = &frame.bytes;
+                let len = bytes.len();
                 worker.stats.received_packets += 1;
                 worker.stats.received_bytes += len as u64;
 
@@ -519,9 +534,9 @@ pub(crate) async fn dispatch<R: PacketReceive>(
                 };
                 let owner = shared.owner(key);
                 if owner != id {
-                    worker.forward_raw(bytes, owner);
+                    worker.forward_raw(frame, owner);
                 } else if let Some(packet) = parsed.decode(&mut decoder, Instant::now()) {
-                    worker.packet(packet)?;
+                    worker.packet(packet, Some(&frame))?;
                 }
             }
         }

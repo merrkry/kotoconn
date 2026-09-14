@@ -23,6 +23,7 @@ pub(crate) struct Storage {
     tx: bool,
     pool: Pool,
     scratch: Bytes,
+    pub source: Option<Bytes>,
 }
 
 impl Storage {
@@ -43,6 +44,7 @@ impl Storage {
             tx,
             pool,
             scratch: Bytes::new(),
+            source: None,
         }
     }
 
@@ -232,7 +234,12 @@ impl Buffer for Storage {
         // TCP already checked the advertised window. A lowered target must still
         // accept in-flight data covered by a previous window advertisement.
         if !data.is_empty() {
-            self.insert(self.head + self.length + offset, self.pool.copy(data));
+            let bytes = self
+                .source
+                .as_ref()
+                .and_then(|source| crate::storage::view(source, data))
+                .unwrap_or_else(|| self.pool.copy(data));
+            self.insert(self.head + self.length + offset, bytes);
         }
         data.len()
     }
@@ -279,6 +286,25 @@ mod tests {
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicUsize::new(0)),
         )
+    }
+
+    #[test]
+    fn receive_views_keep_the_frame_alive_through_overlaps_and_consumption() {
+        let mut rx = storage(false);
+        let source = rx.pool.copy(b"headerabcdefghij");
+        let pointer = source.as_ptr();
+        rx.source = Some(source.clone());
+        rx.write_unallocated(0, &source[6..]);
+        rx.source = None;
+        drop(source);
+        rx.enqueue_unallocated(10);
+        let bytes = rx.take().unwrap();
+        assert_eq!(bytes.as_ptr() as usize, pointer as usize + 6);
+        assert_eq!(bytes, b"abcdefghij"[..]);
+        rx.write_unallocated(0, b"next");
+        rx.enqueue_unallocated(4);
+        assert_eq!(rx.take().unwrap(), b"next"[..]);
+        assert_eq!(bytes, b"abcdefghij"[..]);
     }
 
     #[test]

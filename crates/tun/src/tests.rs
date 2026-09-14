@@ -99,29 +99,21 @@ fn gso_tcp_preserves_aggregate_bytes_sequence_and_flags_in_both_families() {
         let mut frame = vec![0; tun_rs::VIRTIO_NET_HDR_LEN];
         header.encode(&mut frame).unwrap();
         frame.extend_from_slice(&packet);
-        let mut output = vec![0; 65575];
-        let mut pending = std::collections::VecDeque::new();
-        let len = offload::normalize(
-            &mut frame,
-            &mut output,
-            &mut pending,
-            &mut kotoconn_protocol::queue::Capacity::new(kotoconn_protocol::queue::INITIAL_BYTES),
-        )
-        .unwrap();
-        let packet = decoded(&output[..len]);
-        let (actual_flow, tcp) = packet.tcp().unwrap();
+        let (verified, segments) = offload::normalize(&mut frame).unwrap();
+        let packet = decoded(&frame[tun_rs::VIRTIO_NET_HDR_LEN..]);
+        let (actual_flow, tcp) = packet.tcp_with_checksum(verified).unwrap();
         assert_eq!(actual_flow, flow(ipv6));
         assert_eq!(tcp.seq_number, TcpSeqNumber(100));
         assert_eq!(tcp.ack_number, Some(TcpSeqNumber(200)));
         assert_eq!(tcp.control, TcpControl::Psh);
         assert_eq!(tcp.payload, payload);
-        assert!(pending.is_empty());
+        assert!(segments.is_none());
     }
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn gso_udp_preserves_datagram_boundaries_and_rebuilds_checksums() {
+fn gso_udp_preserves_datagram_boundaries_without_rebuilding_payloads() {
     for (ipv6, segment_size) in [(false, 1000), (true, 1000), (false, 8), (true, 8)] {
         let flow = flow(ipv6);
         let payload: Vec<_> = (0..2501).map(|i| (i % 251) as u8).collect();
@@ -141,23 +133,14 @@ fn gso_udp_preserves_datagram_boundaries_and_rebuilds_checksums() {
         let mut frame = vec![0; tun_rs::VIRTIO_NET_HDR_LEN];
         header.encode(&mut frame).unwrap();
         frame.extend_from_slice(&packet);
-        let mut output = vec![0; 65575];
-        let mut pending = std::collections::VecDeque::new();
-        let len = offload::normalize(
-            &mut frame,
-            &mut output,
-            &mut pending,
-            &mut kotoconn_protocol::queue::Capacity::new(kotoconn_protocol::queue::INITIAL_BYTES),
-        )
-        .unwrap();
-        pending.push_front(output[..len].to_vec());
-        assert_eq!(pending.len(), payload.len().div_ceil(segment_size));
-        for (packet, expected) in pending.into_iter().zip(payload.chunks(segment_size)) {
-            let packet = decoded(&packet);
-            let (actual_flow, actual) = packet.udp().unwrap();
-            assert_eq!(actual_flow, flow);
-            assert_eq!(actual, expected);
-        }
+        let pointer = frame.as_ptr();
+        let (verified, size) = offload::normalize(&mut frame).unwrap();
+        assert_eq!(pointer, frame.as_ptr());
+        let packet = decoded(&frame[tun_rs::VIRTIO_NET_HDR_LEN..]);
+        let (actual_flow, actual) = packet.udp_with_checksum(verified).unwrap();
+        assert_eq!(actual_flow, flow);
+        let parts: Vec<_> = actual.chunks(usize::from(size.unwrap())).collect();
+        assert_eq!(parts, payload.chunks(segment_size).collect::<Vec<_>>());
     }
 }
 
@@ -214,25 +197,23 @@ fn udp_offload_encodes_a_computed_zero_checksum_as_all_ones() {
             let mut frame = vec![0; tun_rs::VIRTIO_NET_HDR_LEN];
             header.encode(&mut frame).unwrap();
             frame.extend_from_slice(&packet);
-            let mut output = vec![0; 65575];
-            let mut pending = std::collections::VecDeque::new();
-            let len = offload::normalize(
-                &mut frame,
-                &mut output,
-                &mut pending,
-                &mut kotoconn_protocol::queue::Capacity::new(
-                    kotoconn_protocol::queue::INITIAL_BYTES,
-                ),
-            )
-            .unwrap();
-            pending.push_front(output[..len].to_vec());
-            assert_eq!(pending.len(), if gso { 2 } else { 1 });
-            for bytes in pending {
+            let (verified, size) = offload::normalize(&mut frame).unwrap();
+            let packet = decoded(&frame[tun_rs::VIRTIO_NET_HDR_LEN..]);
+            let (_, actual) = packet.udp_with_checksum(verified).unwrap();
+            let parts: Vec<_> = actual
+                .chunks(size.map(usize::from).unwrap_or(actual.len()))
+                .collect();
+            assert_eq!(parts.len(), if gso { 2 } else { 1 });
+            for part in parts {
+                assert_eq!(part, payload);
+                let encoded = encoder.encode(flow.source, flow.destination, part).unwrap();
                 assert_eq!(
-                    UdpPacket::new_checked(&bytes[start..]).unwrap().checksum(),
+                    UdpPacket::new_checked(&encoded[0][start..])
+                        .unwrap()
+                        .checksum(),
                     0xffff
                 );
-                assert_eq!(decoded(&bytes).udp().unwrap().1, payload);
+                assert_eq!(decoded(&encoded[0]).udp().unwrap().1, payload);
             }
         }
     }

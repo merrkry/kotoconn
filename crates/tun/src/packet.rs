@@ -45,29 +45,38 @@ impl Packet<'_> {
     }
 
     pub fn tcp(&self) -> Option<(Flow, TcpRepr<'_>)> {
+        self.tcp_with_checksum(false)
+    }
+
+    pub fn tcp_with_checksum(&self, verified: bool) -> Option<(Flow, TcpRepr<'_>)> {
         let packet = TcpPacket::new_checked(&self.payload[..]).ok()?;
         let repr = TcpRepr::parse(
             &packet,
             &self.ip.src_addr(),
             &self.ip.dst_addr(),
-            &ChecksumCapabilities::default(),
+            &checksums(verified),
         )
         .ok()?;
         Some((self.flow(repr.src_port, repr.dst_port)?, repr))
     }
 
+    #[cfg(test)]
     pub fn udp(&self) -> Option<(Flow, &[u8])> {
+        self.udp_with_checksum(false)
+    }
+
+    pub fn udp_with_checksum(&self, verified: bool) -> Option<(Flow, &[u8])> {
         let packet = UdpPacket::new_checked(&self.payload[..]).ok()?;
         // smoltcp 0.14's verify_checksum accepts zero for both address families.
         // RFC 8200 section 8.1 forbids it for ordinary UDP over IPv6.
-        if matches!(self.ip, IpRepr::Ipv6(_)) && packet.checksum() == 0 {
+        if !verified && matches!(self.ip, IpRepr::Ipv6(_)) && packet.checksum() == 0 {
             return None;
         }
         UdpRepr::parse(
             &packet,
             &self.ip.src_addr(),
             &self.ip.dst_addr(),
-            &ChecksumCapabilities::default(),
+            &checksums(verified),
         )
         .ok()?;
         // The IP payload may contain padding, but the UDP length defines the datagram.
@@ -83,6 +92,15 @@ impl Packet<'_> {
             destination: SocketAddr::new(self.ip.dst_addr().into(), destination),
         })
     }
+}
+
+fn checksums(verified: bool) -> ChecksumCapabilities {
+    let mut caps = ChecksumCapabilities::default();
+    if verified {
+        caps.tcp = smoltcp::phy::Checksum::None;
+        caps.udp = smoltcp::phy::Checksum::None;
+    }
+    caps
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -197,6 +215,18 @@ impl<'a> Parsed<'a> {
         ip.set_payload_len(payload.len());
         Some(Packet { ip, payload })
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn offload_transport(data: &[u8]) -> Option<(IpProtocol, usize)> {
+    let parsed = parse(data)?;
+    if parsed.fragment.is_some() {
+        return None;
+    }
+    Some((
+        parsed.ip.next_header(),
+        parsed.payload.as_ptr() as usize - data.as_ptr() as usize,
+    ))
 }
 
 pub(crate) fn parse(data: &[u8]) -> Option<Parsed<'_>> {

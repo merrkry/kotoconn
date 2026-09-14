@@ -11,7 +11,7 @@ use std::{
     future::poll_fn,
     io,
     sync::Arc,
-    task::{Context, Poll},
+    task::{Context, Poll, ready},
 };
 use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -21,6 +21,42 @@ use tracing::Instrument;
 /// register the supplied waker on Pending, and return at most bytes.len() bytes.
 pub trait PacketReceive: Send {
     fn poll_recv(&mut self, cx: &mut Context<'_>, bytes: &mut [u8]) -> Poll<io::Result<usize>>;
+
+    /// Transfer a frame's backing storage. The default supports ordinary packet
+    /// readers; device implementations can preserve offload metadata as well.
+    fn poll_frame(
+        &mut self,
+        cx: &mut Context<'_>,
+        buffer: &mut ReceiveBuffer,
+    ) -> Poll<io::Result<Received>> {
+        let lease = buffer
+            .lease
+            .get_or_insert_with(|| buffer.pool.acquire(65575));
+        let len = ready!(self.poll_recv(cx, lease.as_mut()))?;
+        // SAFETY: The receive call initialized this prefix, and the lease remains
+        // installed until a complete frame is returned.
+        let lease = buffer.lease.take().expect("receive lease");
+        Poll::Ready(Ok(Received {
+            bytes: lease.freeze(len),
+            checksum_verified: false,
+            udp_segment_size: None,
+        }))
+    }
+}
+
+#[derive(Default)]
+pub struct ReceiveBuffer {
+    pub(crate) pool: crate::pool::Pool,
+    pub(crate) lease: Option<kotoconn_protocol::pool::Lease>,
+}
+
+/// Offload assertions are accepted only from the device implementation. Ordinary
+/// packet readers leave both metadata fields unset and receive full validation.
+pub struct Received {
+    pub bytes: Bytes,
+    pub checksum_verified: bool,
+    /// UDP L4 segmentation, never IP fragmentation. Each slice is one datagram.
+    pub udp_segment_size: Option<u16>,
 }
 
 /// A queue has one transmit owner, independent of its receive owner.

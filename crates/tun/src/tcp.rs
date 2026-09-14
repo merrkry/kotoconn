@@ -501,6 +501,20 @@ impl Connection {
         self.wake();
     }
 
+    pub fn input_owned(
+        &mut self,
+        packet: &crate::packet::Packet<'_>,
+        repr: &TcpRepr<'_>,
+        source: Option<Bytes>,
+        output: &queue::Sender<Transmit>,
+        arena: &mut PacketArena,
+    ) {
+        self.socket
+            .receive_context(|storage| storage.source = source);
+        self.input(&packet.ip, repr, Instant::now(), output, arena);
+        self.socket.receive_context(|storage| storage.source = None);
+    }
+
     pub fn poll(
         &mut self,
         now: Instant,
