@@ -33,6 +33,7 @@ def fixed_work(binary, daemon, directory, spec, **kwargs):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     add_arguments(parser, release=True)
+    benchmark.add_traffic_arguments(parser)
     args = parser.parse_args()
     args.binary = args.binary.resolve(strict=True)
     args.traffic_binary = args.traffic_binary.resolve(strict=True)

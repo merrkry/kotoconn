@@ -3,6 +3,8 @@ mod payload;
 mod stats;
 mod tcp;
 mod udp;
+#[cfg(target_os = "linux")]
+mod udp_echo;
 
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, ValueEnum};
@@ -51,6 +53,15 @@ struct Args {
     target: IpAddr,
     #[arg(long, default_value_t = 9001)]
     port: u16,
+    /// Echo SO_RCVBUF request in bytes; zero inherits the host default.
+    #[arg(long, default_value_t = if cfg!(target_os = "linux") { 1048576 } else { 0 })]
+    udp_server_receive_buffer: u32,
+    /// Receive and echo up to N datagrams per syscall; one selects ordinary I/O.
+    #[arg(long, default_value_t = if cfg!(target_os = "linux") { 32 } else { 1 }, value_parser = clap::value_parser!(u8).range(1..=32))]
+    udp_echo_batch: u8,
+    /// Generator workers, independent of the daemon CPU budget.
+    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..=64))]
+    worker_threads: u16,
     #[arg(long, value_enum, default_value = "tcp")]
     protocol: Protocol,
     #[arg(long, value_enum, default_value = "bulk")]
@@ -111,9 +122,16 @@ fn emit(value: serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-#[tokio::main(worker_threads = 2)]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let args = Args::parse();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(usize::from(args.worker_threads))
+        .enable_all()
+        .build()?;
+    runtime.block_on(run(args))
+}
+
+async fn run(args: Args) -> Result<()> {
     ensure!(
         args.source.is_ipv4() == args.target.is_ipv4(),
         "address families differ"
@@ -149,9 +167,15 @@ async fn main() -> Result<()> {
     let (stop, stopping) = oneshot::channel();
     let server = tcp::serve(args.clone(), stopping).await?;
     let (udp_stop, udp_stopping) = oneshot::channel();
-    let udp_server = udp::serve(args.clone(), udp_stopping).await?;
+    let (udp_server, receive_buffer) = udp::serve(args.clone(), udp_stopping).await?;
+    let settings = json!({
+        "worker_threads": args.worker_threads,
+        "udp_echo_batch": args.udp_echo_batch,
+        "udp_server_receive_buffer_requested": args.udp_server_receive_buffer,
+        "udp_server_receive_buffer_actual": receive_buffer,
+    });
     let mut input = BufReader::new(tokio::io::stdin()).lines();
-    emit(json!({"event": "ready"}))?;
+    emit(json!({"event": "ready", "settings": settings}))?;
     if args.controlled {
         ensure!(
             input.next_line().await?.as_deref() == Some("start"),
@@ -210,7 +234,7 @@ async fn main() -> Result<()> {
     let positive_controls = udp_server.await??;
     flows.sort_by_key(|v| v["flow"].as_u64());
     emit(
-        json!({"event": "complete", "schema_version": 1, "seconds": started.elapsed().as_secs_f64(), "flows": flows, "positive_controls": positive_controls}),
+        json!({"event": "complete", "schema_version": 1, "seconds": started.elapsed().as_secs_f64(), "flows": flows, "positive_controls": positive_controls, "settings": settings}),
     )?;
     if args.controlled {
         ensure!(

@@ -64,6 +64,20 @@ UDP is exercised without adding a test header. UDP churn counts new client
 sockets, not necessarily new proxy associations: Linux may reuse a source port
 and its existing association, including one created during warmup.
 
+The Linux echo server receives and sends up to 32 datagrams per syscall and
+requests a 1 MiB socket receive buffer. Batching reduces server work at high
+packet rates. The explicit buffer prevents unusually large host defaults from
+turning server overload into hundreds of milliseconds of queued replies.
+This does not remove overload: loss remains visible and must be read alongside
+latency. No host socket settings are changed.
+
+Use `--udp-echo-batch 1` for the ordinary receive/send path, or
+`--udp-server-receive-buffer 0` to inherit the host buffer. Both parameters apply
+to every workload, including mixed traffic and warmup. The traffic result records
+the request and the effective SO_RCVBUF value, including kernel adjustment or
+clamping. Compare candidates with the same settings; results made with different
+echo configurations are separate experiments.
+
 Mixed cases use one bulk TCP, one sparse TCP, one churn TCP and one paced UDP
 flow per group of four. Malformed cases inject a named, deterministic corpus
 every sampling interval, alongside valid raw-packet controls that must reach
@@ -148,5 +162,10 @@ of this repository and does not enter the measurement window.
 two CPUs already available to the caller, or one when only one is available.
 It does not reserve CPUs or change host CPU settings. Choose separate affinity
 sets when comparing concurrent workspaces, or run performance comparisons
-sequentially. The generator uses two Tokio worker threads. Small CI samples
-validate the measurement pipeline; they are not performance baselines.
+sequentially. The generator uses four Tokio worker threads by default;
+`--traffic-workers N` changes this independently of the daemon. It inherits the
+runner's CPU affinity, recorded in metadata. For example, on a machine with six
+available CPUs, run `taskset -c 2-5 python3 benchmarks/run.py --daemon-cpus 0,1`
+to give the generator four CPUs separate from the daemon. Extra threads without
+CPU time do not establish generator capacity. Small CI samples validate the
+measurement pipeline; they are not performance baselines.
