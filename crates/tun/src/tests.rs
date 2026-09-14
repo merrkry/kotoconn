@@ -537,6 +537,92 @@ async fn tcp_admits_without_application_io_and_preserves_half_close() {
     }
 }
 
+#[tokio::test]
+async fn direct_handoff_preserves_prequeued_bytes_half_close_and_counts() {
+    for ipv6 in [false, true] {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (stream, packets, mut replies, driver, server_seq) = accepted(ipv6).await;
+            let listener =
+                tokio::net::TcpListener::bind(if ipv6 { "[::1]:0" } else { "127.0.0.1:0" })
+                    .await
+                    .unwrap();
+            let socket = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (mut peer, _) = listener.accept().await.unwrap();
+            packets
+                .send(segment(
+                    flow(ipv6),
+                    101,
+                    Some(server_seq),
+                    TcpControl::Fin,
+                    b"hello",
+                ))
+                .await
+                .unwrap();
+            let relay = tokio::spawn(async move {
+                let mut stream: kotoconn_protocol::BoxStream = Box::pin(stream);
+                kotoconn_protocol::relay(&mut stream, Box::pin(socket)).await
+            });
+            let remote = tokio::spawn(async move {
+                let mut data = Vec::new();
+                peer.read_to_end(&mut data).await.unwrap();
+                assert_eq!(data, b"hello");
+                peer.write_all(b"world").await.unwrap();
+                peer.shutdown().await.unwrap();
+            });
+            let mut received = Vec::new();
+            loop {
+                let packet = decoded(&replies.recv().await.unwrap().packet());
+                let (_, repr) = packet.tcp().unwrap();
+                received.extend_from_slice(repr.payload);
+                let fin = repr.control == TcpControl::Fin;
+                let end = repr.seq_number + repr.payload.len() + usize::from(fin);
+                packets
+                    .send(segment(flow(ipv6), 107, Some(end.0), TcpControl::None, &[]))
+                    .await
+                    .unwrap();
+                if fin {
+                    break;
+                }
+            }
+            assert_eq!(received, b"world");
+            assert_eq!(relay.await.unwrap().unwrap(), (5, 5));
+            remote.await.unwrap();
+            // The data contract completed; stop this fixture's TIME_WAIT owner.
+            driver.abort();
+            let _ = driver.await;
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn cancelling_handoff_before_its_first_poll_revokes_the_socket() {
+    use kotoconn_protocol::Stream as _;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (mut stream, _packets, _replies, driver, _) = accepted(false).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socket = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let mut socket: Option<kotoconn_protocol::BoxStream> = Some(Box::pin(socket));
+        let completion = std::pin::Pin::new(&mut stream)
+            .take_over(&mut socket)
+            .unwrap();
+        drop(completion);
+        assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+        assert_eq!(
+            driver.await.unwrap().unwrap_err().kind(),
+            io::ErrorKind::ConnectionReset
+        );
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test(start_paused = true)]
 async fn tcp_drop_aborts_and_remote_reset_is_an_io_error() {
     let (stream, _packets, mut replies, driver, _) = accepted(false).await;

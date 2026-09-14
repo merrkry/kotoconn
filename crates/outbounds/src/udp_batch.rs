@@ -58,23 +58,23 @@ fn send_gso(socket: &UdpSocket, packets: &[Packet], size: u16) -> io::Result<()>
     let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
     let mut control = [0usize; 8];
     message.msg_iov = vectors.as_mut_ptr();
-    message.msg_iovlen = packets.len();
+    message.msg_iovlen = packets.len() as _;
     message.msg_control = control.as_mut_ptr().cast();
     // SAFETY: CMSG_SPACE performs size arithmetic only.
-    message.msg_controllen = unsafe { libc::CMSG_SPACE(2) } as usize;
-    debug_assert!(message.msg_controllen <= std::mem::size_of_val(&control));
+    message.msg_controllen = unsafe { libc::CMSG_SPACE(2) } as _;
+    debug_assert!(message.msg_controllen as usize <= std::mem::size_of_val(&control));
     // SAFETY: The control buffer is aligned, initialized and large enough for one
     // UDP_SEGMENT u16. All packet vectors remain live throughout sendmsg.
     let sent = unsafe {
         let header = libc::CMSG_FIRSTHDR(&message);
         (*header).cmsg_level = libc::SOL_UDP;
         (*header).cmsg_type = libc::UDP_SEGMENT;
-        (*header).cmsg_len = libc::CMSG_LEN(2) as usize;
+        (*header).cmsg_len = libc::CMSG_LEN(2) as _;
         std::ptr::write_unaligned(libc::CMSG_DATA(header).cast::<u16>(), size);
         libc::sendmsg(
             socket.as_raw_fd(),
             &message,
-            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            (libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) as _,
         )
     };
     if sent < 0 {
@@ -111,7 +111,7 @@ pub(super) fn send(socket: &UdpSocket, packets: &[Packet]) -> io::Result<usize> 
             socket.as_raw_fd(),
             headers.as_mut_ptr(),
             packets.len() as u32,
-            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            (libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) as _,
         )
     };
     if n < 0 {
@@ -164,7 +164,7 @@ pub(super) fn receive(
         headers[index].msg_hdr.msg_iov = &mut vectors[index];
         headers[index].msg_hdr.msg_iovlen = 1;
         headers[index].msg_hdr.msg_control = controls[index].as_mut_ptr().cast();
-        headers[index].msg_hdr.msg_controllen = std::mem::size_of_val(&controls[index]);
+        headers[index].msg_hdr.msg_controllen = std::mem::size_of_val(&controls[index]) as _;
     }
     // SAFETY: The 32 descriptors point to distinct writable leases with the stated
     // lengths. MSG_DONTWAIT and a null timeout make this a nonblocking operation.
@@ -173,7 +173,7 @@ pub(super) fn receive(
             socket.as_raw_fd(),
             headers.as_mut_ptr(),
             buffers.len() as u32,
-            libc::MSG_DONTWAIT,
+            libc::MSG_DONTWAIT as _,
             std::ptr::null_mut(),
         )
     };
@@ -195,7 +195,7 @@ pub(super) fn receive(
             let mut control = libc::CMSG_FIRSTHDR(message);
             while !control.is_null() {
                 if (*control).cmsg_level == libc::SOL_UDP && (*control).cmsg_type == libc::UDP_GRO {
-                    if (*control).cmsg_len >= libc::CMSG_LEN(4) as usize {
+                    if (*control).cmsg_len as usize >= libc::CMSG_LEN(4) as usize {
                         let size = std::ptr::read_unaligned(libc::CMSG_DATA(control).cast::<u32>());
                         if size == 0 || size > u16::MAX as u32 {
                             lengths[index] = usize::MAX;

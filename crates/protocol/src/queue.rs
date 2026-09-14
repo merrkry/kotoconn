@@ -321,11 +321,20 @@ impl<T> Receiver<T> {
     }
 
     pub async fn recv_many(&mut self, out: &mut Vec<T>, limit: usize) -> usize {
+        std::future::poll_fn(|cx| self.poll_recv_many(cx, out, limit)).await
+    }
+
+    pub fn poll_recv_many(
+        &mut self,
+        cx: &mut Context<'_>,
+        out: &mut Vec<T>,
+        limit: usize,
+    ) -> Poll<usize> {
         if limit == 0 {
-            return 0;
+            return Poll::Ready(0);
         }
-        let Some(first) = self.recv().await else {
-            return 0;
+        let Some(first) = ready!(self.poll_recv(cx)) else {
+            return Poll::Ready(0);
         };
         out.push(first);
         let mut count = 1;
@@ -341,7 +350,7 @@ impl<T> Receiver<T> {
         if cost != 0 {
             self.complete(cost);
         }
-        count
+        Poll::Ready(count)
     }
 }
 

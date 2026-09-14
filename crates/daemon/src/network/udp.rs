@@ -14,6 +14,21 @@ impl Drop for Entry {
 }
 
 pub(super) async fn association(handler: SessionHandler, mut packets: Datagram) -> Result<()> {
+    if let Some(target) = packets.single_target.take() {
+        let incoming = packets.take_receiver();
+        let worker = packets.worker.take();
+        return packets
+            .scope
+            .run(session(
+                handler,
+                target,
+                incoming,
+                packets.tx.clone(),
+                packets.scope.clone(),
+                worker,
+            ))
+            .await;
+    }
     let mut sessions = HashMap::<Target, Entry>::new();
     let (completed, mut completions) = mpsc::unbounded_channel();
     let mut generation = 0;
@@ -67,6 +82,7 @@ pub(super) async fn association(handler: SessionHandler, mut packets: Datagram) 
                                     rx,
                                     replies,
                                     control.clone(),
+                                    None,
                                 ))
                                 .await;
                         if let Err(error) = &result
@@ -97,6 +113,7 @@ async fn session(
     mut incoming: kotoconn_protocol::queue::Receiver<Packet>,
     replies: kotoconn_protocol::queue::Sender<Packet>,
     scope: Scope,
+    worker: Option<Arc<dyn p::DatagramWorker>>,
 ) -> Result<()> {
     let registration = handler
         .sessions
@@ -130,6 +147,13 @@ async fn session(
             .control(TransportProtocol::Udp)
             .run(async {
                 let mut outgoing = client.udp_scoped(destination, scope.clone()).await?;
+                if let Some(worker) = worker
+                    && let Some(native) = outgoing.take_native().await?
+                {
+                    tracing::debug!("UDP transport transferred to TUN worker");
+                    worker.transfer(native, incoming, activity.clone()).await?;
+                    return Ok(());
+                }
                 let forward = async {
                     let mut batch = Vec::with_capacity(32);
                     while incoming.recv_many(&mut batch, 32).await != 0 {

@@ -14,20 +14,27 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-struct Value {
-    stream: BoxStream,
+struct Value<T> {
+    io: T,
     _work: WorkGuard,
 }
 
-struct Shared {
-    value: AtomicPtr<Value>,
-    closed: AtomicBool,
-    reader: AtomicWaker,
-    writer: AtomicWaker,
+pub(crate) struct Shared<T: Send> {
+    value: AtomicPtr<Value<T>>,
+    pub(crate) closed: AtomicBool,
+    pub(crate) reader: AtomicWaker,
+    pub(crate) writer: AtomicWaker,
 }
 
-impl Shared {
-    fn take(&self) -> Option<Box<Value>> {
+impl<T: Send> Shared<T> {
+    pub(crate) fn with<R>(&self, operation: impl FnOnce(&mut T) -> R) -> Option<R> {
+        let mut value = self.take()?;
+        let result = operation(&mut value.io);
+        self.put(value);
+        Some(result)
+    }
+
+    fn take(&self) -> Option<Box<Value<T>>> {
         let pointer = self.value.swap(ptr::null_mut(), Ordering::AcqRel);
         if pointer.is_null() {
             return None;
@@ -37,7 +44,7 @@ impl Shared {
         Some(unsafe { Box::from_raw(pointer) })
     }
 
-    fn put(&self, value: Box<Value>) {
+    fn put(&self, value: Box<Value<T>>) {
         if self.closed.load(Ordering::Acquire) {
             return;
         }
@@ -50,7 +57,7 @@ impl Shared {
         }
     }
 
-    fn close(&self) {
+    pub(crate) fn close(&self) {
         self.closed.store(true, Ordering::Release);
         drop(self.take());
         self.reader.wake();
@@ -58,15 +65,15 @@ impl Shared {
     }
 }
 
-impl Drop for Shared {
+impl<T: Send> Drop for Shared<T> {
     fn drop(&mut self) {
         drop(self.take());
     }
 }
 
-struct Owner(Arc<Shared>);
+struct Owner<T: Send>(Arc<Shared<T>>);
 
-impl Drop for Owner {
+impl<T: Send> Drop for Owner<T> {
     fn drop(&mut self) {
         self.0.close();
     }
@@ -91,7 +98,7 @@ pub fn stream_task(
         let stream = connect.await?;
         let work = tracking.track()?;
         owner.0.put(Box::new(Value {
-            stream,
+            io: stream,
             _work: work,
         }));
         owner.0.reader.wake();
@@ -102,15 +109,36 @@ pub fn stream_task(
     Ok(Box::pin(Scoped { shared, scope }))
 }
 
+/// Revocation stays active even when an established owner is never polled again.
+pub(crate) fn installed<T: Send + 'static>(scope: &Scope, io: T) -> anyhow::Result<Arc<Shared<T>>> {
+    let shared = Arc::new(Shared {
+        value: AtomicPtr::new(ptr::null_mut()),
+        closed: AtomicBool::new(false),
+        reader: AtomicWaker::new(),
+        writer: AtomicWaker::new(),
+    });
+    shared.put(Box::new(Value {
+        io,
+        _work: scope.track()?,
+    }));
+    let owner = Owner(shared.clone());
+    scope.spawn(async move {
+        let _owner = owner;
+        std::future::pending::<()>().await;
+        Ok(())
+    })?;
+    Ok(shared)
+}
+
 struct Scoped {
-    shared: Arc<Shared>,
+    shared: Arc<Shared<BoxStream>>,
     scope: Scope,
 }
 
 impl Scoped {
     fn with<T>(&mut self, operation: impl FnOnce(Pin<&mut dyn Stream>) -> T) -> Option<T> {
         let mut value = self.shared.take()?;
-        let result = operation(value.stream.as_mut());
+        let result = operation(value.io.as_mut());
         self.shared.put(value);
         Some(result)
     }
@@ -172,6 +200,11 @@ impl AsyncWrite for Scoped {
 }
 
 impl Stream for Scoped {
+    fn poll_direct(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        self.shared.reader.register(cx.waker());
+        self.with(|stream| stream.poll_direct(cx))
+            .unwrap_or_else(|| self.unavailable())
+    }
     fn poll_read_chunk(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,

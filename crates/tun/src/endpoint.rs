@@ -37,7 +37,7 @@ pub trait PacketReceive: Send {
         // installed until a complete frame is returned.
         let lease = buffer.lease.take().expect("receive lease");
         Poll::Ready(Ok(Received {
-            bytes: lease.freeze(len),
+            bytes: lease.publish(len),
             checksum_verified: false,
             udp_segment_size: None,
         }))

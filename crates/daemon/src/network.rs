@@ -263,9 +263,9 @@ impl p::Handler for SessionHandler {
 
                         control
                             .run(async {
-                                let mut outbound = client.tcp_scoped(target, scope.clone()).await?;
+                                let outbound = client.tcp_scoped(target, scope.clone()).await?;
                                 let (sent_bytes, received_bytes) =
-                                    p::copy_bidirectional(&mut stream, &mut outbound).await?;
+                                    p::relay(&mut stream, outbound).await?;
                                 tracing::debug!(sent_bytes, received_bytes, "TCP relay completed");
                                 Ok(())
                             })

@@ -28,6 +28,21 @@ impl Default for ChunkBuffer {
 /// Chunk writes consume exactly the accepted prefix. Pending never changes the
 /// caller's chunk. Receive credit is returned explicitly after destination acceptance.
 pub trait Stream: AsyncRead + AsyncWrite + Send {
+    /// True only after setup when a worker may poll the established byte stream
+    /// directly. Codecs can decline and continue using the ordinary chunk relay.
+    fn poll_direct(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        Poll::Ready(Ok(false))
+    }
+
+    /// Called before relay I/O. Acceptance takes the peer and returns completion;
+    /// dropping that future must cancel the handoff. Declining leaves peer intact.
+    fn take_over<'a>(
+        self: Pin<&'a mut Self>,
+        _peer: &mut Option<BoxStream>,
+    ) -> Option<futures_util::future::BoxFuture<'a, io::Result<(u64, u64)>>> {
+        None
+    }
+
     fn poll_read_chunk(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -40,10 +55,11 @@ pub trait Stream: AsyncRead + AsyncWrite + Send {
         ready!(self.as_mut().poll_read(cx, &mut out))?;
         let n = out.filled().len();
         if n == 0 {
+            buffer.lease = None;
             return Poll::Ready(Ok(Bytes::new()));
         }
         // SAFETY: The lease was installed above and remained owned during the read.
-        Poll::Ready(Ok(buffer.lease.take().expect("read lease").freeze(n)))
+        Poll::Ready(Ok(buffer.lease.take().expect("read lease").publish(n)))
     }
 
     fn poll_write_chunk(
@@ -60,6 +76,9 @@ pub trait Stream: AsyncRead + AsyncWrite + Send {
 }
 
 impl Stream for tokio::net::TcpStream {
+    fn poll_direct(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        Poll::Ready(Ok(true))
+    }
     fn poll_read_chunk(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -73,6 +92,7 @@ impl Stream for tokio::net::TcpStream {
         ready!(self.as_mut().poll_read(cx, &mut out))?;
         let n = out.filled().len();
         if n == 0 {
+            buffer.lease = None;
             return Poll::Ready(Ok(Bytes::new()));
         }
         // SAFETY: The read used the lease still held by this buffer.
@@ -80,7 +100,7 @@ impl Stream for tokio::net::TcpStream {
             .lease
             .take()
             .expect("socket read lease")
-            .freeze(n)))
+            .publish(n)))
     }
 }
 
@@ -136,6 +156,13 @@ impl AsyncWrite for Prefix {
 }
 
 impl Stream for Prefix {
+    fn poll_direct(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        if self.bytes.is_empty() {
+            self.inner.as_mut().poll_direct(cx)
+        } else {
+            Poll::Ready(Ok(false))
+        }
+    }
     fn poll_read_chunk(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -224,4 +251,17 @@ pub async fn copy_bidirectional(a: &mut BoxStream, b: &mut BoxStream) -> io::Res
         Poll::Ready(Ok((upload.transferred, download.transferred)))
     })
     .await
+}
+
+/// Routing and outbound construction precede this optional transfer of execution.
+pub async fn relay(a: &mut BoxStream, mut b: BoxStream) -> io::Result<(u64, u64)> {
+    if std::future::poll_fn(|cx| b.as_mut().poll_direct(cx)).await? {
+        let mut peer = Some(b);
+        if let Some(completion) = a.as_mut().take_over(&mut peer) {
+            return completion.await;
+        }
+        // SAFETY: The takeover contract leaves a declined peer in its slot.
+        b = peer.expect("declined stream takeover");
+    }
+    copy_bidirectional(a, &mut b).await
 }

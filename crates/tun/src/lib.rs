@@ -11,6 +11,7 @@ mod tcp;
 mod tcp_storage;
 mod transmit;
 mod udp;
+mod udp_direct;
 mod worker;
 
 pub use endpoint::{PacketReceive, PacketSend, ReceiveBuffer, Received, run};

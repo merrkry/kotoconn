@@ -1,4 +1,5 @@
 //! Public client construction and independent TCP/UDP close handles.
+mod native_udp;
 mod system;
 #[cfg(target_os = "linux")]
 mod udp_batch;

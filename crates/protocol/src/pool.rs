@@ -65,6 +65,15 @@ impl Lease {
         assert!(length <= self.bytes.len());
         Bytes::from_owner(self).slice(..length)
     }
+    /// Avoid pinning a large receive allocation for a short message. This is
+    /// the single compaction copy at a native read boundary, before publication.
+    pub fn publish(self, length: usize) -> Bytes {
+        if length < self.bytes.len() / 4 {
+            self.pool.copy(&self.bytes[..length])
+        } else {
+            self.freeze(length)
+        }
+    }
 }
 
 impl Pool {

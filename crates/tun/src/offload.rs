@@ -110,7 +110,7 @@ impl PacketReceive for Receiver {
         };
         // SAFETY: poll_recv initialized this prefix and the lease is installed.
         let lease = buffer.lease.take().expect("receive lease");
-        let bytes = lease.freeze(len);
+        let bytes = lease.publish(len);
         Poll::Ready(Ok(Received {
             bytes: if offload {
                 bytes.slice(VIRTIO_NET_HDR_LEN..)

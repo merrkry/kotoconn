@@ -37,6 +37,9 @@ use tokio::{
     time::Instant,
 };
 
+#[path = "tcp_direct.rs"]
+mod direct;
+
 const INITIAL: usize = 128 * 1024;
 const MAX_WINDOW: usize = (u16::MAX as usize) << 7;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -50,6 +53,7 @@ pub(crate) struct Link {
 pub(crate) type Ready = (Flow, u64);
 
 struct Shared {
+    attachment: SegQueue<direct::Attachment>,
     incoming: SegQueue<Bytes>,
     outgoing: SegQueue<Bytes>,
     rx_used: Arc<AtomicUsize>,
@@ -68,6 +72,15 @@ struct Shared {
     ready: mpsc::UnboundedSender<Ready>,
     id: Ready,
     pool: Pool,
+}
+
+impl std::task::Wake for Shared {
+    fn wake(self: Arc<Self>) {
+        Shared::wake(&self);
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        Shared::wake(self);
+    }
 }
 
 impl Shared {
@@ -203,6 +216,32 @@ impl AsyncWrite for Stream {
 }
 
 impl kotoconn_protocol::Stream for Stream {
+    fn take_over<'a>(
+        mut self: Pin<&'a mut Self>,
+        peer: &mut Option<kotoconn_protocol::BoxStream>,
+    ) -> Option<futures_util::future::BoxFuture<'a, io::Result<(u64, u64)>>> {
+        if !self.head.is_empty() || self.read_eof || self.write_eof {
+            return None;
+        }
+        let peer = peer.take()?;
+        let (done, completion) = oneshot::channel();
+        self.shared
+            .attachment
+            .push(direct::Attachment { peer, done });
+        self.shared.wake();
+        let cancellation = direct::Cancellation {
+            shared: self.shared.clone(),
+            armed: true,
+        };
+        Some(Box::pin(async move {
+            let result = completion.await.map_err(|_| reset_error())??;
+            cancellation.complete();
+            self.read_eof = true;
+            self.write_eof = true;
+            Ok(result)
+        }))
+    }
+
     fn poll_read_chunk(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -348,6 +387,8 @@ pub(crate) struct Connection {
     rx_capacity: Capacity,
     tx_capacity: Capacity,
     closed_normally: bool,
+    direct: Option<direct::Direct>,
+    handed_over: bool,
 }
 
 pub(crate) enum Progress {
@@ -366,6 +407,7 @@ impl Connection {
         pool: Pool,
     ) -> io::Result<(Self, Accept)> {
         let shared = Arc::new(Shared {
+            attachment: SegQueue::new(),
             incoming: SegQueue::new(),
             outgoing: SegQueue::new(),
             rx_used: Arc::new(AtomicUsize::new(0)),
@@ -436,6 +478,8 @@ impl Connection {
                 rx_capacity: Capacity::new(INITIAL),
                 tx_capacity: Capacity::new(INITIAL),
                 closed_normally: false,
+                direct: None,
+                handed_over: false,
             },
             accept,
         ))
@@ -528,59 +572,84 @@ impl Connection {
         {
             self.socket.abort();
         }
-        if matches!(self.socket.state(), State::Established | State::CloseWait) {
-            if let Some((sender, stream)) = self.admission.take()
-                && sender.send(stream).is_err()
-            {
-                self.socket.abort();
+        if !self.handed_over
+            && let Some(attachment) = self.shared.attachment.pop()
+        {
+            self.handed_over = true;
+            self.direct = Some(direct::Direct::new(attachment));
+        }
+        if let Some(direct) = &mut self.direct {
+            let waker = std::task::Waker::from(self.shared.clone());
+            let mut cx = Context::from_waker(&waker);
+            let result = if self.socket.state() == State::Closed && !self.closed_normally {
+                Err(reset_error())
+            } else {
+                direct.poll(&mut self.socket, &self.shared, &mut cx)
+            };
+            if !matches!(result, Ok(false)) {
+                // SAFETY: The state remains installed throughout its synchronous poll.
+                let direct = self.direct.take().expect("active direct transfer");
+                if result.is_err() {
+                    self.socket.abort();
+                }
+                direct.finish(result.map(|_| ()));
             }
-            for _ in 0..32 {
-                let Some(bytes) = self.shared.outgoing.pop() else {
-                    break;
-                };
-                if self
-                    .socket
-                    .send_buffer(|buffer| {
-                        let n = buffer.push(bytes);
-                        (n, ())
-                    })
-                    .is_err()
+        }
+        if !self.handed_over {
+            if matches!(self.socket.state(), State::Established | State::CloseWait) {
+                if let Some((sender, stream)) = self.admission.take()
+                    && sender.send(stream).is_err()
                 {
                     self.socket.abort();
-                    break;
                 }
-            }
-            if self.shared.finish.load(Ordering::Acquire) && self.shared.outgoing.is_empty() {
-                self.socket.close();
-            }
-        }
-        if self.socket.can_recv() {
-            let shared = &self.shared;
-            let _ = self.socket.recv_buffer(|buffer| {
-                let mut count = 0;
                 for _ in 0..32 {
-                    let Some(bytes) = buffer.take() else {
+                    let Some(bytes) = self.shared.outgoing.pop() else {
                         break;
                     };
-                    count += bytes.len();
-                    shared.rx_used.fetch_add(bytes.len(), Ordering::Release);
-                    shared.incoming.push(bytes);
+                    if self
+                        .socket
+                        .send_buffer(|buffer| {
+                            let n = buffer.push(bytes);
+                            (n, ())
+                        })
+                        .is_err()
+                    {
+                        self.socket.abort();
+                        break;
+                    }
                 }
-                (count, ())
-            });
-            self.shared.reader.wake();
-        }
-        if self.admission.is_none()
-            && !self.socket.may_recv()
-            && (self.socket.state() != State::Closed || self.closed_normally)
-        {
-            self.shared.eof.store(true, Ordering::Release);
-            self.shared.reader.wake();
-        }
-        self.shared.writer.wake();
-        if self.socket.state() == State::Closed && !self.closed_normally {
-            self.shared.reset.store(true, Ordering::Release);
-            self.shared.reader.wake();
+                if self.shared.finish.load(Ordering::Acquire) && self.shared.outgoing.is_empty() {
+                    self.socket.close();
+                }
+            }
+            if self.socket.can_recv() {
+                let shared = &self.shared;
+                let _ = self.socket.recv_buffer(|buffer| {
+                    let mut count = 0;
+                    for _ in 0..32 {
+                        let Some(bytes) = buffer.take() else {
+                            break;
+                        };
+                        count += bytes.len();
+                        shared.rx_used.fetch_add(bytes.len(), Ordering::Release);
+                        shared.incoming.push(bytes);
+                    }
+                    (count, ())
+                });
+                self.shared.reader.wake();
+            }
+            if self.admission.is_none()
+                && !self.socket.may_recv()
+                && (self.socket.state() != State::Closed || self.closed_normally)
+            {
+                self.shared.eof.store(true, Ordering::Release);
+                self.shared.reader.wake();
+            }
+            self.shared.writer.wake();
+            if self.socket.state() == State::Closed && !self.closed_normally {
+                self.shared.reset.store(true, Ordering::Release);
+                self.shared.reader.wake();
+            }
         }
         if self.socket.state() == State::TimeWait && stopping {
             self.closed_normally = true;
@@ -616,7 +685,7 @@ impl Connection {
                 break;
             }
         }
-        if self.socket.can_recv() || !self.shared.outgoing.is_empty() {
+        if !self.handed_over && (self.socket.can_recv() || !self.shared.outgoing.is_empty()) {
             return Progress::Again;
         }
         let deadline = match self.socket.poll_at(&mut self.host) {
@@ -659,9 +728,10 @@ fn emit_scattered(
     if range.is_empty() {
         return emit(arena, output, ip, repr, segment_size);
     }
-    let count = storage.segments(range);
-    let cost = crate::storage::charge(ip.buffer_len()) + count.len() * std::mem::size_of::<Bytes>();
+    let count = storage.segment_count(range.clone());
+    let cost = crate::storage::charge(ip.buffer_len()) + count * std::mem::size_of::<Bytes>();
     let permit = output.try_reserve(cost).map_err(|e| (e, cost))?;
+    let count = storage.segments(range);
     let header_len = ip.header_len() + repr.header_len();
     let len = if segment_size.is_some() {
         header_len

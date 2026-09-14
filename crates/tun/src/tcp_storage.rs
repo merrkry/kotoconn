@@ -48,6 +48,17 @@ impl Storage {
         }
     }
 
+    pub fn segment_count(&self, range: std::ops::Range<usize>) -> usize {
+        let start = self.head + range.start;
+        let end = self.head + range.end;
+        let prefix = self
+            .blocks
+            .range(..start)
+            .next_back()
+            .is_some_and(|(&key, bytes)| key + bytes.len() > start);
+        usize::from(prefix) + self.blocks.range(start..end).count()
+    }
+
     pub fn segments(&self, range: std::ops::Range<usize>) -> Vec<Bytes> {
         let mut position = self.head + range.start;
         let end = self.head + range.end;

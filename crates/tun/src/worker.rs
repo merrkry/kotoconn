@@ -91,6 +91,7 @@ struct UdpEntry {
     activity: p::Activity,
     scope: Scope,
     generation: u64,
+    direct: Option<crate::udp_direct::Direct>,
 }
 
 impl Drop for UdpEntry {
@@ -121,6 +122,7 @@ struct Worker {
     done: mpsc::UnboundedSender<(Flow, u64)>,
     output: queue::Sender<Transmit>,
     ready: mpsc::UnboundedSender<tcp::Ready>,
+    transfers: mpsc::UnboundedSender<crate::udp_direct::Transfer>,
     timers: BTreeMap<(Instant, u64), Flow>,
     blocked: VecDeque<(tcp::Ready, usize)>,
     pool: crate::pool::Pool,
@@ -133,6 +135,17 @@ struct Worker {
 
 impl Worker {
     fn drive(&mut self, id: tcp::Ready) {
+        if let Some(entry) = self
+            .udp
+            .get_mut(&id.0)
+            .filter(|entry| entry.generation == id.1)
+            && let Some(direct) = &mut entry.direct
+        {
+            if entry.scope.is_closed() || !direct.poll(&self.output, &entry.activity) {
+                self.udp.remove(&id.0);
+            }
+            return;
+        }
         let (flow, generation) = id;
         let Some(entry) = self
             .tcp
@@ -312,7 +325,13 @@ impl Worker {
                         .checked_add(1)
                         .expect("TUN connection generation exhausted");
                     let scope = self.context.scope.child();
-                    let (association, driver) = p::packet_pair(scope.clone());
+                    let (mut association, driver) = p::packet_pair(scope.clone());
+                    association.single_target = Some(p::target(flow.destination));
+                    association.worker = Some(Arc::new(crate::udp_direct::Handoff {
+                        id: (flow, self.generation),
+                        sender: self.transfers.clone(),
+                        scope: scope.clone(),
+                    }));
                     let packets = driver.tx.clone();
                     let activity = p::Activity::default();
                     let clock = activity.clone();
@@ -345,6 +364,7 @@ impl Worker {
                         flow,
                         UdpEntry {
                             packets,
+                            direct: None,
                             activity,
                             scope,
                             generation: self.generation,
@@ -355,7 +375,7 @@ impl Worker {
                 // SAFETY: The flow was found or inserted above. Only
                 // dispatch mutates this map; tasks only send completions.
                 debug_assert!(self.udp.contains_key(&flow));
-                let entry = &self.udp[&flow];
+                let entry = self.udp.get_mut(&flow).expect("admitted UDP flow");
                 let segment = frame
                     .and_then(|frame| frame.udp_segment_size)
                     .map(usize::from)
@@ -366,6 +386,18 @@ impl Worker {
                 while first || parts.peek().is_some() {
                     first = false;
                     let payload = parts.next().unwrap_or(&[]);
+                    if let Some(direct) = &mut entry.direct {
+                        let payload = backing
+                            .and_then(|source| crate::storage::view(source, payload))
+                            .unwrap_or_else(|| self.pool.copy(payload));
+                        if !direct.enqueue(p::Packet {
+                            target: p::target(flow.destination),
+                            payload,
+                        }) {
+                            self.stats.capacity_drops += 1;
+                        }
+                        continue;
+                    }
                     let Ok(permit) = entry.packets.try_reserve(payload.len()) else {
                         self.stats.capacity_drops += 1;
                         return Ok(());
@@ -403,6 +435,7 @@ pub(crate) async fn dispatch<R: PacketReceive>(
 ) -> Result<()> {
     let (done, mut completed) = mpsc::unbounded_channel();
     let (ready, mut runnable) = mpsc::unbounded_channel();
+    let (transfers, mut transfer_events) = mpsc::unbounded_channel();
     let pool = crate::pool::Pool::default();
     let mut worker = Worker {
         id,
@@ -414,6 +447,7 @@ pub(crate) async fn dispatch<R: PacketReceive>(
         done,
         output,
         ready,
+        transfers,
         timers: BTreeMap::new(),
         blocked: VecDeque::new(),
         pool: pool.clone(),
@@ -474,6 +508,12 @@ pub(crate) async fn dispatch<R: PacketReceive>(
                 }
             } => {
                 decoder.expire(Instant::now());
+                continue;
+            },
+            Some(transfer) = transfer_events.recv() => {
+                if let Some(entry) = worker.udp.get_mut(&transfer.id.0).filter(|entry| entry.generation == transfer.id.1 && !entry.scope.is_closed()) {
+                    entry.direct = Some(crate::udp_direct::Direct::new(transfer, worker.ready.clone()));
+                }
                 continue;
             },
             Some(id) = runnable.recv() => {
@@ -646,6 +686,7 @@ mod tests {
             done,
             output,
             ready,
+            transfers: mpsc::unbounded_channel().0,
             timers: BTreeMap::new(),
             blocked: VecDeque::new(),
             pool,
