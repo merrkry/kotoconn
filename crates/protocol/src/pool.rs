@@ -68,6 +68,11 @@ impl Lease {
 }
 
 impl Pool {
+    pub fn shared() -> Self {
+        thread_local! { static POOL: Pool = Pool::default(); }
+        POOL.with(Clone::clone)
+    }
+
     pub fn copy(&self, bytes: &[u8]) -> Bytes {
         self.fill(bytes.len(), |out| out.copy_from_slice(bytes))
     }

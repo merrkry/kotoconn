@@ -1,4 +1,5 @@
 //! Protocol-independent I/O, capability and lifetime contracts.
+mod activity;
 mod chunk;
 mod control;
 mod io;
@@ -8,6 +9,7 @@ mod scoped;
 mod server;
 pub mod stream_buffer;
 
+pub use activity::Activity;
 use anyhow::{Result, bail};
 pub use control::{Scope, WorkGuard};
 use futures_util::future::BoxFuture;

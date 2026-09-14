@@ -15,10 +15,7 @@ use std::{
     hash::BuildHasher,
     sync::Arc,
 };
-use tokio::{
-    sync::{mpsc, watch},
-    time::Instant,
-};
+use tokio::{sync::mpsc, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) struct Shared {
@@ -90,7 +87,7 @@ struct TcpEntry {
 
 struct UdpEntry {
     packets: queue::Sender<p::Packet>,
-    activity: watch::Sender<Instant>,
+    activity: p::Activity,
     scope: Scope,
     generation: u64,
 }
@@ -314,7 +311,8 @@ impl Worker {
                     let scope = self.context.scope.child();
                     let (association, driver) = p::packet_pair(scope.clone());
                     let packets = driver.tx.clone();
-                    let (activity, clock) = watch::channel(Instant::now());
+                    let activity = p::Activity::default();
+                    let clock = activity.clone();
                     let handler = self.context.handler.clone();
                     let output = self.output.clone();
                     let completion = Completion {
@@ -332,7 +330,7 @@ impl Worker {
                         let replies = udp_replies(flow, driver, output, reply_activity);
                         tokio::select! {
                             _ = stopping.cancelled() => {},
-                            _ = until_idle(clock, idle) => {},
+                            _ = clock.until_idle(idle) => {},
                             result = handler.udp(association) => result?,
                             result = replies => result?,
                         }
@@ -364,7 +362,7 @@ impl Worker {
                     target: p::target(flow.destination),
                     payload,
                 });
-                entry.activity.send_replace(Instant::now());
+                entry.activity.record();
             }
             _ => {}
         }
@@ -534,37 +532,30 @@ async fn udp_replies(
     flow: Flow,
     mut driver: p::Datagram,
     output: queue::Sender<Transmit>,
-    activity: watch::Sender<Instant>,
+    activity: p::Activity,
 ) -> Result<()> {
-    while let Some(packet) = driver.rx.recv().await {
-        let Ok(source) = p::socket_addr(&packet.target) else {
-            continue;
-        };
-        let Some((source, destination)) = udp::reply_flow(flow, source) else {
-            continue;
-        };
-        // One queued item owns the whole datagram. Only this association waits
-        // for capacity; shared ingress keeps receiving other connections.
-        output
-            .send(Transmit::Datagram {
-                source,
-                destination,
-                payload: packet.payload,
-            })
-            .await?;
-        activity.send_replace(Instant::now());
+    let mut batch = Vec::with_capacity(32);
+    while driver.rx.recv_many(&mut batch, 32).await != 0 {
+        for packet in batch.drain(..) {
+            let Ok(source) = p::socket_addr(&packet.target) else {
+                continue;
+            };
+            let Some((source, destination)) = udp::reply_flow(flow, source) else {
+                continue;
+            };
+            // One queued item owns the whole datagram. Only this association waits
+            // for capacity; shared ingress keeps receiving other connections.
+            output
+                .send(Transmit::Datagram {
+                    source,
+                    destination,
+                    payload: packet.payload,
+                })
+                .await?;
+        }
+        activity.record();
     }
     Ok(())
-}
-
-async fn until_idle(mut activity: watch::Receiver<Instant>, idle: std::time::Duration) {
-    loop {
-        let deadline = *activity.borrow_and_update() + idle;
-        tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => return,
-            result = activity.changed() => { if result.is_err() { return; } },
-        }
-    }
 }
 
 #[cfg(test)]

@@ -18,9 +18,8 @@ pub struct ChunkBuffer {
 
 impl Default for ChunkBuffer {
     fn default() -> Self {
-        thread_local! { static POOL: Pool = Pool::default(); }
         Self {
-            pool: POOL.with(Clone::clone),
+            pool: Pool::shared(),
             lease: None,
         }
     }

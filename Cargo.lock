@@ -1486,6 +1486,7 @@ dependencies = [
  "kotoconn-protocol",
  "kotoconn-shadowsocks2022",
  "kotoconn-socks5",
+ "libc",
  "tokio",
  "tokio-util",
  "tracing",

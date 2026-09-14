@@ -51,6 +51,7 @@ impl p::Server for Server {
 
                                     let mut buffer = vec![0; 65536];
                                     let mut byte = [0];
+                                    let mut batch = Vec::with_capacity(32);
 
                                     // The advertised client endpoint can be unknown. Pin the first
                                     // valid packet's port, while always requiring the TCP peer IP.
@@ -83,8 +84,9 @@ impl p::Server for Server {
                                                     let _ = driver.tx.try_send(packet);
                                                 }
                                             }
-                                            response = driver.rx.recv() => {
-                                                let Some(response) = response else { return Ok(()); };
+                                            count = driver.rx.recv_many(&mut batch, 32) => {
+                                                if count == 0 { return Ok(()); }
+                                                for response in batch.drain(..) {
 
                                                 if let (Some(client), Ok(wire)) =
                                                     (client, encode(response))
@@ -92,6 +94,7 @@ impl p::Server for Server {
                                                         socket.send_to(&wire, client).await
                                                 {
                                                     tracing::warn!(error = %format_args!("{error:#}"), "SOCKS UDP reply");
+                                                }
                                                 }
                                             }
                                         }

@@ -90,6 +90,7 @@ async fn udp(socket: UdpSocket, context: ServerContext, crypto: Arc<Crypto>) -> 
     let mut associations = HashMap::<u64, Association>::new();
     let (responses, mut replies) = mpsc::channel::<(u64, Packet)>(64);
     let mut buffer = vec![0; 65536];
+    let mut reply_batch = Vec::with_capacity(32);
 
     // Replay state must outlive short application sessions across the wire's
     // timestamp acceptance window. Application idle expiry remains in the daemon.
@@ -134,12 +135,15 @@ async fn udp(socket: UdpSocket, context: ServerContext, crypto: Arc<Crypto>) -> 
                         let work = handler.udp(connection);
                         tokio::pin!(work);
 
+                        let mut batch = Vec::with_capacity(32);
                         loop {
                             tokio::select! {
                                 result = &mut work => return result,
-                                response = driver.rx.recv() => {
-                                    let Some(response) = response else { return Ok(()); };
-                                    let _ = responses.try_send((id, response));
+                                count = driver.rx.recv_many(&mut batch, 32) => {
+                                    if count == 0 { return Ok(()); }
+                                    for response in batch.drain(..) {
+                                        let _ = responses.try_send((id, response));
+                                    }
                                 }
                             }
                         }
@@ -159,6 +163,7 @@ async fn udp(socket: UdpSocket, context: ServerContext, crypto: Arc<Crypto>) -> 
                     );
                 }
 
+                // SAFETY: This task found or inserted the association above.
                 let association = associations.get_mut(&id).expect("inserted association");
                 if !association
                     .window
@@ -176,8 +181,9 @@ async fn udp(socket: UdpSocket, context: ServerContext, crypto: Arc<Crypto>) -> 
                     payload: buffer[..n].to_vec().into(),
                 });
             }
-            response = replies.recv() => {
-                let Some((id, packet)) = response else { return Ok(()); };
+            count = replies.recv_many(&mut reply_batch, 32) => {
+                if count == 0 { return Ok(()); }
+                for (id, packet) in reply_batch.drain(..) {
                 let Some(association) = associations.get_mut(&id) else { continue; };
                 association.packet += 1;
                 if association.packet >= PACKET_LIMIT {
@@ -203,6 +209,7 @@ async fn udp(socket: UdpSocket, context: ServerContext, crypto: Arc<Crypto>) -> 
                 }
 
                 association.active = Instant::now();
+                }
             }
         }
     }

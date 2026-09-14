@@ -148,8 +148,8 @@ pub struct Receiver<T> {
     shared: Arc<Shared<T>>,
 }
 
-/// Byte credits include outstanding reservations. Only the receiver owns the
-/// feedback state; producers atomically reserve against its published target.
+/// Byte credits include outstanding reservations. Completion counters and target
+/// refreshes are shared atomically; producers reserve against the current target.
 pub fn channel<T>(initial: usize, size: fn(&T) -> usize) -> (Sender<T>, Receiver<T>) {
     let shared = Arc::new(Shared {
         items: SegQueue::new(),

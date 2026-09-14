@@ -48,36 +48,88 @@ impl Carrier for System {
             let scope = self.scope.child().tracked_by(&caller);
             let (user, mut driver) = packet_pair(scope.clone());
             scope.spawn(async move {
-                let mut buffer = vec![0; 65536];
-
-                loop {
-                    tokio::select! {
-                        received = socket.recv(&mut buffer) => {
-                            match received {
+                let pool = kotoconn_protocol::pool::Pool::shared();
+                let send = async {
+                    let mut packets = Vec::with_capacity(32);
+                    while driver.rx.recv_many(&mut packets, 32).await != 0 {
+                        if packets.iter().any(|p| p.target != target) {
+                            anyhow::bail!("datagram target differs from connected target");
+                        }
+                        let mut sent = 0;
+                        while sent < packets.len() {
+                            #[cfg(target_os = "linux")]
+                            let result = socket
+                                .async_io(tokio::io::Interest::WRITABLE, || {
+                                    crate::udp_batch::send(&socket, &packets[sent..])
+                                })
+                                .await;
+                            #[cfg(not(target_os = "linux"))]
+                            let result = socket.send(&packets[sent].payload).await.map(|_| 1);
+                            match result {
                                 Ok(n) => {
-                                    let _ = driver
-                                        .tx
-                                        .try_send(Packet {
-                                            target: target.clone(),
-                                            payload: buffer[..n].to_vec().into(),
-                                        });
+                                    debug_assert!(n > 0);
+                                    sent += n;
                                 }
-                                Err(error) => tracing::warn!(error = %format_args!("{error:#}"), "UDP receive"),
+                                Err(error) => {
+                                    tracing::warn!(%error, "UDP send");
+                                    sent += 1;
+                                }
                             }
                         }
-                        packet = driver.rx.recv() => {
-                            let Some(packet) = packet else { return Ok(()); };
-
-                            if packet.target != target {
-                                anyhow::bail!("datagram target differs from connected target");
-                            }
-
-                            if let Err(error) = socket.send(&packet.payload).await {
-                                tracing::warn!(error = %format_args!("{error:#}"), "UDP send");
-                            }
-                        }
+                        packets.clear();
                     }
-                }
+                    Ok::<(), anyhow::Error>(())
+                };
+                let receive = async {
+                    let mut buffers = Vec::new();
+                    let mut batch = 1;
+                    let mut lengths = [0usize; 32];
+                    loop {
+                        socket.readable().await?;
+                        buffers.resize_with(batch, || pool.acquire(65536));
+                        #[cfg(target_os = "linux")]
+                        let result = socket.try_io(tokio::io::Interest::READABLE, || {
+                            crate::udp_batch::receive(&socket, &mut buffers, &mut lengths)
+                        });
+                        #[cfg(not(target_os = "linux"))]
+                        let result = socket.recv(buffers[0].as_mut()).await.map(|n| {
+                            lengths[0] = n;
+                            1
+                        });
+                        let count = match result {
+                            Ok(n) => n,
+                            Err(error) => {
+                                buffers.clear();
+                                if error.kind() != std::io::ErrorKind::WouldBlock {
+                                    tracing::warn!(%error, "UDP receive");
+                                }
+                                continue;
+                            }
+                        };
+                        for i in 0..count {
+                            if lengths[i] == usize::MAX {
+                                continue;
+                            }
+                            let Ok(permit) = driver.tx.try_reserve(lengths[i]) else {
+                                continue;
+                            };
+                            // Compact small datagrams rather than retaining a 64 KiB
+                            // receive allocation for each packet waiting downstream.
+                            let payload = pool.copy(&buffers[i].as_ref()[..lengths[i]]);
+                            permit.send(Packet {
+                                target: target.clone(),
+                                payload,
+                            });
+                        }
+                        batch = if count == batch {
+                            (batch * 2).min(32)
+                        } else {
+                            count.max(1)
+                        };
+                        buffers.clear();
+                    }
+                };
+                tokio::select! { result = send => result, result = receive => result }
             })?;
             Ok(user)
         })
