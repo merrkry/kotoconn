@@ -1,6 +1,6 @@
 # TUN workloads
 
-Build the candidate and the shared traffic tool, then run from any directory:
+Build the candidate and the shared traffic tool, then run from the repository root:
 
 ```sh
 cargo build --release -p kotoconn-cli -p kotoconn-tun-traffic
@@ -28,6 +28,9 @@ download with one and 16 connections, 256 sparse TCP connections, small UDP,
 one-flow UDP, UDP churn, sparse UDP, fragmentation boundaries, and a clean
 mixed case. Use `--case NAME`, `--mtu N`, and `--family 4|6` to select cases.
 All three options can be repeated. MTU 1280 and 65535 are available explicitly.
+Repeated MTU/family values are deduplicated in their original order. The runner
+rejects matrices needing more than 8000 server ports before creating a namespace,
+including all repetitions, reference samples and warmups in that count.
 
 A persistent TCP connection exchanges independently generated data in each
 direction. A transaction completes only after payload validation and a server

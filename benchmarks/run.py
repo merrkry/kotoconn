@@ -9,6 +9,7 @@ from testing.tun.comparison import SingBox
 from testing.tun.environment import (
     CLIENT,
     REMOTE,
+    SERVER_PORTS,
     Daemon,
     add_arguments,
     command,
@@ -108,12 +109,17 @@ def cases(args):
                 )
 
 
+def implementations(args, case_name):
+    if args.sing_box and case_name != "mixed-malformed":
+        return ["candidate", "sing-box-go"]
+    return ["candidate"]
+
+
 def run(args):
     configure_network()
     binaries = {"candidate": args.binary}
     if args.sing_box:
         binaries["sing-box-go"] = args.sing_box
-    names = list(binaries)
     result = {
         "schema_version": 2,
         "suite": "tun-workloads",
@@ -137,14 +143,12 @@ def run(args):
     path = args.output / "results.json"
     try:
         for case_id, name, spec in cases(args):
+            # Compare the mixed flow set without raw injection in mixed-clean.
+            names = implementations(args, name)
             for repetition in range(args.repetitions):
                 # Alternate order within each pair; every sample starts a fresh daemon.
                 order = names if repetition % 2 == 0 else list(reversed(names))
                 for implementation in order:
-                    # Malformed-input policy belongs to Kotoconn's tests. Compare
-                    # the same flow mix without raw injection in mixed-clean.
-                    if implementation == "sing-box-go" and name == "mixed-malformed":
-                        continue
                     directory = args.output / f"{case_id}-{repetition}-{implementation}"
                     directory.mkdir()
                     entry = {
@@ -286,8 +290,10 @@ def main():
         args.reference_version = command(str(args.sing_box), "version").stdout.strip()
         if not args.reference_version.startswith("sing-box version 1.15."):
             parser.error("the reference must be sing-box 1.15 with the go TUN stack")
-    args.mtu = args.mtu or [1500, 9000]
-    args.family = args.family or ([4, 6] if args.profile == "full" else [4])
+    args.mtu = list(dict.fromkeys(args.mtu or [1500, 9000]))
+    args.family = list(
+        dict.fromkeys(args.family or ([4, 6] if args.profile == "full" else [4]))
+    )
     if (
         args.duration < 0.2
         or args.warmup < 0
@@ -296,6 +302,19 @@ def main():
     ):
         parser.error(
             "duration must be >= 0.2s, warmup >= 0, repetitions and UDP rate positive"
+        )
+    selected = list(cases(args))
+    if not selected:
+        parser.error("no matching benchmark cases")
+    required_ports = (
+        sum(len(implementations(args, name)) for _, name, _ in selected)
+        * args.repetitions
+        * (1 + bool(args.warmup))
+    )
+    if required_ports > len(SERVER_PORTS):
+        parser.error(
+            f"selected matrix needs {required_ports} traffic server ports; "
+            f"only {len(SERVER_PORTS)} are available; reduce repetitions or select fewer cases"
         )
     if not enter(args, Path(__file__).resolve(), "benchmarks"):
         run(args)

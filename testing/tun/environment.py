@@ -18,7 +18,8 @@ ROOT = Path(__file__).resolve().parents[2]
 NAME = "ktest0"
 CLIENT = ("192.0.2.2", "fd00::2")
 REMOTE = ("198.18.0.1", "2001:db8::1")
-PORTS = itertools.count(12000)
+SERVER_PORTS = range(12000, 20000)
+PORTS = itertools.count(SERVER_PORTS.start)
 
 
 def isolated():
@@ -126,7 +127,9 @@ def configure_network():
     # Outbound kernel sockets use documentation addresses on lo, so Linux's
     # default loopback-only TIME_WAIT reuse does not recognize this topology.
     Path("/proc/sys/net/ipv4/tcp_tw_reuse").write_text("1")
-    Path("/proc/sys/net/ipv4/ip_local_port_range").write_text("20000 65535")
+    Path("/proc/sys/net/ipv4/ip_local_port_range").write_text(
+        f"{SERVER_PORTS.stop} 65535"
+    )
     # Raw controls must never share a tuple with a generated application flow.
     Path("/proc/sys/net/ipv4/ip_local_reserved_ports").write_text("22222,22224")
 
@@ -329,8 +332,10 @@ def traffic(binary, daemon, directory, spec, *, inject=None):
     # Retained TIME_WAIT sockets from one case must not consume the next case's
     # tuple space. The daemon and its connection/pool state remain alive.
     spec = {"port": next(PORTS), **spec}
-    if not 12000 <= spec["port"] < 20000:
-        raise ValueError("run exhausted its 8000 reserved traffic server ports")
+    if spec["port"] not in SERVER_PORTS:
+        raise ValueError(
+            f"run exhausted its {len(SERVER_PORTS)} reserved traffic server ports"
+        )
     if inject:
         inject.port = spec["port"]
     argv = [str(binary), "--controlled"]

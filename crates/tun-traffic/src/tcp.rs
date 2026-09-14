@@ -13,6 +13,7 @@ use tokio::{
 };
 
 const BANNER: &[u8] = b"tun-traffic-ready";
+
 const TRAILER: &[u8] = b"tun-traffic-eof";
 
 pub async fn serve(

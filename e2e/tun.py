@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from testing.tun.environment import (
     CLIENT,
     REMOTE,
+    SERVER_PORTS,
     Daemon,
     add_arguments,
     configure_network,
@@ -275,10 +276,13 @@ def main():
     args = parser.parse_args()
     args.binary = args.binary.resolve(strict=True)
     args.traffic_binary = args.traffic_binary.resolve(strict=True)
-    args.mtu = args.mtu or (
-        [1280, 1500, 9000, 65535] if args.profile == "stress" else [1500, 9000]
+    args.mtu = list(
+        dict.fromkeys(
+            args.mtu
+            or ([1280, 1500, 9000, 65535] if args.profile == "stress" else [1500, 9000])
+        )
     )
-    args.family = args.family or [4, 6]
+    args.family = list(dict.fromkeys(args.family or [4, 6]))
     args.repeat = (
         args.repeat
         if args.repeat is not None
@@ -286,6 +290,24 @@ def main():
     )
     if args.repeat < 1:
         parser.error("repeat must be positive")
+    selected = [
+        name
+        for mtu in args.mtu
+        for family in args.family
+        for name, _ in cases(mtu, family == 6, stress=args.profile == "stress")
+        if not args.case or name in args.case
+    ]
+    required_ports = sum(2 if name == "mixed-malformed" else 1 for name in selected)
+    required_ports *= args.repeat
+    if not args.case or "generic-relay" in args.case:
+        required_ports += 4
+    if not required_ports and args.case and "lifecycle" not in args.case:
+        parser.error("no matching cases")
+    if required_ports > len(SERVER_PORTS):
+        parser.error(
+            f"selected matrix needs {required_ports} traffic server ports; "
+            f"only {len(SERVER_PORTS)} are available; reduce repeat or select fewer cases"
+        )
     if not enter(args, Path(__file__).resolve(), "e2e"):
         run(args)
 
