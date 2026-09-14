@@ -26,8 +26,12 @@ impl Carrier for System {
         Box::pin(async move {
             let address = socket_addr(&target)?;
             tracing::debug!(%address, "connecting TCP socket");
+
             stream_task(self.scope.child().tracked_by(&caller), async move {
-                Ok(Box::pin(TcpStream::connect(address).await?) as BoxStream)
+                let stream = TcpStream::connect(address).await?;
+                // Relayed request fragments must not wait for the peer's delayed ACK.
+                stream.set_nodelay(true)?;
+                Ok(Box::pin(stream) as BoxStream)
             })
         })
     }

@@ -442,6 +442,8 @@ impl Connection {
             shared.tx_acked.clone(),
         );
         let mut socket = tcp::Socket::with_buffers(rx, tx);
+        // Small replies and trailers must progress while earlier bytes await ACK.
+        socket.set_nagle_enabled(false);
         socket.set_congestion_control(tcp::CongestionControl::Cubic);
         socket.set_timeout(Some(smoltcp::time::Duration::from_secs(120)));
         socket

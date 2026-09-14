@@ -24,6 +24,8 @@ UDP writers own their encoders and share atomic fragment identifiers. Unfragment
 
 Protocol streams can return owned chunks and accept a prefix of an owned chunk. Acceptance returns the source's receive credit; TCP TX credit still waits for its own peer's ACK. HTTP retains handshake read-ahead as a prefix, SOCKS preserves the underlying chunk interface, and Shadowsocks keeps compatibility buffering at its codec boundary. A single relay future polls both directions without generic stream splitting or a shared stream lock.
 
+Native outbound TCP sockets use TCP_NODELAY, and TUN TCP disables Nagle. Small request fragments, replies and trailers are sent without waiting for an earlier segment's acknowledgment. TCP receive credit, retransmission and delayed ACK handling remain independent of these send settings.
+
 Eager setup and cancellation run in owner tasks that carry no payload. Cancellation revokes established I/O even when its handle is idle. A resource temporarily held by a synchronous poll remains included in scope completion until that poll releases it.
 
 After the daemon routes a TUN flow, eligible native TCP and UDP transports move to that flow's worker. The worker polls socket readiness, TCP state and packet I/O directly. TCP retains half-close behavior and reports transferred byte counts to the session. UDP transfers its existing ingress queue before accepting new direct input; partial socket sends remove only the accepted prefix. Daemon routing, registration, carrier cancellation and idle expiry remain active. Encoded transports continue through the ordinary chunk or packet path.
