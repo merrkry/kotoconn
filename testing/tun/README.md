@@ -134,7 +134,8 @@ Traffic invocations use separate server ports in 12000..19999. Clients defer
 source-port allocation until connect, so earlier cases' TIME_WAIT sockets do
 not exhaust a new case's tuple space. The namespace uses ephemeral ports
 20000..65535 and enables timestamp-protected TCP TIME_WAIT reuse for outbound
-kernel sockets on its local documentation addresses. These settings never
+kernel sockets on its local documentation addresses. Raw injection source ports
+22222 and 22224 are excluded from ephemeral allocation. These settings never
 apply to the parent namespace. One invocation supports 8000 traffic processes,
 including warmups and recovery checks.
 

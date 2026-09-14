@@ -124,6 +124,8 @@ def configure_network():
     # default loopback-only TIME_WAIT reuse does not recognize this topology.
     Path("/proc/sys/net/ipv4/tcp_tw_reuse").write_text("1")
     Path("/proc/sys/net/ipv4/ip_local_port_range").write_text("20000 65535")
+    # Raw controls must never share a tuple with a generated application flow.
+    Path("/proc/sys/net/ipv4/ip_local_reserved_ports").write_text("22222,22224")
 
 
 def configure_routes():
