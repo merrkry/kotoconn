@@ -88,11 +88,6 @@ impl PacketIo for Native {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
                 result => result?,
             };
-            self.batch = if count == self.batch {
-                (count * 2).min(32)
-            } else {
-                count.max(1)
-            };
             let before = out.len();
             for (i, buffer) in buffers.into_iter().enumerate().take(count) {
                 let length = lengths[i];
@@ -123,8 +118,17 @@ impl PacketIo for Native {
                     offset = end;
                 }
             }
-            if out.len() != before {
-                return Poll::Ready(Ok(out.len() - before));
+            let datagrams = out.len() - before;
+            // recvmmsg counts messages, while a GRO message contains many
+            // datagrams. Bound the next turn by datagrams rather than aggregates.
+            let messages = if count == self.batch {
+                (count * 2).min(32)
+            } else {
+                count.max(1)
+            };
+            self.batch = messages.min((32 * count / datagrams.max(1)).max(1));
+            if datagrams != 0 {
+                return Poll::Ready(Ok(datagrams));
             }
         }
     }

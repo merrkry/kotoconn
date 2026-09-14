@@ -186,6 +186,25 @@ impl Worker {
         }
     }
 
+    fn frame(&mut self, frame: crate::Received, decoder: &mut Decoder) -> Result<()> {
+        let bytes = &frame.bytes;
+        self.stats.received_packets += 1;
+        self.stats.received_bytes += bytes.len() as u64;
+        let Some(parsed) = packet::parse(bytes) else {
+            return Ok(());
+        };
+        let Some(key) = parsed.route() else {
+            return Ok(());
+        };
+        let owner = self.shared.owner(key);
+        if owner != self.id {
+            self.forward_raw(frame, owner);
+        } else if let Some(packet) = parsed.decode(decoder, Instant::now()) {
+            self.packet(packet, Some(&frame))?;
+        }
+        Ok(())
+    }
+
     fn forward_raw(&mut self, frame: crate::Received, owner: usize) {
         let bytes = &frame.bytes;
         // SAFETY: owner comes from Shared::owner, and receive buffers hold at most 65575 bytes.
@@ -477,7 +496,7 @@ pub(crate) async fn dispatch<R: PacketReceive>(
             reported_drained = true;
         }
         turns += 1;
-        if turns == 64 {
+        if turns >= 64 {
             tokio::task::yield_now().await;
             turns = 0;
         }
@@ -517,7 +536,12 @@ pub(crate) async fn dispatch<R: PacketReceive>(
                 continue;
             },
             Some(id) = runnable.recv() => {
+                let udp_batch = worker.udp.contains_key(&id.0);
                 worker.drive(id);
+                // One UDP readiness event can consume a full batch. Let the
+                // independent writer drain it before another batch monopolizes
+                // this executor; ordinary packet ingress keeps its small budget.
+                if udp_batch { tokio::task::yield_now().await; }
                 continue;
             },
             _ = async {
@@ -561,22 +585,20 @@ pub(crate) async fn dispatch<R: PacketReceive>(
                 ForwardedPacket::Reassembled(packet) => worker.packet(packet, None)?,
             },
             Input::Read(frame) => {
-                let bytes = &frame.bytes;
-                let len = bytes.len();
-                worker.stats.received_packets += 1;
-                worker.stats.received_bytes += len as u64;
-
-                let Some(parsed) = packet::parse(bytes) else {
-                    continue;
-                };
-                let Some(key) = parsed.route() else {
-                    continue;
-                };
-                let owner = shared.owner(key);
-                if owner != id {
-                    worker.forward_raw(frame, owner);
-                } else if let Some(packet) = parsed.decode(&mut decoder, Instant::now()) {
-                    worker.packet(packet, Some(&frame))?;
+                worker.frame(frame, &mut decoder)?;
+                // Drain only frames already readable. Native UDP can then submit
+                // a batch instead of scheduling one socket send per input frame.
+                for _ in 0..31 {
+                    let next =
+                        poll_fn(|cx| std::task::Poll::Ready(device.poll_frame(cx, &mut buffer)))
+                            .await;
+                    match next {
+                        std::task::Poll::Ready(frame) => {
+                            worker.frame(frame?, &mut decoder)?;
+                            turns += 1;
+                        }
+                        std::task::Poll::Pending => break,
+                    }
                 }
             }
         }
