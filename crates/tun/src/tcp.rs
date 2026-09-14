@@ -37,6 +37,9 @@ use tokio::{
     time::Instant,
 };
 
+#[path = "tcp_direct.rs"]
+mod direct;
+
 const INITIAL: usize = 128 * 1024;
 const MAX_WINDOW: usize = (u16::MAX as usize) << 7;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -50,6 +53,7 @@ pub(crate) struct Link {
 pub(crate) type Ready = (Flow, u64);
 
 struct Shared {
+    attachment: SegQueue<direct::Attachment>,
     incoming: SegQueue<Bytes>,
     outgoing: SegQueue<Bytes>,
     rx_used: Arc<AtomicUsize>,
@@ -68,6 +72,15 @@ struct Shared {
     ready: mpsc::UnboundedSender<Ready>,
     id: Ready,
     pool: Pool,
+}
+
+impl std::task::Wake for Shared {
+    fn wake(self: Arc<Self>) {
+        Shared::wake(&self);
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        Shared::wake(self);
+    }
 }
 
 impl Shared {
@@ -202,6 +215,101 @@ impl AsyncWrite for Stream {
     }
 }
 
+impl kotoconn_protocol::Stream for Stream {
+    fn take_over<'a>(
+        mut self: Pin<&'a mut Self>,
+        peer: &mut Option<kotoconn_protocol::BoxStream>,
+    ) -> Option<futures_util::future::BoxFuture<'a, io::Result<(u64, u64)>>> {
+        if !self.head.is_empty() || self.read_eof || self.write_eof {
+            return None;
+        }
+        let peer = peer.take()?;
+        let (done, completion) = oneshot::channel();
+        self.shared
+            .attachment
+            .push(direct::Attachment { peer, done });
+        self.shared.wake();
+        let cancellation = direct::Cancellation {
+            shared: self.shared.clone(),
+            armed: true,
+        };
+        Some(Box::pin(async move {
+            let result = completion.await.map_err(|_| reset_error())??;
+            cancellation.complete();
+            self.read_eof = true;
+            self.write_eof = true;
+            Ok(result)
+        }))
+    }
+
+    fn poll_read_chunk(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        _: &mut kotoconn_protocol::ChunkBuffer,
+    ) -> Poll<io::Result<Bytes>> {
+        let budget = ready!(coop::poll_proceed(cx));
+        self.shared.reader.register(cx.waker());
+        if self.shared.reset.load(Ordering::Acquire) {
+            return Poll::Ready(Err(reset_error()));
+        }
+        if self.head.is_empty()
+            && let Some(bytes) = self.shared.incoming.pop()
+        {
+            self.head = bytes;
+        }
+        if !self.head.is_empty() {
+            budget.made_progress();
+            return Poll::Ready(Ok(std::mem::take(&mut self.head)));
+        }
+        if self.shared.eof.load(Ordering::Acquire) {
+            if let Some(bytes) = self.shared.incoming.pop() {
+                budget.made_progress();
+                return Poll::Ready(Ok(bytes));
+            }
+            self.read_eof = true;
+            Poll::Ready(Ok(Bytes::new()))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn consume_chunk(self: Pin<&mut Self>, n: usize) {
+        let old = self.shared.rx_used.fetch_sub(n, Ordering::AcqRel);
+        debug_assert!(old >= n);
+        self.shared.rx_consumed.fetch_add(n, Ordering::Release);
+        self.shared.wake();
+    }
+
+    fn poll_write_chunk(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &mut Bytes,
+    ) -> Poll<io::Result<usize>> {
+        let budget = ready!(coop::poll_proceed(cx));
+        self.shared.writer.register(cx.waker());
+        if self.shared.reset.load(Ordering::Acquire) {
+            return Poll::Ready(Err(reset_error()));
+        }
+        if self.write_eof {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+        let available = self
+            .shared
+            .tx_target
+            .load(Ordering::Acquire)
+            .saturating_sub(self.shared.tx_used.load(Ordering::Acquire));
+        let n = bytes.len().min(available);
+        if n == 0 {
+            return Poll::Pending;
+        }
+        self.shared.tx_used.fetch_add(n, Ordering::Release);
+        self.shared.outgoing.push(bytes.split_to(n));
+        self.shared.wake();
+        budget.made_progress();
+        Poll::Ready(Ok(n))
+    }
+}
+
 pub(crate) struct Accept {
     receiver: oneshot::Receiver<Stream>,
     shared: Arc<Shared>,
@@ -279,6 +387,8 @@ pub(crate) struct Connection {
     rx_capacity: Capacity,
     tx_capacity: Capacity,
     closed_normally: bool,
+    direct: Option<direct::Direct>,
+    handed_over: bool,
 }
 
 pub(crate) enum Progress {
@@ -297,6 +407,7 @@ impl Connection {
         pool: Pool,
     ) -> io::Result<(Self, Accept)> {
         let shared = Arc::new(Shared {
+            attachment: SegQueue::new(),
             incoming: SegQueue::new(),
             outgoing: SegQueue::new(),
             rx_used: Arc::new(AtomicUsize::new(0)),
@@ -367,6 +478,8 @@ impl Connection {
                 rx_capacity: Capacity::new(INITIAL),
                 tx_capacity: Capacity::new(INITIAL),
                 closed_normally: false,
+                direct: None,
+                handed_over: false,
             },
             accept,
         ))
@@ -432,6 +545,20 @@ impl Connection {
         self.wake();
     }
 
+    pub fn input_owned(
+        &mut self,
+        packet: &crate::packet::Packet<'_>,
+        repr: &TcpRepr<'_>,
+        source: Option<Bytes>,
+        output: &queue::Sender<Transmit>,
+        arena: &mut PacketArena,
+    ) {
+        self.socket
+            .receive_context(|storage| storage.source = source);
+        self.input(&packet.ip, repr, Instant::now(), output, arena);
+        self.socket.receive_context(|storage| storage.source = None);
+    }
+
     pub fn poll(
         &mut self,
         now: Instant,
@@ -445,59 +572,84 @@ impl Connection {
         {
             self.socket.abort();
         }
-        if matches!(self.socket.state(), State::Established | State::CloseWait) {
-            if let Some((sender, stream)) = self.admission.take()
-                && sender.send(stream).is_err()
-            {
-                self.socket.abort();
+        if !self.handed_over
+            && let Some(attachment) = self.shared.attachment.pop()
+        {
+            self.handed_over = true;
+            self.direct = Some(direct::Direct::new(attachment));
+        }
+        if let Some(direct) = &mut self.direct {
+            let waker = std::task::Waker::from(self.shared.clone());
+            let mut cx = Context::from_waker(&waker);
+            let result = if self.socket.state() == State::Closed && !self.closed_normally {
+                Err(reset_error())
+            } else {
+                direct.poll(&mut self.socket, &self.shared, &mut cx)
+            };
+            if !matches!(result, Ok(false)) {
+                // SAFETY: The state remains installed throughout its synchronous poll.
+                let direct = self.direct.take().expect("active direct transfer");
+                if result.is_err() {
+                    self.socket.abort();
+                }
+                direct.finish(result.map(|_| ()));
             }
-            for _ in 0..32 {
-                let Some(bytes) = self.shared.outgoing.pop() else {
-                    break;
-                };
-                if self
-                    .socket
-                    .send_buffer(|buffer| {
-                        let n = buffer.push(bytes);
-                        (n, ())
-                    })
-                    .is_err()
+        }
+        if !self.handed_over {
+            if matches!(self.socket.state(), State::Established | State::CloseWait) {
+                if let Some((sender, stream)) = self.admission.take()
+                    && sender.send(stream).is_err()
                 {
                     self.socket.abort();
-                    break;
                 }
-            }
-            if self.shared.finish.load(Ordering::Acquire) && self.shared.outgoing.is_empty() {
-                self.socket.close();
-            }
-        }
-        if self.socket.can_recv() {
-            let shared = &self.shared;
-            let _ = self.socket.recv_buffer(|buffer| {
-                let mut count = 0;
                 for _ in 0..32 {
-                    let Some(bytes) = buffer.take() else {
+                    let Some(bytes) = self.shared.outgoing.pop() else {
                         break;
                     };
-                    count += bytes.len();
-                    shared.rx_used.fetch_add(bytes.len(), Ordering::Release);
-                    shared.incoming.push(bytes);
+                    if self
+                        .socket
+                        .send_buffer(|buffer| {
+                            let n = buffer.push(bytes);
+                            (n, ())
+                        })
+                        .is_err()
+                    {
+                        self.socket.abort();
+                        break;
+                    }
                 }
-                (count, ())
-            });
-            self.shared.reader.wake();
-        }
-        if self.admission.is_none()
-            && !self.socket.may_recv()
-            && (self.socket.state() != State::Closed || self.closed_normally)
-        {
-            self.shared.eof.store(true, Ordering::Release);
-            self.shared.reader.wake();
-        }
-        self.shared.writer.wake();
-        if self.socket.state() == State::Closed && !self.closed_normally {
-            self.shared.reset.store(true, Ordering::Release);
-            self.shared.reader.wake();
+                if self.shared.finish.load(Ordering::Acquire) && self.shared.outgoing.is_empty() {
+                    self.socket.close();
+                }
+            }
+            if self.socket.can_recv() {
+                let shared = &self.shared;
+                let _ = self.socket.recv_buffer(|buffer| {
+                    let mut count = 0;
+                    for _ in 0..32 {
+                        let Some(bytes) = buffer.take() else {
+                            break;
+                        };
+                        count += bytes.len();
+                        shared.rx_used.fetch_add(bytes.len(), Ordering::Release);
+                        shared.incoming.push(bytes);
+                    }
+                    (count, ())
+                });
+                self.shared.reader.wake();
+            }
+            if self.admission.is_none()
+                && !self.socket.may_recv()
+                && (self.socket.state() != State::Closed || self.closed_normally)
+            {
+                self.shared.eof.store(true, Ordering::Release);
+                self.shared.reader.wake();
+            }
+            self.shared.writer.wake();
+            if self.socket.state() == State::Closed && !self.closed_normally {
+                self.shared.reset.store(true, Ordering::Release);
+                self.shared.reader.wake();
+            }
         }
         if self.socket.state() == State::TimeWait && stopping {
             self.closed_normally = true;
@@ -505,11 +657,22 @@ impl Connection {
         }
         for _ in 0..32 {
             let mut sent = false;
-            let result = self.socket.dispatch(&mut self.host, |_, meta, (ip, repr)| {
-                let result = emit(arena, output, ip, repr, meta.segmentation_offload_size);
-                sent = result.is_ok();
-                result
-            });
+            let result = self.socket.dispatch_scattered(
+                &mut self.host,
+                |_, meta, (ip, repr), storage, range| {
+                    let result = emit_scattered(
+                        arena,
+                        output,
+                        ip,
+                        repr,
+                        meta.segmentation_offload_size,
+                        storage,
+                        range,
+                    );
+                    sent = result.is_ok();
+                    result
+                },
+            );
             match result {
                 Err((queue::Error::Full, bytes)) => return Progress::Blocked(bytes),
                 Err((queue::Error::Closed, _)) => return Progress::Closed,
@@ -522,7 +685,7 @@ impl Connection {
                 break;
             }
         }
-        if self.socket.can_recv() || !self.shared.outgoing.is_empty() {
+        if !self.handed_over && (self.socket.can_recv() || !self.shared.outgoing.is_empty()) {
             return Progress::Again;
         }
         let deadline = match self.socket.poll_at(&mut self.host) {
@@ -551,6 +714,71 @@ impl Drop for Connection {
         self.shared.reader.wake();
         self.shared.writer.wake();
     }
+}
+
+fn emit_scattered(
+    arena: &mut PacketArena,
+    output: &queue::Sender<Transmit>,
+    ip: IpRepr,
+    repr: TcpRepr<'_>,
+    segment_size: Option<std::num::NonZeroU16>,
+    storage: &Storage,
+    range: std::ops::Range<usize>,
+) -> Result<(), (queue::Error, usize)> {
+    if range.is_empty() {
+        return emit(arena, output, ip, repr, segment_size);
+    }
+    let count = storage.segment_count(range.clone());
+    let cost = crate::storage::charge(ip.buffer_len()) + count * std::mem::size_of::<Bytes>();
+    let permit = output.try_reserve(cost).map_err(|e| (e, cost))?;
+    let count = storage.segments(range);
+    let header_len = ip.header_len() + repr.header_len();
+    let len = if segment_size.is_some() {
+        header_len
+    } else {
+        ip.buffer_len()
+    };
+    let (_, packet) = arena.encode(len, |bytes| {
+        ip.emit(
+            &mut bytes[..ip.header_len()],
+            &ChecksumCapabilities::default(),
+        );
+        let tcp = &mut bytes[ip.header_len()..];
+        let mut checksums = ChecksumCapabilities::default();
+        checksums.tcp = smoltcp::phy::Checksum::Rx;
+        // SAFETY: The allocation includes the complete IP and TCP headers.
+        repr.emit(
+            &mut TcpPacket::new_unchecked(&mut *tcp),
+            &ip.src_addr(),
+            &ip.dst_addr(),
+            &checksums,
+        );
+        if segment_size.is_some() {
+            let seed = checksum::pseudo_header(
+                &ip.src_addr(),
+                &ip.dst_addr(),
+                IpProtocol::Tcp,
+                ip.payload_len() as u32,
+            );
+            TcpPacket::new_unchecked(tcp).set_checksum(seed);
+        } else {
+            let mut at = repr.header_len();
+            for part in &count {
+                tcp[at..at + part.len()].copy_from_slice(part);
+                at += part.len();
+            }
+            TcpPacket::new_unchecked(tcp).fill_checksum(&ip.src_addr(), &ip.dst_addr());
+        }
+    });
+    permit.send(match segment_size {
+        Some(size) => Transmit::TcpGso {
+            packet,
+            payload: count,
+            segment_size: size.get(),
+        },
+        None => Transmit::Packet(packet),
+    });
+    Ok(())
 }
 
 fn emit(
@@ -591,6 +819,7 @@ fn emit(
     permit.send(match segment_size {
         Some(size) => Transmit::TcpGso {
             packet,
+            payload: Vec::new(),
             segment_size: size.get(),
         },
         None => Transmit::Packet(packet),
@@ -660,21 +889,45 @@ mod tests {
             };
             let ip = IpRepr::new(source, destination, IpProtocol::Tcp, repr.buffer_len(), 64);
             let (output, mut input) = queue::channel(INITIAL, Transmit::size);
-            emit(
+            let mut storage = Storage::new(
+                Pool::default(),
+                Arc::new(AtomicUsize::new(INITIAL)),
+                true,
+                Arc::new(AtomicUsize::new(data.len())),
+                Arc::new(AtomicUsize::new(0)),
+            );
+            for part in data.chunks(8192) {
+                storage.push(Bytes::copy_from_slice(part));
+            }
+            let repr = TcpRepr {
+                payload: &[],
+                ..repr
+            };
+            emit_scattered(
                 &mut PacketArena::default(),
                 &output,
                 ip,
                 repr,
                 std::num::NonZeroU16::new(1200),
+                &storage,
+                0..data.len(),
             )
             .unwrap();
             let Transmit::TcpGso {
                 packet,
                 segment_size,
+                payload,
             } = input.try_recv().unwrap()
             else {
                 panic!()
             };
+            assert!(payload.len() > 1);
+            smoltcp::socket::tcp::Buffer::dequeue_allocated(&mut storage, data.len());
+            let mut full_packet = packet.to_vec();
+            for part in payload {
+                full_packet.extend_from_slice(&part);
+            }
+            let packet = Bytes::from(full_packet);
             let header = crate::offload::tcp_gso_header(&packet, segment_size).unwrap();
             let header = tun_rs::VirtioNetHdr::decode(&header).unwrap();
             assert_eq!(header.flags, 1);

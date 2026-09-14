@@ -1,8 +1,5 @@
 use super::*;
-use tokio::{
-    sync::{mpsc, watch},
-    time::Instant,
-};
+use tokio::sync::mpsc;
 
 struct Entry {
     tx: kotoconn_protocol::queue::Sender<Packet>,
@@ -17,10 +14,26 @@ impl Drop for Entry {
 }
 
 pub(super) async fn association(handler: SessionHandler, mut packets: Datagram) -> Result<()> {
+    if let Some(target) = packets.single_target.take() {
+        let incoming = packets.take_receiver();
+        let worker = packets.worker.take();
+        return packets
+            .scope
+            .run(session(
+                handler,
+                target,
+                incoming,
+                packets.tx.clone(),
+                packets.scope.clone(),
+                worker,
+            ))
+            .await;
+    }
     let mut sessions = HashMap::<Target, Entry>::new();
     let (completed, mut completions) = mpsc::unbounded_channel();
     let mut generation = 0;
 
+    let mut batch = Vec::with_capacity(32);
     loop {
         tokio::select! {
             biased;
@@ -33,8 +46,9 @@ pub(super) async fn association(handler: SessionHandler, mut packets: Datagram) 
                     sessions.remove(&target);
                 }
             }
-            packet = packets.rx.recv() => {
-                let Some(packet) = packet else { return Ok(()); };
+            count = packets.rx.recv_many(&mut batch, 32) => {
+                if count == 0 { return Ok(()); }
+                for packet in batch.drain(..) {
                 let target = packet.target.clone();
 
                 if sessions
@@ -68,6 +82,7 @@ pub(super) async fn association(handler: SessionHandler, mut packets: Datagram) 
                                     rx,
                                     replies,
                                     control.clone(),
+                                    None,
                                 ))
                                 .await;
                         if let Err(error) = &result
@@ -86,6 +101,7 @@ pub(super) async fn association(handler: SessionHandler, mut packets: Datagram) 
                 }
 
                 let _ = sessions[&target].tx.try_send(packet);
+                }
             }
         }
     }
@@ -97,6 +113,7 @@ async fn session(
     mut incoming: kotoconn_protocol::queue::Receiver<Packet>,
     replies: kotoconn_protocol::queue::Sender<Packet>,
     scope: Scope,
+    worker: Option<Arc<dyn p::DatagramWorker>>,
 ) -> Result<()> {
     let registration = handler
         .sessions
@@ -105,7 +122,7 @@ async fn session(
     tracing::Span::current().record("session_id", registration.id.0);
     tracing::debug!("session started");
 
-    let (activity, last_activity) = watch::channel(Instant::now());
+    let activity = p::Activity::default();
     let work = async {
         let decision = handler
             .policy
@@ -130,19 +147,31 @@ async fn session(
             .control(TransportProtocol::Udp)
             .run(async {
                 let mut outgoing = client.udp_scoped(destination, scope.clone()).await?;
+                if let Some(worker) = worker
+                    && let Some(native) = outgoing.take_native().await?
+                {
+                    tracing::debug!("UDP transport transferred to TUN worker");
+                    worker.transfer(native, incoming, activity.clone()).await?;
+                    return Ok(());
+                }
                 let forward = async {
-                    while let Some(packet) = incoming.recv().await {
-                        outgoing.tx.send(packet).await?;
-                        activity.send_replace(Instant::now());
+                    let mut batch = Vec::with_capacity(32);
+                    while incoming.recv_many(&mut batch, 32).await != 0 {
+                        for packet in batch.drain(..) {
+                            outgoing.tx.send(packet).await?;
+                        }
+                        activity.record();
                     }
                     Ok::<(), anyhow::Error>(())
                 };
 
                 let backward = async {
-                    while let Some(packet) = outgoing.rx.recv().await {
-                        // Reply address is protocol metadata; there is no target rewrite.
-                        let _ = replies.try_send(packet);
-                        activity.send_replace(Instant::now());
+                    let mut batch = Vec::with_capacity(32);
+                    while outgoing.rx.recv_many(&mut batch, 32).await != 0 {
+                        for packet in batch.drain(..) {
+                            let _ = replies.try_send(packet);
+                        }
+                        activity.record();
                     }
                     Ok::<(), anyhow::Error>(())
                 };
@@ -152,58 +181,10 @@ async fn session(
     };
     tokio::select! {
         biased;
-        _ = until_idle(handler.idle, last_activity) => {
+        _ = activity.until_idle(handler.idle) => {
             tracing::debug!("UDP session idle timeout");
             Ok(())
         },
         result = work => result,
-    }
-}
-
-async fn until_idle(timeout: std::time::Duration, mut activity: watch::Receiver<Instant>) {
-    loop {
-        let deadline = *activity.borrow_and_update() + timeout;
-        tokio::select! {
-            biased;
-            changed = activity.changed() => {
-                if changed.is_err() {
-                    return;
-                }
-            }
-            _ = tokio::time::sleep_until(deadline) => return,
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-
-    #[tokio::test(start_paused = true)]
-    async fn activity_refreshes_only_its_session_and_idle_work_expires() {
-        let timeout = Duration::from_secs(10);
-        let (a, a_rx) = watch::channel(Instant::now());
-        let (_b, b_rx) = watch::channel(Instant::now());
-        let first = until_idle(timeout, a_rx);
-        let second = until_idle(timeout, b_rx);
-        tokio::pin!(first, second);
-        tokio::select! {
-            biased;
-            _ = &mut first => panic!("expired before idle interval"),
-            _ = &mut second => panic!("expired before idle interval"),
-            _ = std::future::ready(()) => {},
-        }
-        tokio::time::advance(Duration::from_secs(9)).await;
-        a.send_replace(Instant::now());
-        tokio::time::advance(Duration::from_secs(1)).await;
-        second.await;
-        tokio::select! {
-            biased;
-            _ = &mut first => panic!("another session's deadline expired this session"),
-            _ = std::future::ready(()) => {},
-        }
-        tokio::time::advance(Duration::from_secs(9)).await;
-        first.await;
     }
 }

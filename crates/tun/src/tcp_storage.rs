@@ -23,6 +23,7 @@ pub(crate) struct Storage {
     tx: bool,
     pool: Pool,
     scratch: Bytes,
+    pub source: Option<Bytes>,
 }
 
 impl Storage {
@@ -43,7 +44,38 @@ impl Storage {
             tx,
             pool,
             scratch: Bytes::new(),
+            source: None,
         }
+    }
+
+    pub fn segment_count(&self, range: std::ops::Range<usize>) -> usize {
+        let start = self.head + range.start;
+        let end = self.head + range.end;
+        let prefix = self
+            .blocks
+            .range(..start)
+            .next_back()
+            .is_some_and(|(&key, bytes)| key + bytes.len() > start);
+        usize::from(prefix) + self.blocks.range(start..end).count()
+    }
+
+    pub fn segments(&self, range: std::ops::Range<usize>) -> Vec<Bytes> {
+        let mut position = self.head + range.start;
+        let end = self.head + range.end;
+        let mut result = Vec::new();
+        while position < end {
+            // SAFETY: dispatch selects a range inside the contiguous TX prefix.
+            let (&start, bytes) = self
+                .blocks
+                .range(..=position)
+                .next_back()
+                .expect("TX segment");
+            let count = (end - position).min(start + bytes.len() - position);
+            debug_assert!(count != 0);
+            result.push(bytes.slice(position - start..position - start + count));
+            position += count;
+        }
+        result
     }
 
     pub fn push(&mut self, bytes: Bytes) -> usize {
@@ -162,6 +194,21 @@ impl Buffer for Storage {
         &bytes[local..bytes.len().min(local + size.min(self.length - offset))]
     }
 
+    fn segment_len(&self, offset: usize, size: usize) -> usize {
+        let mut position = offset;
+        let end = offset + size.min(self.length.saturating_sub(offset));
+        // Bound descriptor work and the number of vectors in one syscall.
+        for _ in 0..64 {
+            if position == end {
+                break;
+            }
+            let part = self.get_allocated(position, end - position);
+            debug_assert!(!part.is_empty());
+            position += part.len();
+        }
+        position - offset
+    }
+
     fn get_segment(&mut self, offset: usize, size: usize) -> &[u8] {
         let wanted = size.min(self.length.saturating_sub(offset));
         if self.get_allocated(offset, wanted).len() == wanted {
@@ -198,7 +245,12 @@ impl Buffer for Storage {
         // TCP already checked the advertised window. A lowered target must still
         // accept in-flight data covered by a previous window advertisement.
         if !data.is_empty() {
-            self.insert(self.head + self.length + offset, self.pool.copy(data));
+            let bytes = self
+                .source
+                .as_ref()
+                .and_then(|source| crate::storage::view(source, data))
+                .unwrap_or_else(|| self.pool.copy(data));
+            self.insert(self.head + self.length + offset, bytes);
         }
         data.len()
     }
@@ -245,6 +297,25 @@ mod tests {
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicUsize::new(0)),
         )
+    }
+
+    #[test]
+    fn receive_views_keep_the_frame_alive_through_overlaps_and_consumption() {
+        let mut rx = storage(false);
+        let source = rx.pool.copy(b"headerabcdefghij");
+        let pointer = source.as_ptr();
+        rx.source = Some(source.clone());
+        rx.write_unallocated(0, &source[6..]);
+        rx.source = None;
+        drop(source);
+        rx.enqueue_unallocated(10);
+        let bytes = rx.take().unwrap();
+        assert_eq!(bytes.as_ptr() as usize, pointer as usize + 6);
+        assert_eq!(bytes, b"abcdefghij"[..]);
+        rx.write_unallocated(0, b"next");
+        rx.enqueue_unallocated(4);
+        assert_eq!(rx.take().unwrap(), b"next"[..]);
+        assert_eq!(bytes, b"abcdefghij"[..]);
     }
 
     #[test]

@@ -68,18 +68,23 @@ impl p::Client for Client {
             scope.spawn(async move {
                 let mut byte = [0];
 
+                let mut received_batch = Vec::with_capacity(32);
+                let mut outgoing_batch = Vec::with_capacity(32);
                 loop {
                     tokio::select! {
                         biased;
                         _ = control.read(&mut byte) => return Ok(()),
-                        received = transport.rx.recv() => {
-                            let Some(received) = received else { bail!("SOCKS UDP carrier closed"); };
+                        count = transport.rx.recv_many(&mut received_batch, 32) => {
+                            if count == 0 { bail!("SOCKS UDP carrier closed"); };
+                            for received in received_batch.drain(..) {
                             if let Ok(packet) = decode(&received.payload).await {
                                 let _ = driver.tx.try_send(packet);
                             }
+                            }
                         }
-                        packet = driver.rx.recv() => {
-                            let Some(packet) = packet else { return Ok(()); };
+                        count = driver.rx.recv_many(&mut outgoing_batch, 32) => {
+                            if count == 0 { return Ok(()); };
+                            for packet in outgoing_batch.drain(..) {
 
                             match encode(packet) {
                                 Ok(payload) => {
@@ -95,6 +100,7 @@ impl p::Client for Client {
                                     }
                                 },
                                 Err(error) => tracing::warn!(error = %format_args!("{error:#}"), "SOCKS UDP drop"),
+                            }
                             }
                         }
                     }

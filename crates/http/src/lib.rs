@@ -50,7 +50,10 @@ impl p::Client for Client {
                 "CONNECT rejected: {:?}",
                 response.code
             );
-            Ok(Box::pin(stream) as BoxStream)
+            Ok(p::prefix(
+                stream.buffer().to_vec().into(),
+                stream.into_inner(),
+            ))
         })
     }
 
@@ -100,7 +103,7 @@ impl p::Server for Server {
                                 .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                                 .await?;
                             stream.flush().await?;
-                            handler.tcp(destination, Box::pin(stream), scope).await
+                            handler.tcp(destination, p::prefix(stream.buffer().to_vec().into(), stream.into_inner()), scope).await
                         }
                     })
                     .await

@@ -81,3 +81,5 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Buffered<S> {
         Pin::new(&mut self.stream).poll_shutdown(cx)
     }
 }
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send> kotoconn_protocol::Stream for Buffered<S> {}

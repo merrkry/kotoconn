@@ -1486,6 +1486,7 @@ dependencies = [
  "kotoconn-protocol",
  "kotoconn-shadowsocks2022",
  "kotoconn-socks5",
+ "libc",
  "tokio",
  "tokio-util",
  "tracing",
@@ -1497,6 +1498,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "crossbeam-queue",
  "futures-util",
  "kotoconn-config",
  "tokio",

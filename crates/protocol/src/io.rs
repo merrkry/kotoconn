@@ -1,16 +1,16 @@
-use crate::{Scope, Target, queue};
-use anyhow::Result;
+use crate::{Activity, BoxPacketIo, PacketIo, Scope, Target, queue};
 use bytes::Bytes;
+use futures_util::future::BoxFuture;
+use std::pin::Pin;
 use std::{
-    future::Future,
-    pin::Pin,
+    io,
+    sync::Arc,
     task::{Context, Poll},
 };
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::oneshot;
 
-pub trait Stream: AsyncRead + AsyncWrite + Send {}
-
-impl<T: AsyncRead + AsyncWrite + Send> Stream for T {}
+pub use crate::chunk::{ChunkBuffer, Stream, copy_bidirectional, prefix};
+pub use crate::scoped::stream_task;
 
 pub type BoxStream = Pin<Box<dyn Stream>>;
 
@@ -27,11 +27,106 @@ pub struct Datagram {
     pub tx: queue::Sender<Packet>,
     pub rx: queue::Receiver<Packet>,
     pub scope: Scope,
+    /// A TUN flow has one destination, so routing can own its ingress directly.
+    pub single_target: Option<Target>,
+    pub worker: Option<Arc<dyn DatagramWorker>>,
+    handoff: Option<oneshot::Sender<oneshot::Sender<Option<BoxPacketIo>>>>,
+    close_on_drop: bool,
 }
 
 impl Drop for Datagram {
     fn drop(&mut self) {
-        self.scope.close();
+        if self.close_on_drop {
+            self.scope.close();
+        }
+    }
+}
+
+/// A flow owner receives the selected transport only after policy routing.
+pub trait DatagramWorker: Send + Sync {
+    fn transfer(
+        &self,
+        io: BoxPacketIo,
+        incoming: queue::Receiver<Packet>,
+        activity: Activity,
+    ) -> BoxFuture<'static, io::Result<()>>;
+}
+
+impl Datagram {
+    /// The driver must stop and drop its queue endpoints before delivering the
+    /// native transport. No later packet may be published to the old reply queue.
+    pub fn offer_handoff(&mut self) -> oneshot::Receiver<oneshot::Sender<Option<BoxPacketIo>>> {
+        let (sender, receiver) = oneshot::channel();
+        self.handoff = Some(sender);
+        receiver
+    }
+
+    /// The driver relinquishes its close guard only after transferring ownership.
+    pub fn disarm(&mut self) {
+        self.close_on_drop = false;
+    }
+
+    pub fn take_receiver(&mut self) -> queue::Receiver<Packet> {
+        let (sender, receiver) =
+            queue::channel(queue::INITIAL_BYTES, |packet: &Packet| packet.payload.len());
+        drop(sender);
+        std::mem::replace(&mut self.rx, receiver)
+    }
+
+    /// Must precede application sends. A driver that already consumed an outgoing
+    /// datagram declines. Buffered replies remain ahead of future native receives.
+    pub async fn take_native(&mut self) -> io::Result<Option<BoxPacketIo>> {
+        let Some(request) = self.handoff.take() else {
+            return Ok(None);
+        };
+        let (reply, receive) = oneshot::channel();
+        request
+            .send(reply)
+            .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+        let Some(io) = receive
+            .await
+            .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Box::new(BufferedPackets {
+            io,
+            pending: Some(self.take_receiver()),
+        })))
+    }
+}
+
+struct BufferedPackets {
+    io: BoxPacketIo,
+    pending: Option<queue::Receiver<Packet>>,
+}
+
+impl PacketIo for BufferedPackets {
+    fn poll_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+        out: &mut Vec<Packet>,
+    ) -> Poll<io::Result<usize>> {
+        if let Some(pending) = &mut self.pending {
+            let before = out.len();
+            while out.len() - before < 32 {
+                match pending.try_recv() {
+                    Ok(packet) => out.push(packet),
+                    Err(queue::Error::Closed) => {
+                        self.pending = None;
+                        break;
+                    }
+                    Err(queue::Error::Full) => break,
+                }
+            }
+            if out.len() != before {
+                return Poll::Ready(Ok(out.len() - before));
+            }
+        }
+        self.io.poll_recv(cx, out)
+    }
+    fn poll_send(&mut self, cx: &mut Context<'_>, packets: &[Packet]) -> Poll<io::Result<usize>> {
+        self.io.poll_send(cx, packets)
     }
 }
 
@@ -44,70 +139,19 @@ pub fn packet_pair(scope: Scope) -> (Datagram, Datagram) {
             tx: a_tx,
             rx: a_rx,
             scope: scope.clone(),
+            single_target: None,
+            worker: None,
+            handoff: None,
+            close_on_drop: true,
         },
         Datagram {
             tx: b_tx,
             rx: b_rx,
             scope,
+            single_target: None,
+            worker: None,
+            handoff: None,
+            close_on_drop: true,
         },
     )
-}
-
-/// Decouples protocol progress from the caller's read/write scheduling. Reading
-/// alone advances setup, including server-first protocols. Drop cancels setup/I/O.
-pub fn stream_task(
-    scope: Scope,
-    connect: impl Future<Output = Result<BoxStream>> + Send + 'static,
-) -> Result<BoxStream> {
-    let (local, mut remote) = crate::stream_buffer::duplex();
-    let handle = scope.clone();
-
-    scope.spawn(async move {
-        let mut stream = connect.await?;
-        tokio::io::copy_bidirectional(&mut remote, &mut stream).await?;
-        Ok(())
-    })?;
-    Ok(Box::pin(OwnedStream {
-        inner: local,
-        scope: handle,
-    }))
-}
-
-struct OwnedStream {
-    inner: crate::stream_buffer::BufferedStream,
-    scope: Scope,
-}
-
-impl Drop for OwnedStream {
-    fn drop(&mut self) {
-        self.scope.close();
-    }
-}
-
-impl AsyncRead for OwnedStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for OwnedStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
 }

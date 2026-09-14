@@ -11,9 +11,10 @@ mod tcp;
 mod tcp_storage;
 mod transmit;
 mod udp;
+mod udp_direct;
 mod worker;
 
-pub use endpoint::{PacketReceive, PacketSend, run};
+pub use endpoint::{PacketReceive, PacketSend, ReceiveBuffer, Received, run};
 pub use linux::{BoundTun, bind};
 
 #[cfg(test)]

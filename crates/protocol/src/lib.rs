@@ -1,15 +1,26 @@
 //! Protocol-independent I/O, capability and lifetime contracts.
+mod activity;
+mod chunk;
 mod control;
 mod io;
+mod packet_io;
+pub mod pool;
 pub mod queue;
+mod scoped;
 mod server;
 pub mod stream_buffer;
 
+pub use activity::Activity;
 use anyhow::{Result, bail};
+pub use chunk::relay;
 pub use control::{Scope, WorkGuard};
 use futures_util::future::BoxFuture;
-pub use io::{BoxStream, Datagram, Packet, Stream, packet_pair, stream_task};
+pub use io::{
+    BoxStream, ChunkBuffer, Datagram, DatagramWorker, Packet, Stream, copy_bidirectional,
+    packet_pair, prefix, stream_task,
+};
 pub use kotoconn_config::{Target, TransportProtocol};
+pub use packet_io::{BoxPacketIo, PacketIo, packet_io_task};
 pub use server::{BoundServer, Handler, Server, ServerContext, accept_loop};
 use std::{net::SocketAddr, sync::Arc};
 

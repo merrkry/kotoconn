@@ -5,6 +5,13 @@ use bytes::{Bytes, BytesMut};
 
 const BLOCK: usize = 16 * 1024;
 
+/// Share only slices belonging to this allocation; reassembly has its own owner.
+pub(crate) fn view(source: &Bytes, data: &[u8]) -> Option<Bytes> {
+    let start = (data.as_ptr() as usize).checked_sub(source.as_ptr() as usize)?;
+    let end = start.checked_add(data.len())?;
+    (end <= source.len()).then(|| source.slice(start..end))
+}
+
 #[derive(Default)]
 pub(crate) struct PacketArena {
     tail: BytesMut,

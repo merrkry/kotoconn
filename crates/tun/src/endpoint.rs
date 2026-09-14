@@ -11,7 +11,7 @@ use std::{
     future::poll_fn,
     io,
     sync::Arc,
-    task::{Context, Poll},
+    task::{Context, Poll, ready},
 };
 use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -21,6 +21,42 @@ use tracing::Instrument;
 /// register the supplied waker on Pending, and return at most bytes.len() bytes.
 pub trait PacketReceive: Send {
     fn poll_recv(&mut self, cx: &mut Context<'_>, bytes: &mut [u8]) -> Poll<io::Result<usize>>;
+
+    /// Transfer a frame's backing storage. The default supports ordinary packet
+    /// readers; device implementations can preserve offload metadata as well.
+    fn poll_frame(
+        &mut self,
+        cx: &mut Context<'_>,
+        buffer: &mut ReceiveBuffer,
+    ) -> Poll<io::Result<Received>> {
+        let lease = buffer
+            .lease
+            .get_or_insert_with(|| buffer.pool.acquire(65575));
+        let len = ready!(self.poll_recv(cx, lease.as_mut()))?;
+        // SAFETY: The receive call initialized this prefix, and the lease remains
+        // installed until a complete frame is returned.
+        let lease = buffer.lease.take().expect("receive lease");
+        Poll::Ready(Ok(Received {
+            bytes: lease.publish(len),
+            checksum_verified: false,
+            udp_segment_size: None,
+        }))
+    }
+}
+
+#[derive(Default)]
+pub struct ReceiveBuffer {
+    pub(crate) pool: crate::pool::Pool,
+    pub(crate) lease: Option<kotoconn_protocol::pool::Lease>,
+}
+
+/// Offload assertions are accepted only from the device implementation. Ordinary
+/// packet readers leave both metadata fields unset and receive full validation.
+pub struct Received {
+    pub bytes: Bytes,
+    pub checksum_verified: bool,
+    /// UDP L4 segmentation, never IP fragmentation. Each slice is one datagram.
+    pub udp_segment_size: Option<u16>,
 }
 
 /// A queue has one transmit owner, independent of its receive owner.
@@ -32,6 +68,21 @@ pub trait PacketSend: Send {
         false
     }
 
+    fn udp_gso(&self) -> bool {
+        false
+    }
+
+    /// Write complete equal-size UDP datagrams as one frame. A single datagram
+    /// uses checksum offload only. Oversized datagrams still require fragmentation.
+    fn send_udp_segments(
+        &mut self,
+        _header: &[u8],
+        _payload: &[Bytes],
+        _segment_size: u16,
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        async { Err(io::ErrorKind::Unsupported.into()) }
+    }
+
     /// Write one TCP aggregate. Only called when tcp_gso returned true.
     fn send_tcp_gso(
         &mut self,
@@ -39,6 +90,22 @@ pub trait PacketSend: Send {
         _segment_size: u16,
     ) -> impl Future<Output = io::Result<()>> + Send {
         async { Err(io::ErrorKind::Unsupported.into()) }
+    }
+
+    /// Header and payload vectors belong to a single GSO frame.
+    fn send_tcp_segments(
+        &mut self,
+        header: &[u8],
+        payload: &[Bytes],
+        segment_size: u16,
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        async move {
+            let mut packet = header.to_vec();
+            for part in payload {
+                packet.extend_from_slice(part);
+            }
+            self.send_tcp_gso(&packet, segment_size).await
+        }
     }
 
     /// Send only packets already available. Cancellation may transmit a prefix;
@@ -184,11 +251,13 @@ async fn transmit<W: PacketSend>(
     let mut sent_bytes = 0u64;
 
     while input.recv_many(&mut items, 64).await != 0 {
-        for item in items.drain(..) {
+        let mut pending = items.drain(..).peekable();
+        while let Some(item) = pending.next() {
             match item {
                 Transmit::Packet(packet) => packets.push(packet),
                 Transmit::TcpGso {
                     packet,
+                    payload,
                     segment_size,
                 } => {
                     if !packets.is_empty() {
@@ -197,15 +266,55 @@ async fn transmit<W: PacketSend>(
                         sent_bytes += packets.iter().map(|p| p.len() as u64).sum::<u64>();
                         packets.clear();
                     }
-                    device.send_tcp_gso(&packet, segment_size).await?;
+                    device
+                        .send_tcp_segments(&packet, &payload, segment_size)
+                        .await?;
                     sent_packets += 1;
-                    sent_bytes += packet.len() as u64;
+                    sent_bytes +=
+                        packet.len() as u64 + payload.iter().map(|p| p.len() as u64).sum::<u64>();
                 }
                 Transmit::Datagram {
                     source,
                     destination,
                     payload,
                 } => {
+                    let size = payload.len();
+                    if device.udp_gso()
+                        && size != 0
+                        && encoder.can_offload(source, destination, size)
+                    {
+                        let mut parts = vec![payload];
+                        while parts.len() < 64 && (parts.len() + 1) * size <= 65507 {
+                            if !matches!(pending.peek(), Some(Transmit::Datagram { source: s, destination: d, payload: p })
+                                if *s == source && *d == destination && p.len() == size)
+                            {
+                                break;
+                            }
+                            // SAFETY: peek established this item's variant; no other
+                            // consumer can modify the local batch iterator.
+                            let Some(Transmit::Datagram { payload, .. }) = pending.next() else {
+                                unreachable!()
+                            };
+                            parts.push(payload);
+                        }
+                        // SAFETY: The first size was validated and aggregation stops
+                        // before exceeding the IPv4 limit, also valid for IPv6.
+                        let header = encoder
+                            .header(source, destination, size, size * parts.len())
+                            .expect("validated UDP aggregate");
+                        if !packets.is_empty() {
+                            device.send_batch(&packets).await?;
+                            sent_packets += packets.len() as u64;
+                            sent_bytes += packets.iter().map(|p| p.len() as u64).sum::<u64>();
+                            packets.clear();
+                        }
+                        device
+                            .send_udp_segments(&header, &parts, size as u16)
+                            .await?;
+                        sent_packets += parts.len() as u64;
+                        sent_bytes += (header.len() * parts.len() + size * parts.len()) as u64;
+                        continue;
+                    }
                     let datagram = encoder.encode(source, destination, &payload);
                     if let Some(datagram) = datagram {
                         packets.extend(datagram);

@@ -99,29 +99,21 @@ fn gso_tcp_preserves_aggregate_bytes_sequence_and_flags_in_both_families() {
         let mut frame = vec![0; tun_rs::VIRTIO_NET_HDR_LEN];
         header.encode(&mut frame).unwrap();
         frame.extend_from_slice(&packet);
-        let mut output = vec![0; 65575];
-        let mut pending = std::collections::VecDeque::new();
-        let len = offload::normalize(
-            &mut frame,
-            &mut output,
-            &mut pending,
-            &mut kotoconn_protocol::queue::Capacity::new(kotoconn_protocol::queue::INITIAL_BYTES),
-        )
-        .unwrap();
-        let packet = decoded(&output[..len]);
-        let (actual_flow, tcp) = packet.tcp().unwrap();
+        let (verified, segments) = offload::normalize(&mut frame).unwrap();
+        let packet = decoded(&frame[tun_rs::VIRTIO_NET_HDR_LEN..]);
+        let (actual_flow, tcp) = packet.tcp_with_checksum(verified).unwrap();
         assert_eq!(actual_flow, flow(ipv6));
         assert_eq!(tcp.seq_number, TcpSeqNumber(100));
         assert_eq!(tcp.ack_number, Some(TcpSeqNumber(200)));
         assert_eq!(tcp.control, TcpControl::Psh);
         assert_eq!(tcp.payload, payload);
-        assert!(pending.is_empty());
+        assert!(segments.is_none());
     }
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn gso_udp_preserves_datagram_boundaries_and_rebuilds_checksums() {
+fn gso_udp_preserves_datagram_boundaries_without_rebuilding_payloads() {
     for (ipv6, segment_size) in [(false, 1000), (true, 1000), (false, 8), (true, 8)] {
         let flow = flow(ipv6);
         let payload: Vec<_> = (0..2501).map(|i| (i % 251) as u8).collect();
@@ -141,23 +133,14 @@ fn gso_udp_preserves_datagram_boundaries_and_rebuilds_checksums() {
         let mut frame = vec![0; tun_rs::VIRTIO_NET_HDR_LEN];
         header.encode(&mut frame).unwrap();
         frame.extend_from_slice(&packet);
-        let mut output = vec![0; 65575];
-        let mut pending = std::collections::VecDeque::new();
-        let len = offload::normalize(
-            &mut frame,
-            &mut output,
-            &mut pending,
-            &mut kotoconn_protocol::queue::Capacity::new(kotoconn_protocol::queue::INITIAL_BYTES),
-        )
-        .unwrap();
-        pending.push_front(output[..len].to_vec());
-        assert_eq!(pending.len(), payload.len().div_ceil(segment_size));
-        for (packet, expected) in pending.into_iter().zip(payload.chunks(segment_size)) {
-            let packet = decoded(&packet);
-            let (actual_flow, actual) = packet.udp().unwrap();
-            assert_eq!(actual_flow, flow);
-            assert_eq!(actual, expected);
-        }
+        let pointer = frame.as_ptr();
+        let (verified, size) = offload::normalize(&mut frame).unwrap();
+        assert_eq!(pointer, frame.as_ptr());
+        let packet = decoded(&frame[tun_rs::VIRTIO_NET_HDR_LEN..]);
+        let (actual_flow, actual) = packet.udp_with_checksum(verified).unwrap();
+        assert_eq!(actual_flow, flow);
+        let parts: Vec<_> = actual.chunks(usize::from(size.unwrap())).collect();
+        assert_eq!(parts, payload.chunks(segment_size).collect::<Vec<_>>());
     }
 }
 
@@ -214,27 +197,77 @@ fn udp_offload_encodes_a_computed_zero_checksum_as_all_ones() {
             let mut frame = vec![0; tun_rs::VIRTIO_NET_HDR_LEN];
             header.encode(&mut frame).unwrap();
             frame.extend_from_slice(&packet);
-            let mut output = vec![0; 65575];
-            let mut pending = std::collections::VecDeque::new();
-            let len = offload::normalize(
-                &mut frame,
-                &mut output,
-                &mut pending,
-                &mut kotoconn_protocol::queue::Capacity::new(
-                    kotoconn_protocol::queue::INITIAL_BYTES,
-                ),
-            )
-            .unwrap();
-            pending.push_front(output[..len].to_vec());
-            assert_eq!(pending.len(), if gso { 2 } else { 1 });
-            for bytes in pending {
+            let (verified, size) = offload::normalize(&mut frame).unwrap();
+            let packet = decoded(&frame[tun_rs::VIRTIO_NET_HDR_LEN..]);
+            let (_, actual) = packet.udp_with_checksum(verified).unwrap();
+            let parts: Vec<_> = actual
+                .chunks(size.map(usize::from).unwrap_or(actual.len()))
+                .collect();
+            assert_eq!(parts.len(), if gso { 2 } else { 1 });
+            for part in parts {
+                assert_eq!(part, payload);
+                let encoded = encoder.encode(flow.source, flow.destination, part).unwrap();
                 assert_eq!(
-                    UdpPacket::new_checked(&bytes[start..]).unwrap().checksum(),
+                    UdpPacket::new_checked(&encoded[0][start..])
+                        .unwrap()
+                        .checksum(),
                     0xffff
                 );
-                assert_eq!(decoded(&bytes).udp().unwrap().1, payload);
+                assert_eq!(decoded(&encoded[0]).udp().unwrap().1, payload);
             }
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn udp_output_views_segment_into_valid_wire_datagrams() {
+    for ipv6 in [false, true] {
+        let flow = flow(ipv6);
+        let mut encoder = udp::Encoder::new(1500);
+        let size = 1232;
+        let payload: Vec<_> = (0..3).flat_map(|i| vec![i; size]).collect();
+        let header = encoder
+            .header(flow.source, flow.destination, size, payload.len())
+            .unwrap();
+        let mut aggregate = header.to_vec();
+        aggregate.extend_from_slice(&payload);
+        let metadata = tun_rs::VirtioNetHdr {
+            flags: 1,
+            gso_type: tun_rs::VIRTIO_NET_HDR_GSO_UDP_L4,
+            hdr_len: header.len() as u16,
+            gso_size: size as u16,
+            csum_start: if ipv6 { 40 } else { 20 },
+            csum_offset: 6,
+        };
+        let mut packets = vec![vec![0; 1500]; 3];
+        let mut lengths = [0; 3];
+        assert_eq!(
+            tun_rs::gso_split(
+                &mut aggregate,
+                metadata,
+                &mut packets,
+                &mut lengths,
+                0,
+                ipv6
+            )
+            .unwrap(),
+            3
+        );
+        for (i, packet) in packets.iter().enumerate() {
+            let packet = decoded(&packet[..lengths[i]]);
+            let (actual, data) = packet.udp().unwrap();
+            assert_eq!(actual, flow);
+            assert_eq!(data, vec![i as u8; size]);
+        }
+        assert!(!encoder.can_offload(flow.source, flow.destination, 4096));
+        assert!(
+            encoder
+                .encode(flow.source, flow.destination, &[0; 4096])
+                .unwrap()
+                .len()
+                > 1
+        );
     }
 }
 
@@ -502,6 +535,92 @@ async fn tcp_admits_without_application_io_and_preserves_half_close() {
         drop(stream);
         driver.await.unwrap().unwrap();
     }
+}
+
+#[tokio::test]
+async fn direct_handoff_preserves_prequeued_bytes_half_close_and_counts() {
+    for ipv6 in [false, true] {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (stream, packets, mut replies, driver, server_seq) = accepted(ipv6).await;
+            let listener =
+                tokio::net::TcpListener::bind(if ipv6 { "[::1]:0" } else { "127.0.0.1:0" })
+                    .await
+                    .unwrap();
+            let socket = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (mut peer, _) = listener.accept().await.unwrap();
+            packets
+                .send(segment(
+                    flow(ipv6),
+                    101,
+                    Some(server_seq),
+                    TcpControl::Fin,
+                    b"hello",
+                ))
+                .await
+                .unwrap();
+            let relay = tokio::spawn(async move {
+                let mut stream: kotoconn_protocol::BoxStream = Box::pin(stream);
+                kotoconn_protocol::relay(&mut stream, Box::pin(socket)).await
+            });
+            let remote = tokio::spawn(async move {
+                let mut data = Vec::new();
+                peer.read_to_end(&mut data).await.unwrap();
+                assert_eq!(data, b"hello");
+                peer.write_all(b"world").await.unwrap();
+                peer.shutdown().await.unwrap();
+            });
+            let mut received = Vec::new();
+            loop {
+                let packet = decoded(&replies.recv().await.unwrap().packet());
+                let (_, repr) = packet.tcp().unwrap();
+                received.extend_from_slice(repr.payload);
+                let fin = repr.control == TcpControl::Fin;
+                let end = repr.seq_number + repr.payload.len() + usize::from(fin);
+                packets
+                    .send(segment(flow(ipv6), 107, Some(end.0), TcpControl::None, &[]))
+                    .await
+                    .unwrap();
+                if fin {
+                    break;
+                }
+            }
+            assert_eq!(received, b"world");
+            assert_eq!(relay.await.unwrap().unwrap(), (5, 5));
+            remote.await.unwrap();
+            // The data contract completed; stop this fixture's TIME_WAIT owner.
+            driver.abort();
+            let _ = driver.await;
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn cancelling_handoff_before_its_first_poll_revokes_the_socket() {
+    use kotoconn_protocol::Stream as _;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (mut stream, _packets, _replies, driver, _) = accepted(false).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socket = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let mut socket: Option<kotoconn_protocol::BoxStream> = Some(Box::pin(socket));
+        let completion = std::pin::Pin::new(&mut stream)
+            .take_over(&mut socket)
+            .unwrap();
+        drop(completion);
+        assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+        assert_eq!(
+            driver.await.unwrap().unwrap_err().kind(),
+            io::ErrorKind::ConnectionReset
+        );
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test(start_paused = true)]

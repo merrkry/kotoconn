@@ -1,5 +1,8 @@
 //! Public client construction and independent TCP/UDP close handles.
+mod native_udp;
 mod system;
+#[cfg(target_os = "linux")]
+mod udp_batch;
 
 use anyhow::Result;
 use futures_util::future::BoxFuture;
@@ -96,31 +99,24 @@ impl Carrier for Clients {
                 udp: true,
             })?;
             let scope = self.udp.child().tracked_by(&caller);
-            let (user, mut driver) = packet_pair(scope.clone());
-            let protocol = self.protocol.clone();
-            let connection_scope = scope.clone();
-
+            let transport = scope.run(self.protocol.udp(target, scope.clone())).await?;
+            let lower = transport.scope.clone();
+            let control = scope.clone();
+            struct Close(Scope);
+            impl Drop for Close {
+                fn drop(&mut self) {
+                    self.0.close();
+                }
+            }
+            let close = Close(lower.clone());
             scope.spawn(async move {
-                let mut transport = protocol.udp(target, connection_scope.child()).await?;
-
-                // Independent forwarding futures avoid blocking replies on a full
-                // request queue, while retaining bounded backpressure in each direction.
-                let outgoing = async {
-                    while let Some(packet) = driver.rx.recv().await {
-                        transport.tx.send(packet).await?;
-                    }
-                    Ok::<(), anyhow::Error>(())
-                };
-                let incoming = async {
-                    while let Some(packet) = transport.rx.recv().await {
-                        driver.tx.send(packet).await?;
-                    }
-                    Ok::<(), anyhow::Error>(())
-                };
-
-                tokio::select! { result = outgoing => result, result = incoming => result }
+                let close = close;
+                lower.cancelled().await;
+                control.close();
+                drop(close);
+                Ok(())
             })?;
-            Ok(user)
+            Ok(transport)
         })
     }
 }

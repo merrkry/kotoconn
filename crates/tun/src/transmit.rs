@@ -9,6 +9,7 @@ pub(crate) enum Transmit {
     Packet(Bytes),
     TcpGso {
         packet: Bytes,
+        payload: Vec<Bytes>,
         segment_size: u16,
     },
     Datagram {
@@ -21,7 +22,13 @@ pub(crate) enum Transmit {
 impl Transmit {
     pub(crate) fn size(&self) -> usize {
         match self {
-            Self::Packet(packet) | Self::TcpGso { packet, .. } => storage::charge(packet.len()),
+            Self::Packet(packet) => storage::charge(packet.len()),
+            Self::TcpGso {
+                packet, payload, ..
+            } => {
+                storage::charge(packet.len() + payload.iter().map(Bytes::len).sum::<usize>())
+                    + payload.len() * std::mem::size_of::<Bytes>()
+            }
             Self::Datagram { payload, .. } => payload.len() + 48,
         }
     }

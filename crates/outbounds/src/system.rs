@@ -44,42 +44,7 @@ impl Carrier for System {
             .await?;
             socket.connect(peer).await?;
             tracing::debug!(%peer, "connected UDP socket");
-
-            let scope = self.scope.child().tracked_by(&caller);
-            let (user, mut driver) = packet_pair(scope.clone());
-            scope.spawn(async move {
-                let mut buffer = vec![0; 65536];
-
-                loop {
-                    tokio::select! {
-                        received = socket.recv(&mut buffer) => {
-                            match received {
-                                Ok(n) => {
-                                    let _ = driver
-                                        .tx
-                                        .try_send(Packet {
-                                            target: target.clone(),
-                                            payload: buffer[..n].to_vec().into(),
-                                        });
-                                }
-                                Err(error) => tracing::warn!(error = %format_args!("{error:#}"), "UDP receive"),
-                            }
-                        }
-                        packet = driver.rx.recv() => {
-                            let Some(packet) = packet else { return Ok(()); };
-
-                            if packet.target != target {
-                                anyhow::bail!("datagram target differs from connected target");
-                            }
-
-                            if let Err(error) = socket.send(&packet.payload).await {
-                                tracing::warn!(error = %format_args!("{error:#}"), "UDP send");
-                            }
-                        }
-                    }
-                }
-            })?;
-            Ok(user)
+            crate::native_udp::start(socket, target, self.scope.child().tracked_by(&caller))
         })
     }
 }

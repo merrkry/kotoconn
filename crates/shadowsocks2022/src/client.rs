@@ -52,10 +52,13 @@ impl p::Client for Client {
                 let mut packet_id = 0;
                 let mut windows = HashMap::<u64, PacketWindowFilter>::new();
 
+                let mut received_batch = Vec::with_capacity(32);
+                let mut outgoing_batch = Vec::with_capacity(32);
                 loop {
                     tokio::select! {
-                        received = transport.rx.recv() => {
-                            let Some(received) = received else { return Ok(()); };
+                        count = transport.rx.recv_many(&mut received_batch, 32) => {
+                            if count == 0 { return Ok(()); };
+                            for received in received_batch.drain(..) {
                             let mut payload = Vec::from(received.payload);
                             let Ok((n, destination, Some(ctrl))) =
                                 decrypt_server_payload(
@@ -93,9 +96,11 @@ impl p::Client for Client {
                                     target: from_address(destination),
                                     payload: payload.into(),
                                 });
+                            }
                         }
-                        packet = driver.rx.recv() => {
-                            let Some(packet) = packet else { return Ok(()); };
+                        count = driver.rx.recv_many(&mut outgoing_batch, 32) => {
+                            if count == 0 { return Ok(()); };
+                            for packet in outgoing_batch.drain(..) {
                             packet_id += 1;
                             ensure!(packet_id < PACKET_LIMIT, "Shadowsocks packet counter exhausted");
 
@@ -125,6 +130,7 @@ impl p::Client for Client {
                                 Err(kotoconn_protocol::queue::Error::Closed)
                             ) {
                                 return Ok(());
+                            }
                             }
                         }
                     }

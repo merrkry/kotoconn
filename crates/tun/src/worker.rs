@@ -6,6 +6,7 @@ use crate::{
     udp,
 };
 use anyhow::Result;
+#[cfg(test)]
 use bytes::Bytes;
 use kotoconn_protocol::{self as p, Scope, ServerContext, queue};
 use smoltcp::wire::{IpProtocol, TcpControl};
@@ -15,10 +16,7 @@ use std::{
     hash::BuildHasher,
     sync::Arc,
 };
-use tokio::{
-    sync::{mpsc, watch},
-    time::Instant,
-};
+use tokio::{sync::mpsc, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) struct Shared {
@@ -44,14 +42,14 @@ pub(crate) struct Forwarded {
 impl Forwarded {
     pub(crate) fn size(&self) -> usize {
         match &self.packet {
-            ForwardedPacket::Frame(bytes) => bytes.len(),
+            ForwardedPacket::Frame(frame) => frame.bytes.len(),
             ForwardedPacket::Reassembled(packet) => packet.storage_size(),
         }
     }
 }
 
 enum ForwardedPacket {
-    Frame(Vec<u8>),
+    Frame(crate::Received),
     Reassembled(Packet<'static>),
 }
 
@@ -90,9 +88,11 @@ struct TcpEntry {
 
 struct UdpEntry {
     packets: queue::Sender<p::Packet>,
-    activity: watch::Sender<Instant>,
+    activity: p::Activity,
     scope: Scope,
     generation: u64,
+    direct: Option<crate::udp_direct::Direct>,
+    blocked: bool,
 }
 
 impl Drop for UdpEntry {
@@ -123,6 +123,7 @@ struct Worker {
     done: mpsc::UnboundedSender<(Flow, u64)>,
     output: queue::Sender<Transmit>,
     ready: mpsc::UnboundedSender<tcp::Ready>,
+    transfers: mpsc::UnboundedSender<crate::udp_direct::Transfer>,
     timers: BTreeMap<(Instant, u64), Flow>,
     blocked: VecDeque<(tcp::Ready, usize)>,
     pool: crate::pool::Pool,
@@ -135,6 +136,33 @@ struct Worker {
 
 impl Worker {
     fn drive(&mut self, id: tcp::Ready) {
+        if let Some(entry) = self
+            .udp
+            .get_mut(&id.0)
+            .filter(|entry| entry.generation == id.1)
+            && let Some(direct) = &mut entry.direct
+        {
+            if entry.blocked {
+                self.blocked.retain(|(waiting, _)| *waiting != id);
+                entry.blocked = false;
+            }
+            let progress = if entry.scope.is_closed() {
+                crate::udp_direct::Progress::Closed
+            } else {
+                direct.poll(&self.output, &entry.activity)
+            };
+            match progress {
+                crate::udp_direct::Progress::Idle => {}
+                crate::udp_direct::Progress::Blocked(bytes) => {
+                    entry.blocked = true;
+                    self.blocked.push_back((id, bytes));
+                }
+                crate::udp_direct::Progress::Closed => {
+                    self.udp.remove(&id.0);
+                }
+            }
+            return;
+        }
         let (flow, generation) = id;
         let Some(entry) = self
             .tcp
@@ -175,7 +203,27 @@ impl Worker {
         }
     }
 
-    fn forward_raw(&mut self, bytes: &[u8], owner: usize) {
+    fn frame(&mut self, frame: crate::Received, decoder: &mut Decoder) -> Result<()> {
+        let bytes = &frame.bytes;
+        self.stats.received_packets += 1;
+        self.stats.received_bytes += bytes.len() as u64;
+        let Some(parsed) = packet::parse(bytes) else {
+            return Ok(());
+        };
+        let Some(key) = parsed.route() else {
+            return Ok(());
+        };
+        let owner = self.shared.owner(key);
+        if owner != self.id {
+            self.forward_raw(frame, owner);
+        } else if let Some(packet) = parsed.decode(decoder, Instant::now()) {
+            self.packet(packet, Some(&frame))?;
+        }
+        Ok(())
+    }
+
+    fn forward_raw(&mut self, frame: crate::Received, owner: usize) {
+        let bytes = &frame.bytes;
         // SAFETY: owner comes from Shared::owner, and receive buffers hold at most 65575 bytes.
         debug_assert!(owner < self.shared.inboxes.len());
         debug_assert!(bytes.len() <= 65575);
@@ -183,9 +231,8 @@ impl Worker {
             self.stats.forwarding_drops += 1;
             return;
         };
-        let bytes = bytes.to_vec();
         entry.send(Forwarded {
-            packet: ForwardedPacket::Frame(bytes),
+            packet: ForwardedPacket::Frame(frame),
         });
         self.stats.forwarded_packets += 1;
     }
@@ -205,10 +252,12 @@ impl Worker {
         self.stats.forwarded_packets += 1;
     }
 
-    fn packet(&mut self, packet: Packet<'_>) -> Result<()> {
+    fn packet(&mut self, packet: Packet<'_>, frame: Option<&crate::Received>) -> Result<()> {
+        let verified = frame.is_some_and(|frame| frame.checksum_verified);
+        let backing = frame.map(|frame| &frame.bytes);
         match packet.ip.next_header() {
             IpProtocol::Tcp => {
-                let Some((flow, repr)) = packet.tcp() else {
+                let Some((flow, repr)) = packet.tcp_with_checksum(verified) else {
                     return Ok(());
                 };
                 let owner = self
@@ -275,16 +324,16 @@ impl Worker {
                     .get_mut(&flow)
                     .expect("admitted TCP flow missing")
                     .connection
-                    .input(
-                        &packet.ip,
+                    .input_owned(
+                        &packet,
                         &repr,
-                        Instant::now(),
+                        backing.cloned(),
                         &self.output,
                         &mut self.arena,
                     );
             }
             IpProtocol::Udp if !self.stopping => {
-                let Some((flow, payload)) = packet.udp() else {
+                let Some((flow, payload)) = packet.udp_with_checksum(verified) else {
                     return Ok(());
                 };
                 let owner = self
@@ -295,8 +344,12 @@ impl Worker {
                     return Ok(());
                 }
 
-                if self.udp.get(&flow).is_some_and(|e| e.scope.is_closed()) {
-                    self.udp.remove(&flow);
+                if self.udp.get(&flow).is_some_and(|e| e.scope.is_closed())
+                    && let Some(entry) = self.udp.remove(&flow)
+                    && entry.blocked
+                {
+                    self.blocked
+                        .retain(|(id, _)| *id != (flow, entry.generation));
                 }
 
                 if !self.udp.contains_key(&flow) {
@@ -312,9 +365,16 @@ impl Worker {
                         .checked_add(1)
                         .expect("TUN connection generation exhausted");
                     let scope = self.context.scope.child();
-                    let (association, driver) = p::packet_pair(scope.clone());
+                    let (mut association, driver) = p::packet_pair(scope.clone());
+                    association.single_target = Some(p::target(flow.destination));
+                    association.worker = Some(Arc::new(crate::udp_direct::Handoff {
+                        id: (flow, self.generation),
+                        sender: self.transfers.clone(),
+                        scope: scope.clone(),
+                    }));
                     let packets = driver.tx.clone();
-                    let (activity, clock) = watch::channel(Instant::now());
+                    let activity = p::Activity::default();
+                    let clock = activity.clone();
                     let handler = self.context.handler.clone();
                     let output = self.output.clone();
                     let completion = Completion {
@@ -332,7 +392,7 @@ impl Worker {
                         let replies = udp_replies(flow, driver, output, reply_activity);
                         tokio::select! {
                             _ = stopping.cancelled() => {},
-                            _ = until_idle(clock, idle) => {},
+                            _ = clock.until_idle(idle) => {},
                             result = handler.udp(association) => result?,
                             result = replies => result?,
                         }
@@ -344,6 +404,8 @@ impl Worker {
                         flow,
                         UdpEntry {
                             packets,
+                            direct: None,
+                            blocked: false,
                             activity,
                             scope,
                             generation: self.generation,
@@ -354,17 +416,42 @@ impl Worker {
                 // SAFETY: The flow was found or inserted above. Only
                 // dispatch mutates this map; tasks only send completions.
                 debug_assert!(self.udp.contains_key(&flow));
-                let entry = &self.udp[&flow];
-                let Ok(permit) = entry.packets.try_reserve(payload.len()) else {
-                    self.stats.capacity_drops += 1;
-                    return Ok(());
-                };
-                let payload = Bytes::copy_from_slice(payload);
-                permit.send(p::Packet {
-                    target: p::target(flow.destination),
-                    payload,
-                });
-                entry.activity.send_replace(Instant::now());
+                let entry = self.udp.get_mut(&flow).expect("admitted UDP flow");
+                let segment = frame
+                    .and_then(|frame| frame.udp_segment_size)
+                    .map(usize::from)
+                    .unwrap_or(payload.len().max(1));
+                // Empty UDP payloads are still one complete datagram.
+                let mut parts = payload.chunks(segment).peekable();
+                let mut first = true;
+                while first || parts.peek().is_some() {
+                    first = false;
+                    let payload = parts.next().unwrap_or(&[]);
+                    if let Some(direct) = &mut entry.direct {
+                        let payload = backing
+                            .and_then(|source| crate::storage::view(source, payload))
+                            .unwrap_or_else(|| self.pool.copy(payload));
+                        if !direct.enqueue(p::Packet {
+                            target: p::target(flow.destination),
+                            payload,
+                        }) {
+                            self.stats.capacity_drops += 1;
+                        }
+                        continue;
+                    }
+                    let Ok(permit) = entry.packets.try_reserve(payload.len()) else {
+                        self.stats.capacity_drops += 1;
+                        return Ok(());
+                    };
+                    let payload = backing
+                        .and_then(|source| crate::storage::view(source, payload))
+                        .unwrap_or_else(|| self.pool.copy(payload));
+                    permit.send(p::Packet {
+                        target: p::target(flow.destination),
+                        payload,
+                    });
+                    entry.activity.record();
+                }
             }
             _ => {}
         }
@@ -375,7 +462,7 @@ impl Worker {
 
 enum Input {
     Forwarded(Forwarded),
-    Read(usize),
+    Read(crate::Received),
 }
 
 pub(crate) async fn dispatch<R: PacketReceive>(
@@ -389,6 +476,7 @@ pub(crate) async fn dispatch<R: PacketReceive>(
 ) -> Result<()> {
     let (done, mut completed) = mpsc::unbounded_channel();
     let (ready, mut runnable) = mpsc::unbounded_channel();
+    let (transfers, mut transfer_events) = mpsc::unbounded_channel();
     let pool = crate::pool::Pool::default();
     let mut worker = Worker {
         id,
@@ -400,6 +488,7 @@ pub(crate) async fn dispatch<R: PacketReceive>(
         done,
         output,
         ready,
+        transfers,
         timers: BTreeMap::new(),
         blocked: VecDeque::new(),
         pool: pool.clone(),
@@ -418,29 +507,30 @@ pub(crate) async fn dispatch<R: PacketReceive>(
         },
     };
     let mut decoder = Decoder::new(shared.reassembly.clone());
-    let mut buffer = vec![0; 65575];
+    let mut buffer = crate::ReceiveBuffer::default();
     let mut turns = 0;
     let mut reported_drained = false;
 
+    let writable = worker.output.clone();
     loop {
         if worker.stopping && worker.tcp.is_empty() && !reported_drained {
             let _ = shared.drained.send(id);
             reported_drained = true;
         }
         turns += 1;
-        if turns == 64 {
+        if turns >= 64 {
             tokio::task::yield_now().await;
             turns = 0;
         }
         let expiry = decoder.deadline();
         let tcp_deadline = worker.timers.first_key_value().map(|(&(at, _), _)| at);
         let blocked = worker.blocked.front().copied();
-        let writable = worker.output.clone();
         let event = tokio::select! {
             _ = shared.stop.cancelled() => return Ok(()),
             _ = worker.context.stopping.cancelled(), if !worker.stopping => {
                 worker.stopping = true;
                 worker.udp.clear();
+                worker.blocked.retain(|(id, _)| worker.tcp.get(&id.0).is_some_and(|entry| entry.generation == id.1));
                 for entry in worker.tcp.values() {
                     entry.connection.wake();
                 }
@@ -450,6 +540,7 @@ pub(crate) async fn dispatch<R: PacketReceive>(
             Some((flow, generation)) = completed.recv() => {
                 if worker.udp.get(&flow).is_some_and(|e| e.generation == generation) {
                     worker.udp.remove(&flow);
+                    worker.blocked.retain(|(id, _)| *id != (flow, generation));
                 }
                 continue;
             },
@@ -462,8 +553,19 @@ pub(crate) async fn dispatch<R: PacketReceive>(
                 decoder.expire(Instant::now());
                 continue;
             },
+            Some(transfer) = transfer_events.recv() => {
+                if let Some(entry) = worker.udp.get_mut(&transfer.id.0).filter(|entry| entry.generation == transfer.id.1 && !entry.scope.is_closed()) {
+                    entry.direct = Some(crate::udp_direct::Direct::new(transfer, worker.ready.clone()));
+                }
+                continue;
+            },
             Some(id) = runnable.recv() => {
+                let udp_batch = worker.udp.contains_key(&id.0);
                 worker.drive(id);
+                // One UDP readiness event can consume a full batch. Let the
+                // independent writer drain it before another batch monopolizes
+                // this executor; ordinary packet ingress keeps its small budget.
+                if udp_batch { tokio::task::yield_now().await; }
                 continue;
             },
             _ = async {
@@ -484,6 +586,9 @@ pub(crate) async fn dispatch<R: PacketReceive>(
                     if let Some(entry) = worker.tcp.get_mut(&id.0).filter(|e| e.generation == id.1) {
                         entry.blocked = false;
                     }
+                    if let Some(entry) = worker.udp.get_mut(&id.0).filter(|e| e.generation == id.1) {
+                        entry.blocked = false;
+                    }
                     worker.drive(id);
                 }
                 continue;
@@ -492,38 +597,35 @@ pub(crate) async fn dispatch<R: PacketReceive>(
                 // Neither forwarded traffic nor a busy kernel queue gets priority.
                 tokio::select! {
                     Some(forwarded) = inbox.recv() => Ok(Input::Forwarded(forwarded)),
-                    len = poll_fn(|cx| device.poll_recv(cx, &mut buffer)) => len.map(Input::Read),
+                    len = poll_fn(|cx| device.poll_frame(cx, &mut buffer)) => len.map(Input::Read),
                 }
             } => event?,
         };
 
         match event {
             Input::Forwarded(forwarded) => match forwarded.packet {
-                ForwardedPacket::Frame(bytes) => {
-                    if let Some(packet) = decoder.decode(&bytes, Instant::now()) {
-                        worker.packet(packet)?;
+                ForwardedPacket::Frame(frame) => {
+                    if let Some(packet) = decoder.decode(&frame.bytes, Instant::now()) {
+                        worker.packet(packet, Some(&frame))?;
                     }
                 }
-                ForwardedPacket::Reassembled(packet) => worker.packet(packet)?,
+                ForwardedPacket::Reassembled(packet) => worker.packet(packet, None)?,
             },
-            Input::Read(len) => {
-                // SAFETY: PacketReceive reports bytes written into buffer.
-                debug_assert!(len <= buffer.len());
-                let bytes = &buffer[..len];
-                worker.stats.received_packets += 1;
-                worker.stats.received_bytes += len as u64;
-
-                let Some(parsed) = packet::parse(bytes) else {
-                    continue;
-                };
-                let Some(key) = parsed.route() else {
-                    continue;
-                };
-                let owner = shared.owner(key);
-                if owner != id {
-                    worker.forward_raw(bytes, owner);
-                } else if let Some(packet) = parsed.decode(&mut decoder, Instant::now()) {
-                    worker.packet(packet)?;
+            Input::Read(frame) => {
+                worker.frame(frame, &mut decoder)?;
+                // Drain only frames already readable. Native UDP can then submit
+                // a batch instead of scheduling one socket send per input frame.
+                for _ in 0..31 {
+                    let next =
+                        poll_fn(|cx| std::task::Poll::Ready(device.poll_frame(cx, &mut buffer)))
+                            .await;
+                    match next {
+                        std::task::Poll::Ready(frame) => {
+                            worker.frame(frame?, &mut decoder)?;
+                            turns += 1;
+                        }
+                        std::task::Poll::Pending => break,
+                    }
                 }
             }
         }
@@ -534,37 +636,30 @@ async fn udp_replies(
     flow: Flow,
     mut driver: p::Datagram,
     output: queue::Sender<Transmit>,
-    activity: watch::Sender<Instant>,
+    activity: p::Activity,
 ) -> Result<()> {
-    while let Some(packet) = driver.rx.recv().await {
-        let Ok(source) = p::socket_addr(&packet.target) else {
-            continue;
-        };
-        let Some((source, destination)) = udp::reply_flow(flow, source) else {
-            continue;
-        };
-        // One queued item owns the whole datagram. Only this association waits
-        // for capacity; shared ingress keeps receiving other connections.
-        output
-            .send(Transmit::Datagram {
-                source,
-                destination,
-                payload: packet.payload,
-            })
-            .await?;
-        activity.send_replace(Instant::now());
+    let mut batch = Vec::with_capacity(32);
+    while driver.rx.recv_many(&mut batch, 32).await != 0 {
+        for packet in batch.drain(..) {
+            let Ok(source) = p::socket_addr(&packet.target) else {
+                continue;
+            };
+            let Some((source, destination)) = udp::reply_flow(flow, source) else {
+                continue;
+            };
+            // One queued item owns the whole datagram. Only this association waits
+            // for capacity; shared ingress keeps receiving other connections.
+            output
+                .send(Transmit::Datagram {
+                    source,
+                    destination,
+                    payload: packet.payload,
+                })
+                .await?;
+        }
+        activity.record();
     }
     Ok(())
-}
-
-async fn until_idle(mut activity: watch::Receiver<Instant>, idle: std::time::Duration) {
-    loop {
-        let deadline = *activity.borrow_and_update() + idle;
-        tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => return,
-            result = activity.changed() => { if result.is_err() { return; } },
-        }
-    }
 }
 
 #[cfg(test)]
@@ -640,6 +735,7 @@ mod tests {
             done,
             output,
             ready,
+            transfers: mpsc::unbounded_channel().0,
             timers: BTreeMap::new(),
             blocked: VecDeque::new(),
             pool,
