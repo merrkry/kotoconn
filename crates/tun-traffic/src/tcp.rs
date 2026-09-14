@@ -113,6 +113,27 @@ async fn connect(args: &Args, stats: &mut Stats) -> Result<TcpStream> {
     } else {
         TcpSocket::new_v6()?
     };
+    // Choose a source port at connect time so separate destinations can reuse
+    // ports retained in TIME_WAIT by earlier workload cases.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let enabled: libc::c_int = 1;
+        // SAFETY: The socket owns a live descriptor. The pointer and length
+        // describe an initialized integer copied synchronously by setsockopt.
+        let result = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_IP,
+                libc::IP_BIND_ADDRESS_NO_PORT,
+                (&enabled as *const libc::c_int).cast(),
+                std::mem::size_of_val(&enabled) as libc::socklen_t,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
     socket.bind(SocketAddr::new(args.source, 0))?;
     let started = Instant::now();
     let mut stream = socket

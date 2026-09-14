@@ -15,6 +15,9 @@ Every invocation creates a new network namespace and a unique child of
 `target/benchmarks/`, or of the supplied `--output` directory. Devices, ports,
 policy rules and child processes belong to that run. Source-address routing
 keeps TCP TIME_WAIT acknowledgments on the same path as client traffic.
+Each warmup and measurement uses a separate reserved server port. Namespace-local
+ephemeral-port and TCP TIME_WAIT settings prevent earlier samples from consuming
+the next sample's port space; see [isolation details](../../testing/tun/README.md#isolation-and-artifacts).
 
 ## Cases
 

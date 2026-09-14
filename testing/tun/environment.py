@@ -2,6 +2,7 @@
 
 import argparse
 import hashlib
+import itertools
 import json
 import os
 import queue
@@ -17,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 NAME = "ktest0"
 CLIENT = ("192.0.2.2", "fd00::2")
 REMOTE = ("198.18.0.1", "2001:db8::1")
+PORTS = itertools.count(12000)
 
 
 def isolated():
@@ -118,6 +120,10 @@ def configure_network():
         )
     for field, value in (("rp_filter", "0"), ("accept_local", "1")):
         Path(f"/proc/sys/net/ipv4/conf/all/{field}").write_text(value)
+    # Outbound kernel sockets use documentation addresses on lo, so Linux's
+    # default loopback-only TIME_WAIT reuse does not recognize this topology.
+    Path("/proc/sys/net/ipv4/tcp_tw_reuse").write_text("1")
+    Path("/proc/sys/net/ipv4/ip_local_port_range").write_text("20000 65535")
 
 
 def configure_routes():
@@ -315,6 +321,13 @@ def resource(pid):
 
 
 def traffic(binary, daemon, directory, spec, *, inject=None):
+    # Retained TIME_WAIT sockets from one case must not consume the next case's
+    # tuple space. The daemon and its connection/pool state remain alive.
+    spec = {"port": next(PORTS), **spec}
+    if not 12000 <= spec["port"] < 20000:
+        raise ValueError("run exhausted its 8000 reserved traffic server ports")
+    if inject:
+        inject.port = spec["port"]
     argv = [str(binary), "--controlled"]
     for key, value in spec.items():
         argv += ["--" + key.replace("_", "-")]

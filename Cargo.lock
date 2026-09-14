@@ -1592,6 +1592,7 @@ dependencies = [
  "anyhow",
  "clap",
  "hdrhistogram",
+ "libc",
  "serde_json",
  "tokio",
 ]
