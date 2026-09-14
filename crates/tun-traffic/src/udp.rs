@@ -2,7 +2,7 @@ use crate::{
     Args, Workload, payload,
     stats::{Stats, record},
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
     net::UdpSocket,
@@ -88,7 +88,14 @@ pub async fn run(args: &Args, flow: u64) -> Result<Stats> {
             let bytes = packet(args, flow, sequence, size);
             let sent = Instant::now();
             ensure!(socket.send(&bytes).await? == size, "partial UDP send");
-            let count = socket.recv(&mut received).await?;
+            let count = tokio::time::timeout(
+                Duration::from_secs(args.timeout),
+                socket.recv(&mut received),
+            )
+            .await
+            .with_context(|| {
+                format!("UDP reply deadline: flow={flow} sequence={sequence} size={size}")
+            })??;
             ensure!(
                 received[..count] == bytes,
                 "UDP payload differs: flow={flow} sequence={sequence} size={size}"
@@ -105,13 +112,52 @@ pub async fn run(args: &Args, flow: u64) -> Result<Stats> {
     Ok(stats)
 }
 
+async fn receive_paced(
+    args: &Args,
+    flow: u64,
+    socket: &UdpSocket,
+    mut finishing: watch::Receiver<Option<u64>>,
+) -> Result<(HashMap<u64, Instant>, Stats)> {
+    let mut seen = HashMap::new();
+    let mut stats = Stats::new()?;
+    let mut bytes = vec![0; 65536];
+    let mut deadline = None;
+    let mut last = 0;
+    loop {
+        let total = *finishing.borrow();
+        if total.is_some_and(|n| seen.len() as u64 == n) {
+            break;
+        }
+        // Observe completion even when it happened before this receiver was polled.
+        // Lost UDP replies must not leave the receiver waiting without a deadline.
+        if total.is_some() && deadline.is_none() {
+            deadline = Some(Instant::now() + Duration::from_secs(2));
+        }
+        tokio::select! {
+            changed = finishing.changed(), if total.is_none() => { changed?; }
+            _ = async { if let Some(at) = deadline { tokio::time::sleep_until(at).await } else { std::future::pending().await } } => break,
+            received = socket.recv(&mut bytes) => {
+                let size = received?;
+                let at = Instant::now();
+                ensure!(size == args.datagram_bytes, "paced UDP length differs");
+                let sequence = u64::from_be_bytes(bytes[8..16].try_into()?);
+                ensure!(bytes[..size] == packet(args, flow, sequence, size), "paced UDP payload differs: flow={flow} sequence={sequence}");
+                if seen.insert(sequence, at).is_some() { stats.duplicates += 1; }
+                else if sequence < last { stats.reordered += 1; }
+                last = last.max(sequence);
+            }
+        }
+    }
+    Ok::<_, anyhow::Error>((seen, stats))
+}
+
 async fn paced(args: &Args, flow: u64) -> Result<Stats> {
     let socket = UdpSocket::bind(SocketAddr::new(args.source, 0)).await?;
     socket
         .connect(SocketAddr::new(args.target, args.port))
         .await?;
     let started = Instant::now();
-    let (finished, mut finishing) = watch::channel(None);
+    let (finished, finishing) = watch::channel(None);
     let send = async {
         let mut timestamps = Vec::new();
         let mut sequence = 0;
@@ -130,38 +176,7 @@ async fn paced(args: &Args, flow: u64) -> Result<Stats> {
         finished.send(Some(sequence))?;
         Ok::<_, anyhow::Error>(timestamps)
     };
-    let receive = async {
-        let mut seen = HashMap::new();
-        let mut stats = Stats::new()?;
-        let mut bytes = vec![0; 65536];
-        let mut deadline = None;
-        let mut last = 0;
-        loop {
-            let total = *finishing.borrow();
-            if total.is_some_and(|n| seen.len() as u64 == n) {
-                break;
-            }
-            tokio::select! {
-                changed = finishing.changed(), if total.is_none() => {
-                    changed?;
-                    // UDP can lose data. Bound the external receive drain and report every loss.
-                    deadline = Some(Instant::now() + Duration::from_secs(2));
-                }
-                _ = async { if let Some(at) = deadline { tokio::time::sleep_until(at).await } else { std::future::pending().await } } => break,
-                received = socket.recv(&mut bytes) => {
-                    let size = received?;
-                    let at = Instant::now();
-                    ensure!(size == args.datagram_bytes, "paced UDP length differs");
-                    let sequence = u64::from_be_bytes(bytes[8..16].try_into()?);
-                    ensure!(bytes[..size] == packet(args, flow, sequence, size), "paced UDP payload differs: flow={flow} sequence={sequence}");
-                    if seen.insert(sequence, at).is_some() { stats.duplicates += 1; }
-                    else if sequence < last { stats.reordered += 1; }
-                    last = last.max(sequence);
-                }
-            }
-        }
-        Ok::<_, anyhow::Error>((seen, stats))
-    };
+    let receive = receive_paced(args, flow, &socket, finishing);
     let (timestamps, (received, mut stats)) = tokio::try_join!(send, receive)?;
     for (sequence, at) in &received {
         let &(planned, actual) = timestamps
@@ -171,6 +186,10 @@ async fn paced(args: &Args, flow: u64) -> Result<Stats> {
         record(&mut stats.scheduled, at.duration_since(planned))?;
     }
     stats.sent_datagrams = timestamps.len() as u64;
+    stats.missing_sequence_sample = (0..stats.sent_datagrams)
+        .filter(|sequence| !received.contains_key(sequence))
+        .take(64)
+        .collect();
     stats.received_datagrams = received.len() as u64;
     stats.sent_bytes = stats.sent_datagrams * args.datagram_bytes as u64;
     stats.received_bytes = stats.received_datagrams * args.datagram_bytes as u64;
@@ -182,4 +201,38 @@ async fn paced(args: &Args, flow: u64) -> Result<Stats> {
         stats.received_datagrams
     );
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[tokio::test]
+    async fn completed_sender_with_missing_replies_still_finishes_receive_drain() {
+        let args =
+            Args::try_parse_from(["traffic", "--source", "127.0.0.1", "--target", "127.0.0.1"])
+                .unwrap();
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .send_to(
+                &packet(&args, 7, 0, args.datagram_bytes),
+                receiver.local_addr().unwrap(),
+            )
+            .await
+            .unwrap();
+        // Completion predates the first receive poll; sequence 1 never arrives.
+        let (_finished, finishing) = watch::channel(Some(2));
+        let (received, stats) = tokio::time::timeout(
+            Duration::from_secs(5),
+            receive_paced(&args, 7, &receiver, finishing),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(received.len(), 1);
+        assert!(received.contains_key(&0));
+        assert_eq!(stats.duplicates, 0);
+    }
 }

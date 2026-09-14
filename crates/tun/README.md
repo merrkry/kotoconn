@@ -3,7 +3,7 @@
 The [example policy](../../packages/api/examples/tun.ts) creates `kototun0` and routes TCP and UDP through a direct outbound. Run it with access to `/dev/net/tun` and `CAP_NET_ADMIN`:
 
 ```sh
-cargo build -p kotoconn-cli
+cargo build -p kotoconn-cli -p kotoconn-tun-traffic
 sudo target/debug/kotoconn run --config packages/api/examples/tun.ts
 ```
 

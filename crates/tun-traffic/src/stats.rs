@@ -12,7 +12,9 @@ pub struct Stats {
     pub received_datagrams: u64,
     pub duplicates: u64,
     pub reordered: u64,
+    pub missing_sequence_sample: Vec<u64>,
     pub connect: Histogram<u64>,
+    pub first_response: Histogram<u64>,
     pub latency: Histogram<u64>,
     pub scheduled: Histogram<u64>,
 }
@@ -28,7 +30,9 @@ impl Stats {
             received_datagrams: 0,
             duplicates: 0,
             reordered: 0,
+            missing_sequence_sample: Vec::new(),
             connect: Histogram::new(3)?,
+            first_response: Histogram::new(3)?,
             latency: Histogram::new(3)?,
             scheduled: Histogram::new(3)?,
         })
@@ -42,7 +46,9 @@ impl Stats {
             "sent_datagrams": self.sent_datagrams, "received_datagrams": self.received_datagrams,
             "lost_datagrams": self.sent_datagrams - self.received_datagrams,
             "duplicates": self.duplicates, "reordered": self.reordered,
+            "missing_sequence_sample": self.missing_sequence_sample,
             "connect_us": histogram(&self.connect), "latency_us": histogram(&self.latency),
+            "first_response_us": histogram(&self.first_response),
             "scheduled_latency_us": histogram(&self.scheduled),
         })
     }

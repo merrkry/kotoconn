@@ -303,3 +303,96 @@ async fn forced_shutdown_interrupts_a_writer_after_receive_workers_have_drained(
     endpoint.await.unwrap().unwrap();
     context.scope.wait().await;
 }
+
+struct ObservedSessions(mpsc::UnboundedSender<Scope>);
+
+impl p::Handler for ObservedSessions {
+    fn tcp(&self, _: p::Target, _: p::BoxStream, _: Scope) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { bail!("TCP is not used in this test") })
+    }
+
+    fn udp(&self, mut packets: p::Datagram) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            self.0.send(packets.scope.clone()).unwrap();
+            while let Some(packet) = packets.rx.recv().await {
+                packets.tx.send(packet).await?;
+            }
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn sparse_udp_activity_preserves_only_its_session_and_expired_flows_can_be_reused() {
+    let mut context = context();
+    context.udp_idle_timeout = Duration::from_secs(10);
+    let (admitted, mut sessions) = mpsc::unbounded_channel();
+    context.handler = Arc::new(ObservedSessions(admitted));
+    let (input, packets) = mpsc::channel(16);
+    let (output, mut received) = mpsc::unbounded_channel();
+    let endpoint = tokio::spawn(run(
+        vec![(
+            Receiver {
+                packets,
+                dropped: None,
+            },
+            Sender {
+                queue: 0,
+                packets: output,
+            },
+        )],
+        1500,
+        context.clone(),
+    ));
+    let mut encoder = udp::Encoder::new(1500);
+    let source = "192.0.2.2:12345".parse().unwrap();
+    for cycle in 0..16u8 {
+        let a = encoder
+            .encode(source, "198.18.0.1:1000".parse().unwrap(), &[cycle, 0])
+            .unwrap()
+            .remove(0);
+        let b = encoder
+            .encode(source, "198.18.0.1:1001".parse().unwrap(), &[cycle, 1])
+            .unwrap()
+            .remove(0);
+        input.send(a.to_vec()).await.unwrap();
+        let active = sessions.recv().await.unwrap();
+        received.recv().await.unwrap();
+        input.send(b.to_vec()).await.unwrap();
+        let idle = sessions.recv().await.unwrap();
+        received.recv().await.unwrap();
+
+        tokio::time::advance(Duration::from_secs(9)).await;
+        input.send(a.to_vec()).await.unwrap();
+        received.recv().await.unwrap();
+        assert!(sessions.try_recv().is_err(), "active flow was readmitted");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        idle.cancelled().await;
+        idle.wait().await;
+        assert!(
+            !active.is_closed(),
+            "another flow's idle expiry closed the active session"
+        );
+
+        input.send(b.to_vec()).await.unwrap();
+        let replacement = sessions.recv().await.unwrap();
+        let (_, reply) = received.recv().await.unwrap();
+        assert_eq!(
+            packet::Decoder::default()
+                .decode(&reply, tokio::time::Instant::now())
+                .unwrap()
+                .udp()
+                .unwrap()
+                .1,
+            [cycle, 1]
+        );
+        assert!(!replacement.is_closed());
+        active.close();
+        replacement.close();
+        active.wait().await;
+        replacement.wait().await;
+    }
+    context.stopping.cancel();
+    endpoint.await.unwrap().unwrap();
+    context.scope.wait().await;
+}

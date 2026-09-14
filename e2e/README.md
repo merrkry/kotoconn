@@ -33,10 +33,13 @@ connections, half-close, server-first traffic, malformed packets and device
 cleanup on shutdown:
 
 ```sh
-cargo build -p kotoconn-cli
+cargo build -p kotoconn-cli -p kotoconn-tun-traffic
 python3 e2e/tun.py
 ```
 
 This suite needs `unshare`, `iproute2`, and either unprivileged user namespaces or
-root. It does not change the parent network namespace. See
+root. Every invocation creates a new network namespace and a unique artifact
+directory, including when `--output` is supplied. Concurrent workspaces can use
+the same interface name and ports without sharing devices. It does not change
+the parent network namespace. See
 [the TUN documentation](../crates/tun/README.md) for its supported protocol scope.

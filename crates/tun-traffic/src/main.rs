@@ -83,6 +83,9 @@ struct Args {
 
 impl Args {
     fn more(&self, round: u64, started: Instant) -> bool {
+        if round == 0 {
+            return true;
+        }
         if self.duration_ms == 0 {
             round < self.rounds
         } else {
@@ -157,7 +160,14 @@ async fn main() -> Result<()> {
                 0 => (Protocol::Tcp, Workload::Bulk),
                 1 => (Protocol::Tcp, Workload::Sparse),
                 2 => (Protocol::Tcp, Workload::Churn),
-                _ => (Protocol::Udp, Workload::Boundaries),
+                _ => (
+                    Protocol::Udp,
+                    if spec.rate > 0 {
+                        Workload::Bulk
+                    } else {
+                        Workload::Boundaries
+                    },
+                ),
             };
         }
         let barrier = barrier.clone();
@@ -171,12 +181,13 @@ async fn main() -> Result<()> {
                 }
             };
             let stats = tokio::time::timeout(
-                Duration::from_secs(spec.timeout) + Duration::from_millis(spec.duration_ms),
+                Duration::from_secs(spec.timeout + 5) + Duration::from_millis(spec.duration_ms),
                 run,
             )
             .await
             .with_context(|| format!("flow={flow} {kind} socket deadline"))?
             .with_context(|| format!("flow={flow} {kind}"))?;
+            ensure!(stats.operations > 0, "flow={flow} {kind} made no progress");
             Ok::<_, anyhow::Error>(stats.json(flow, &kind, started.elapsed().as_secs_f64()))
         });
     }

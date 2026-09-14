@@ -121,6 +121,7 @@ async fn connect(args: &Args, stats: &mut Stats) -> Result<TcpStream> {
     let mut banner = vec![0; BANNER.len()];
     stream.read_exact(&mut banner).await?;
     ensure!(banner == BANNER, "server-first banner differs");
+    record(&mut stats.first_response, started.elapsed())?;
     Ok(stream)
 }
 
@@ -136,6 +137,8 @@ pub async fn run(args: &Args, flow: u64) -> Result<Stats> {
         let stream = connect(args, &mut stats).await?;
         let (mut reader, mut writer) = stream.into_split();
         while args.more(sequence, started) {
+            let planned =
+                started + Duration::from_millis(args.interval_ms).mul_f64(sequence as f64);
             if args.workload == Workload::Sparse {
                 // Pacing models application inactivity, never readiness or completion.
                 tokio::time::sleep_until(
@@ -172,6 +175,9 @@ pub async fn run(args: &Args, flow: u64) -> Result<Stats> {
                 "missing transaction acknowledgment"
             );
             record(&mut stats.latency, sent.elapsed())?;
+            if args.workload == Workload::Sparse {
+                record(&mut stats.scheduled, planned.elapsed())?;
+            }
             stats.sent_bytes += upload as u64;
             stats.received_bytes += download as u64;
             stats.operations += 1;
