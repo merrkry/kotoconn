@@ -1,4 +1,4 @@
-"""Measure verified TUN workloads in a private network namespace."""
+"""Measure verified TUN workloads in a Docker container."""
 
 import argparse
 import sys
@@ -276,8 +276,12 @@ def run(args):
 
 
 def add_traffic_arguments(parser):
-    parser.add_argument("--udp-server-receive-buffer", type=int, default=1048576,
-                        help="echo SO_RCVBUF request in bytes; 0 inherits the host default")
+    parser.add_argument(
+        "--udp-server-receive-buffer",
+        type=int,
+        default=1048576,
+        help="echo SO_RCVBUF request in bytes; 0 inherits the host default",
+    )
     parser.add_argument("--udp-echo-batch", type=int, choices=range(1, 33), default=32)
     parser.add_argument("--traffic-workers", type=int, choices=range(1, 65), default=4)
 

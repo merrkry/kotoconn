@@ -33,13 +33,9 @@ empty replies are retained while reverse traffic continues. These tests
 observe state or completion instead of waiting for scheduling luck.
 
 The traffic tool has a socket regression for a sender that finishes before
-the receive side observes completion. Missing UDP replies still terminate
-within the external receive-drain limit. It uses ephemeral sockets and can
-run with the workspace tests inside a namespace:
-
-```sh
-unshare --user --map-root-user --net sh -c 'ip link set lo up; cargo test --workspace'
-```
+receive-side completion is observed. Missing replies still terminate within
+the external receive-drain limit. Real TUN workloads and benchmark experiments
+must use the Docker launcher below, including local development.
 
 Fixed repetitions improve coverage of state reuse; they do not prove that all
 possible thread schedules were tested. A seed reproduces payloads and offered
@@ -125,10 +121,26 @@ path is being exercised.
 
 ## Isolation and artifacts
 
-Both Python entry points re-execute under `unshare --net`, adding a user
-namespace when the caller is not root. Network setup refuses to run unless the
-current network namespace differs from the recorded parent. They change only
-namespace-local addresses, routes, policy rules and IPv4 settings. Source
+Build the runtime once, then use the same Python entry points:
+
+```sh
+docker build -f e2e/tun.Dockerfile -t kotoconn-tun:local .
+python3 e2e/tun.py
+python3 e2e/tun_support/check_isolation.py
+```
+
+Each invocation starts a Docker container with `--network none`, a read-only
+root, NET_ADMIN, NET_RAW and `/dev/net/tun`. No host network, D-Bus socket,
+`/run` directory or container-engine socket is mounted. Network setup refuses
+to run outside this launcher. The existing `docker` command may be provided by
+Podman's Docker-compatible interface. Neither path invokes `unshare`.
+
+Source and binaries are mounted read-only, with only this run's unique
+artifact directory writable. Nix ELF binaries mount their immutable loader
+and library packages read-only; other binaries need a compatible Debian ABI.
+The launcher records the host source revision and image ID before starting,
+so the container does not need access to a worktree's external Git directory.
+Docker applies the test sysctls only to the container network. Source
 routing includes kernel-generated TCP control packets after application exit.
 Traffic invocations use server ports in 12000..19999. Benchmark UDP warmup and
 measurement share one port within a sample so live warmup associations do not
@@ -137,22 +149,22 @@ ports. TCP clients defer source-port allocation until connect, so earlier cases'
 not exhaust a new case's tuple space. The namespace uses ephemeral ports
 20000..65535 and enables timestamp-protected TCP TIME_WAIT reuse for outbound
 kernel sockets on its local documentation addresses. Raw injection source ports
-22222 and 22224 are excluded from ephemeral allocation. These settings never
+22222..22224 are excluded from ephemeral allocation. These settings never
 apply to the parent namespace. One invocation supports 8000 traffic processes,
 including warmups and recovery checks.
 
-The `/dev/net/tun` character device is shared as a factory. Each namespace owns
-its own nonpersistent `ktest0`; no physical device, host route, host port,
-global image tag or named host network namespace is reserved by these runners.
+The `/dev/net/tun` character device is shared as a factory. Each container owns
+its own nonpersistent `ktest0`; no physical device, host route, host port or
+named host network namespace is reserved by these runners. The runtime image
+is explicitly built and can be shared by runs.
 Each invocation creates a unique child of its output directory, even when two
-workspaces pass the same `--output`. Child processes have a dedicated process
-group which is terminated on completion or interruption. No cleanup command
-searches for or deletes another run's resources.
+workspaces pass the same `--output`. Each run records a container ID for cleanup
+on completion or interruption. Cleanup never searches for another run's resources.
 
-`check_isolation.py` runs two suites concurrently with different working
+`check_isolation.py` runs two containers concurrently with different working
 directories and the same artifact parent. It verifies distinct namespace IDs
-and compares the parent's addresses, rules, routes and TCP settings before and after. DHCP
-and router-advertisement countdown fields are excluded from that comparison.
+and compares host addresses, rules, routes, TCP settings and available resolved
+DNS status before and after. DHCP and router-advertisement countdown fields are excluded from that comparison.
 Use `--daemon-cpus` to select one available CPU when exercising a single worker;
 the default affinity includes up to two already available CPUs. Affinity does
 not reserve those CPUs against another workspace.
@@ -161,8 +173,8 @@ Artifacts contain the case ID, seed, exact workload arguments, per-flow
 counts and histograms, process resource samples, generated policy, daemon
 logs and namespace network snapshots. A failed case marks the run failed and
 keeps its first error. Successful later runs do not overwrite its directory.
-A process killed by SIGKILL cannot execute cleanup code; any surviving child
-processes can be identified by the run's command line and process group.
+A launcher killed by SIGKILL cannot execute cleanup code; its `container.cid`
+identifies the container for explicit cleanup.
 
 See [benchmark measurement definitions](../../benchmarks/tun/README.md) before
 using small CI samples or overloaded UDP completion rates as performance data.

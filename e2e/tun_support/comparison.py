@@ -20,6 +20,7 @@ class SingBox(Process):
                             "interface_name": NAME,
                             "mtu": mtu,
                             "auto_route": False,
+                            "dns_mode": "disabled",
                             "stack": "go",
                             "address": ["192.0.2.1/30", "fd00::1/126"],
                         }

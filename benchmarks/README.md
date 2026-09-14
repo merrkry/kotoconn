@@ -5,6 +5,7 @@ network isolation with the TUN E2E tests.
 
 ```sh
 cargo build --release -p kotoconn-cli -p kotoconn-tun-traffic
+docker build -f e2e/tun.Dockerfile -t kotoconn-tun:local .
 python3 benchmarks/run.py
 ```
 

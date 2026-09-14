@@ -8,15 +8,9 @@ from unittest.mock import patch
 import run as benchmark
 from e2e.tun_support.environment import (
     add_arguments,
-    configure_network,
     enter,
     traffic,
 )
-
-
-def small_port_range():
-    configure_network()
-    Path("/proc/sys/net/ipv4/ip_local_port_range").write_text("60000 60063")
 
 
 def fixed_work(binary, daemon, directory, spec, **kwargs):
@@ -37,7 +31,12 @@ def main():
     args = parser.parse_args()
     args.binary = args.binary.resolve(strict=True)
     args.traffic_binary = args.traffic_binary.resolve(strict=True)
-    if enter(args, Path(__file__).resolve(), "benchmarks"):
+    if enter(
+        args,
+        Path(__file__).resolve(),
+        "benchmarks",
+        sysctls={"net.ipv4.ip_local_port_range": "60000 60063"},
+    ):
         return
 
     args.profile = "full"
@@ -50,7 +49,6 @@ def main():
     args.udp_rate = 10000
     args.sing_box = None
     with (
-        patch.object(benchmark, "configure_network", small_port_range),
         patch.object(benchmark, "traffic", fixed_work),
     ):
         benchmark.run(args)

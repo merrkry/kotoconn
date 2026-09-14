@@ -9,10 +9,11 @@ import statistics
 from collections import Counter
 from pathlib import Path
 
-from .environment import ROOT, command, digest
+from .environment import digest
 
 
 def metadata(binaries, traffic_binary):
+    container = json.loads(Path("/artifacts/container.json").read_text())
     cpu = next(
         (
             line.split(":", 1)[1].strip()
@@ -31,15 +32,10 @@ def metadata(binaries, traffic_binary):
         "cpu_max": Path("/sys/fs/cgroup/cpu.max").read_text().strip()
         if Path("/sys/fs/cgroup/cpu.max").exists()
         else None,
-        "source_commit": command(
-            "git", "-C", str(ROOT), "rev-parse", "HEAD"
-        ).stdout.strip(),
-        "source_status": command(
-            "git", "-C", str(ROOT), "status", "--porcelain"
-        ).stdout,
-        "smoltcp": command(
-            "git", "-C", str(ROOT), "submodule", "status"
-        ).stdout.strip(),
+        "source_commit": container["source_commit"],
+        "source_status": container["source_status"],
+        "smoltcp": container["smoltcp"],
+        "container": container,
         "binaries": {
             name: {"path": str(path), "sha256": digest(path)}
             for name, path in binaries.items()

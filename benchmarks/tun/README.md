@@ -4,17 +4,25 @@ Build the candidate and the shared traffic tool, then run from the repository ro
 
 ```sh
 cargo build --release -p kotoconn-cli -p kotoconn-tun-traffic
+docker build -f e2e/tun.Dockerfile -t kotoconn-tun:local .
 python3 benchmarks/run.py
 python3 benchmarks/run.py --profile full
 python3 benchmarks/check_udp_churn.py
 ```
 
-The runner needs Linux, Python 3.10+, `unshare`, `iproute2`, `taskset`,
-`/dev/net/tun`, and either unprivileged user namespaces or root. It does not
-build binaries, install tools, download references, or modify host networking.
-Every invocation creates a new network namespace and a unique child of
-`target/benchmarks/`, or of the supplied `--output` directory. Devices, ports,
-policy rules and child processes belong to that run. Source-address routing
+The runner needs Linux, Python 3.10+, Docker, `ldd`, and `/dev/net/tun`.
+It starts one container per invocation, with no external network, published
+ports, host D-Bus or host network access. The container receives only NET_ADMIN,
+NET_RAW and the TUN device. It does not use `unshare` or require host root.
+The runtime image is built explicitly; `--container-image` selects its tag.
+
+Each run gets a unique child of `target/benchmarks/`, or of `--output`, mounted
+writable as `/artifacts`. Source and selected binaries are read-only. Nix-built
+binaries also mount their immutable runtime library packages read-only; other
+binaries must be compatible with the image's Debian runtime. The container's
+ID, image ID, command, source revision and settings are recorded in
+`container.json`. Cancellation removes only that run's container.
+Source-address routing
 keeps TCP TIME_WAIT acknowledgments on the same path as client traffic.
 TCP warmup and measurement use separate reserved server ports. Each pure UDP
 sample reuses its server port across those two phases. UDP has no FIN, so using
@@ -38,7 +46,7 @@ one-flow UDP, UDP churn, sparse UDP, fragmentation boundaries, and a clean
 mixed case. Use `--case NAME`, `--mtu N`, and `--family 4|6` to select cases.
 All three options can be repeated. MTU 1280 and 65535 are available explicitly.
 Repeated MTU/family values are deduplicated in their original order. The runner
-rejects matrices needing more than 8000 server ports before creating a namespace,
+rejects matrices needing more than 8000 server ports before starting a container,
 including all repetitions, reference samples and warmups in that count.
 
 A persistent TCP connection exchanges independently generated data in each
@@ -144,7 +152,9 @@ its version before starting a workload and records the full version output
 and binary hash. The verified release is
 [1.15.0-alpha.3](https://github.com/SagerNet/sing-box/releases/tag/v1.15.0-alpha.3).
 Reference binaries are supplied by the caller, never downloaded or rebuilt
-implicitly. Omitting `--sing-box` runs only Kotoconn.
+implicitly. System DNS configuration is disabled in the reference. Collect a
+reference baseline deliberately and retain its artifacts; ordinary optimization
+runs should omit `--sing-box` instead of collecting that baseline again. Omitting `--sing-box` runs only Kotoconn.
 The reference logs warnings and errors. Readiness observes its TUN device,
 so per-connection INFO logging does not enter churn measurements.
 
