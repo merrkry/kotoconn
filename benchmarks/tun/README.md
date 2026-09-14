@@ -1,31 +1,20 @@
 # TUN workloads
 
-Build release binaries in Docker, copy them out without starting the image,
-and build the TUN runtime. Run from the repository root:
+Follow the [workspace setup](../../docs/development.md#setup). Nx builds release
+binaries with cargo-zigbuild and packages the TUN runtime before workloads:
 
 ```sh
-docker build -f e2e/Dockerfile --build-arg CARGO_PROFILE=release -t kotoconn-bench:local .
-mkdir -p target/tun/release
-(
-    tun_build=$(docker create kotoconn-bench:local)
-    trap 'docker rm -f "$tun_build"' EXIT
-    docker cp "$tun_build:/usr/local/bin/kotoconn" target/tun/release/kotoconn
-    docker cp "$tun_build:/usr/local/bin/kotoconn-tun-traffic" target/tun/release/kotoconn-tun-traffic
-)
-docker build -f e2e/tun.Dockerfile -t kotoconn-tun:local .
+pnpm exec nx run benchmarks:run
+pnpm exec nx run benchmarks:run -- --profile full
+pnpm exec nx run benchmarks:udp-churn
 ```
 
-Rebuild and copy the binaries after code changes. They are separate from host
-Cargo artifacts. The benchmark defaults to `target/tun/release/`; use `--binary`
-and `--traffic-binary` to select other binaries compatible with Debian Bookworm.
+Bake exports Debian-compatible binaries directly to `target/tun/release/`,
+separate from host Cargo artifacts. BuildKit reuses unchanged layers. To build
+without measuring, use `pnpm exec nx run docker:release`. Use `--binary` and
+`--traffic-binary` to select other Debian Bookworm-compatible binaries.
 
-```sh
-python3 benchmarks/run.py
-python3 benchmarks/run.py --profile full
-python3 benchmarks/check_udp_churn.py
-```
-
-The runner needs Linux, Python 3.10+, Docker, and `/dev/net/tun`.
+The runner needs Linux, Python 3.14, Docker, and `/dev/net/tun`.
 It starts one container per invocation, with no external network, published
 ports, host D-Bus or host network access. The container receives only NET_ADMIN,
 NET_RAW and the TUN device. It does not use `unshare` or require host root.
@@ -157,8 +146,8 @@ value because allocators and payload pools can retain free memory.
 ## Comparisons
 
 ```sh
-python3 benchmarks/run.py --sing-box /path/to/sing-box-1.15
-python3 benchmarks/run.py --case udp-paced --udp-rate 20000 --repetitions 5
+pnpm exec nx run benchmarks:run -- --sing-box /path/to/sing-box-1.15
+pnpm exec nx run benchmarks:run -- --case udp-paced --udp-rate 20000 --repetitions 5
 ```
 
 The only reference is sing-box 1.15 with its go TUN stack. The runner checks
@@ -189,7 +178,7 @@ sets when comparing concurrent workspaces, or run performance comparisons
 sequentially. The generator uses four Tokio worker threads by default;
 `--traffic-workers N` changes this independently of the daemon. It inherits the
 runner's CPU affinity, recorded in metadata. For example, on a machine with six
-available CPUs, run `taskset -c 2-5 python3 benchmarks/run.py --daemon-cpus 0,1`
+available CPUs, run `taskset -c 2-5 pnpm exec nx run benchmarks:run -- --daemon-cpus 0,1`
 to give the generator four CPUs separate from the daemon. Extra threads without
 CPU time do not establish generator capacity. Small CI samples validate the
 measurement pipeline; they are not performance baselines.

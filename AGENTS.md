@@ -45,5 +45,6 @@ Before editing `external/smoltcp`, follow the [stable fork branch workflow](exte
 Use static checks; start a dev server or preview only when explicitly asked.
 
 - TypeScript: run `pnpm run format` and `pnpm run check` before finishing.
-- Rust: run `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` separately. Keep Rust checks out of `package.json`.
-- Generated binding declarations are ignored by Git. `pnpm run check` regenerates them before compilation; use `pnpm run bindings` to refresh editor types.
+- Rust: run `pnpm exec nx run rust:format`, `pnpm exec nx run rust:lint`, and `pnpm exec nx run rust:test` separately. All Rust compilation, including generators and tests, uses cargo-zigbuild with an explicit target. Keep Rust checks out of `package.json`; see [development setup](docs/development.md#setup) for toolchains and target selection.
+- Python: run `pnpm exec nx run python:check` for Ruff formatting/lint and Pyrefly.
+- Generated binding declarations are ignored by Git. `pnpm run check` generates or restores them before compilation; use `pnpm run bindings` to refresh editor types.

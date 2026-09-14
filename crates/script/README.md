@@ -10,6 +10,6 @@ Poll `Script` only on its owning thread. Its shared-reference methods support co
 
 `ts-rs` derives configuration declarations. QuickJS adapters use `structural-convert` in both directions to detect mismatched fields. The `api!` macro emits methods and declarations from the same signatures, and `Handler` ties callback execution to its declared input and output. Native IP and target views have compile-time signature checks and runtime tests for their JS properties.
 
-`packages/bindings` contains generated declarations and related types; `packages/api` contains handwritten helpers and a typechecked example. `pnpm run check` regenerates ignored declarations before compilation.
+`packages/bindings` contains generated declarations and related types; `packages/api` contains handwritten helpers and a typechecked example. `pnpm run check` generates or restores ignored declarations before compilation.
 
 Binding tests use independent sample types for conversions, callbacks, and asynchronous native calls. Runtime tests cover detached work and cancellation without daemon code. Minimal registrations exercise the public Script entry points and registration lifetime. Compiler tests live in `typescript` and validate emitted JavaScript behavior, including asynchronous control flow and type-only imports.
