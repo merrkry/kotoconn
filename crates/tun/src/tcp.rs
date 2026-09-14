@@ -1014,6 +1014,15 @@ mod tests {
         let (_, synack) = packet.tcp().unwrap();
         assert_eq!(synack.window_scale, Some(7));
         assert_eq!(synack.window_len, 65535);
+        assert!(
+            replies.try_recv().is_err(),
+            "a larger receive window must not repeatedly transmit SYN-ACK"
+        );
+        assert!(matches!(
+            conn.poll(now, false, &output, &mut arena),
+            Progress::Idle(Some(at)) if at > now
+        ));
+        assert!(replies.try_recv().is_err());
         repr.seq_number = TcpSeqNumber(101);
         repr.ack_number = Some(synack.seq_number + 1);
         repr.control = TcpControl::None;

@@ -18,6 +18,12 @@ zero-length UDP, fragment boundaries and maximum supported datagrams.
 one persistent decoder, and checks that inconsistent virtio metadata cannot
 bypass transport validation.
 
+The dynamic receive-window regression withholds the handshake ACK and requires
+exactly one SYN-ACK before the retransmission deadline. Release churn exposed a
+SYN-ACK flood when the larger scaled window repeatedly triggered an update
+during the handshake. The regression fails immediately with the old smoltcp
+logic; it does not depend on reproducing the later socket reset.
+
 `parallel_tests.rs` supplies explicit receive queues and controlled writers.
 It checks cross-worker fragment ownership, blocked-reader independence,
 receive failures and forced cancellation. A virtual-clock test repeatedly
@@ -70,6 +76,10 @@ python3 e2e/tun.py --case mixed-malformed --mtu 9000 --family 6 --repeat 8 --see
 python3 e2e/tun.py --case generic-relay
 python3 testing/tun/check_isolation.py
 ```
+
+For optimized-code verification, build with `cargo build --release -p kotoconn-cli
+-p kotoconn-tun-traffic` and pass `--binary target/release/kotoconn
+--traffic-binary target/release/kotoconn-tun-traffic` to the stress command.
 
 The quick profile repeats 18 workload recipes twice at MTU 1500 and 9000 over
 IPv4 and IPv6. It covers one and four connections, persistent TCP transfers,
