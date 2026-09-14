@@ -1,4 +1,4 @@
-"""Own only child processes, files and networking inside one disposable namespace."""
+"""Run TUN workloads inside disposable Docker containers with no host network or bus."""
 
 import argparse
 import hashlib
@@ -24,9 +24,16 @@ PORTS = itertools.count(SERVER_PORTS.start)
 
 def isolated():
     parent = os.environ.get("KOTOCONN_TUN_PARENT_NETNS")
-    if not parent or os.readlink("/proc/self/ns/net") == parent:
+    container = Path("/.dockerenv").exists() or Path("/run/.containerenv").exists()
+    if (
+        not container
+        or os.environ.get("KOTOCONN_TUN_CONTAINER") != "1"
+        or not parent
+        or os.readlink("/proc/self/ns/net") == parent
+        or Path("/run/dbus/system_bus_socket").exists()
+    ):
         raise RuntimeError(
-            "refusing network operations outside a child network namespace"
+            "TUN workloads require the Docker launcher, a private network, and no host D-Bus"
         )
 
 
@@ -39,31 +46,115 @@ def ip(*argv):
     return command("ip", *argv).stdout
 
 
-def enter(args, script, category):
-    """Re-exec once. Every invocation creates a new directory, even with --output."""
+def enter(args, script, category, *, sysctls=None):
+    """Start one container per run; only its unique artifact directory is writable."""
     if args.inside:
         isolated()
+        # Keep nested artifacts writable by the directory's inherited group.
+        os.umask(0o002)
         return False
     base = (args.output or ROOT / "target" / category).resolve()
     base.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix="tun-", dir=base))
-    # CI runs this script with sudo but uploads its synthetic traffic artifacts
-    # as the runner user. Keep the unique directory traversable for that step.
-    directory.chmod(0o755)
-    argv = ["unshare", "--net"]
-    if os.getuid() != 0:
-        argv += ["--user", "--map-root-user"]
+    # Rootful Docker's UID 0 differs from the host runner. Grant the directory's
+    # group write access and inherit that group for files created by either side.
+    directory.chmod(0o2770)
+    image = command(
+        "docker", "image", "inspect", args.container_image, "--format", "{{.Id}}"
+    )
+    metadata = {
+        "image": args.container_image,
+        "image_id": image.stdout.strip(),
+        "engine": command("docker", "--version").stdout.strip(),
+        "source_commit": command(
+            "git", "-C", str(ROOT), "rev-parse", "HEAD"
+        ).stdout.strip(),
+        "source_status": command(
+            "git", "-C", str(ROOT), "status", "--porcelain"
+        ).stdout,
+        "smoltcp": command(
+            "git", "-C", str(ROOT), "submodule", "status"
+        ).stdout.strip(),
+    }
+    cidfile = directory / "container.cid"
+    container_name = f"kotoconn-{directory.name}-{os.getpid()}"
+    argv = [
+        "docker",
+        "run",
+        "--rm",
+        "--init",
+        "--network",
+        "none",
+        "--read-only",
+        "--name",
+        container_name,
+        "--cap-drop",
+        "ALL",
+        "--cap-add",
+        "NET_ADMIN",
+        "--cap-add",
+        "NET_RAW",
+        "--group-add",
+        str(directory.stat().st_gid),
+        "--device",
+        "/dev/net/tun",
+        "--security-opt",
+        "no-new-privileges",
+        "--tmpfs",
+        "/tmp:rw,nosuid,nodev",
+        "--cidfile",
+        str(cidfile),
+        "--env",
+        "KOTOCONN_TUN_CONTAINER=1",
+        "--env",
+        f"KOTOCONN_TUN_PARENT_NETNS={os.readlink('/proc/self/ns/net')}",
+        "--mount",
+        f"type=bind,source={ROOT},target=/workspace,readonly",
+        "--mount",
+        f"type=bind,source={directory},target=/artifacts",
+    ]
+    settings = {
+        "net.ipv4.conf.all.rp_filter": "0",
+        "net.ipv4.conf.default.rp_filter": "0",
+        "net.ipv4.conf.all.accept_local": "1",
+        "net.ipv4.conf.default.accept_local": "1",
+        "net.ipv4.tcp_tw_reuse": "1",
+        "net.ipv4.ip_local_port_range": f"{SERVER_PORTS.stop} 65535",
+        "net.ipv4.ip_local_reserved_ports": "22222-22224",
+        **(sysctls or {}),
+    }
+    for name, value in settings.items():
+        argv += ["--sysctl", f"{name}={value}"]
+    # Preserve an explicit generator affinity while leaving daemon affinity
+    # independently selectable inside the same container CPU allowance.
+    generator_cpus = ",".join(map(str, sorted(os.sched_getaffinity(0))))
+    overrides = []
+    for option in ("binary", "traffic_binary", "sing_box"):
+        binary = getattr(args, option, None)
+        if binary is None:
+            continue
+        binary = binary.resolve(strict=True)
+        target = f"/inputs/{option}"
+        argv += ["--mount", f"type=bind,source={binary},target={target},readonly"]
+        overrides += ["--" + option.replace("_", "-"), target]
     argv += [
-        sys.executable,
-        str(script),
+        "--entrypoint",
+        "taskset",
+        args.container_image,
+        "-c",
+        generator_cpus,
+        "python3",
+        str(Path("/workspace") / script.relative_to(ROOT)),
         *sys.argv[1:],
+        *overrides,
         "--inside",
         "--output",
-        str(directory),
+        "/artifacts",
     ]
+    metadata.update(command=argv, sysctls=settings)
+    (directory / "container.json").write_text(json.dumps(metadata, indent=2) + "\n")
     print(f"Artifacts: {directory}", flush=True)
-    env = dict(os.environ, KOTOCONN_TUN_PARENT_NETNS=os.readlink("/proc/self/ns/net"))
-    child = subprocess.Popen(argv, env=env, start_new_session=True)
+    child = subprocess.Popen(argv, start_new_session=True)
 
     def interrupted(_signal, _frame):
         raise KeyboardInterrupt
@@ -74,21 +165,18 @@ def enter(args, script, category):
         code = child.wait()
     finally:
         signal.signal(signal.SIGTERM, previous)
-        # The namespace and all its devices disappear after its last process exits.
-        # Also collect descendants on cancellation; never target another run's group.
-        try:
-            os.killpg(child.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        # Stop the launcher before cleanup so cancellation during startup cannot
+        # leave it creating a container after we checked for its cidfile.
+        if child.poll() is None:
+            child.terminate()
         try:
             child.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            os.killpg(child.pid, signal.SIGKILL)
+            child.kill()
             child.wait(timeout=5)
-        try:
-            os.killpg(child.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        # The unique name also identifies a container cancelled before its ID
+        # was written. Never search by image or target another run's container.
+        command("docker", "rm", "--force", container_name, check=False)
     if code:
         raise SystemExit(code)
     return True
@@ -122,23 +210,11 @@ def configure_network():
             "lookup",
             "100",
         )
-    for field, value in (("rp_filter", "0"), ("accept_local", "1")):
-        Path(f"/proc/sys/net/ipv4/conf/all/{field}").write_text(value)
-    # Outbound kernel sockets use documentation addresses on lo, so Linux's
-    # default loopback-only TIME_WAIT reuse does not recognize this topology.
-    Path("/proc/sys/net/ipv4/tcp_tw_reuse").write_text("1")
-    Path("/proc/sys/net/ipv4/ip_local_port_range").write_text(
-        f"{SERVER_PORTS.stop} 65535"
-    )
-    # Raw controls must never share a tuple with a generated application flow.
-    Path("/proc/sys/net/ipv4/ip_local_reserved_ports").write_text("22222,22224")
 
 
 def configure_routes():
     for family in ("-4", "-6"):
         ip(family, "route", "replace", "default", "dev", NAME, "table", "100")
-    for field, value in (("rp_filter", "0"), ("accept_local", "1")):
-        Path(f"/proc/sys/net/ipv4/conf/{NAME}/{field}").write_text(value)
 
 
 def policy(path, mtu, idle_ms=30000, outbound="direct"):
@@ -328,10 +404,21 @@ def resource(pid):
     }
 
 
+def reserve_server_port():
+    port = next(PORTS)
+    if port not in SERVER_PORTS:
+        raise ValueError(
+            f"run exhausted its {len(SERVER_PORTS)} reserved traffic server ports"
+        )
+    return port
+
+
 def traffic(binary, daemon, directory, spec, *, inject=None):
-    # Retained TIME_WAIT sockets from one case must not consume the next case's
-    # tuple space. The daemon and its connection/pool state remain alive.
-    spec = {"port": next(PORTS), **spec}
+    # TCP needs fresh tuple space after TIME_WAIT. UDP warmup and measurement
+    # can explicitly share a server port to reuse their live associations.
+    spec = dict(spec)
+    if "port" not in spec:
+        spec["port"] = reserve_server_port()
     if spec["port"] not in SERVER_PORTS:
         raise ValueError(
             f"run exhausted its {len(SERVER_PORTS)} reserved traffic server ports"
@@ -410,17 +497,22 @@ def traffic(binary, daemon, directory, spec, *, inject=None):
 def add_arguments(parser, *, release=False):
     profile = "release" if release else "debug"
     parser.add_argument(
-        "--binary", type=Path, default=ROOT / "target" / profile / "kotoconn"
+        "--binary", type=Path, default=ROOT / "target/tun" / profile / "kotoconn"
     )
     parser.add_argument(
         "--traffic-binary",
         type=Path,
-        default=ROOT / "target" / profile / "kotoconn-tun-traffic",
+        default=ROOT / "target/tun" / profile / "kotoconn-tun-traffic",
     )
     parser.add_argument(
         "--output", type=Path, help="parent directory; each run gets a unique child"
     )
     parser.add_argument("--inside", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--container-image",
+        default="kotoconn-tun:local",
+        help="runtime image built with e2e/tun.Dockerfile",
+    )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
         "--daemon-cpus",

@@ -1,10 +1,10 @@
 //! Validate and normalize IP before allocating transport state. Reassembly is
 //! shared by TCP and UDP, including fragmented initial SYNs.
 use smoltcp::{phy::ChecksumCapabilities, wire::*};
-use std::{borrow::Cow, collections::HashMap, net::SocketAddr, time::Duration};
+use std::{borrow::Cow, collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::time::Instant;
 
-const REASSEMBLY_LIFETIME: Duration = Duration::from_secs(60);
+pub(crate) const REASSEMBLY_LIFETIME: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct Flow {
@@ -103,8 +103,8 @@ fn checksums(verified: bool) -> ChecksumCapabilities {
     caps
 }
 
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
-struct FragmentKey {
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct FragmentKey {
     ipv4_protocol: Option<IpProtocol>,
     source: IpAddress,
     destination: IpAddress,
@@ -120,6 +120,7 @@ struct Fragment {
 }
 
 struct Assembly {
+    binding: Option<Arc<crate::fragments::Binding>>,
     lease: crate::reassembly::Lease,
     expires: Instant,
     ranges: smoltcp::storage::Assembler,
@@ -144,17 +145,7 @@ impl Assembly {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum RouteKey {
     Flow(u8, Flow),
-    Ipv4Fragment {
-        source: Ipv4Address,
-        destination: Ipv4Address,
-        protocol: u8,
-        id: u32,
-    },
-    Ipv6Fragment {
-        source: Ipv6Address,
-        destination: Ipv6Address,
-        id: u32,
-    },
+    Fragment(FragmentKey),
 }
 
 pub(crate) struct Parsed<'a> {
@@ -165,20 +156,25 @@ pub(crate) struct Parsed<'a> {
 
 impl<'a> Parsed<'a> {
     pub fn route(&self) -> Option<RouteKey> {
-        if let Some(fragment) = self.fragment {
-            return Some(match self.ip {
-                IpRepr::Ipv4(ip) => RouteKey::Ipv4Fragment {
-                    source: ip.src_addr,
-                    destination: ip.dst_addr,
-                    protocol: u8::from(ip.next_header),
-                    id: fragment.id,
-                },
-                IpRepr::Ipv6(ip) => RouteKey::Ipv6Fragment {
-                    source: ip.src_addr,
-                    destination: ip.dst_addr,
-                    id: fragment.id,
-                },
-            });
+        if let Some(key) = self.fragment_key() {
+            return Some(RouteKey::Fragment(key));
+        }
+        self.first_route()
+    }
+
+    fn fragment_key(&self) -> Option<FragmentKey> {
+        self.fragment.map(|fragment| FragmentKey {
+            ipv4_protocol: matches!(self.ip, IpRepr::Ipv4(_)).then_some(self.ip.next_header()),
+            source: self.ip.src_addr(),
+            destination: self.ip.dst_addr(),
+            id: fragment.id,
+        })
+    }
+
+    /// Ports select a worker only; transport validation still follows reassembly.
+    pub fn first_route(&self) -> Option<RouteKey> {
+        if self.fragment.is_some_and(|fragment| fragment.offset != 0) {
+            return None;
         }
         if !matches!(self.ip.next_header(), IpProtocol::Tcp | IpProtocol::Udp) {
             return None;
@@ -200,15 +196,27 @@ impl<'a> Parsed<'a> {
     }
 
     pub fn decode(self, decoder: &mut Decoder, now: Instant) -> Option<Packet<'a>> {
+        self.decode_with(decoder, now, None)
+    }
+
+    fn decode_with(
+        self,
+        decoder: &mut Decoder,
+        now: Instant,
+        binding: Option<&Arc<crate::fragments::Binding>>,
+    ) -> Option<Packet<'a>> {
+        let fragment_key = self.fragment_key();
         let mut ip = self.ip;
         let payload = if let Some(fragment) = self.fragment {
-            let key = FragmentKey {
-                ipv4_protocol: matches!(ip, IpRepr::Ipv4(_)).then_some(ip.next_header()),
-                source: ip.src_addr(),
-                destination: ip.dst_addr(),
-                id: fragment.id,
-            };
-            Cow::Owned(decoder.reassemble(key, ip.next_header(), fragment, self.payload, now)?)
+            let key = fragment_key?;
+            Cow::Owned(decoder.reassemble(
+                key,
+                ip.next_header(),
+                fragment,
+                self.payload,
+                now,
+                binding,
+            )?)
         } else {
             Cow::Borrowed(self.payload)
         };
@@ -344,6 +352,38 @@ impl Decoder {
         parse(data)?.decode(self, now)
     }
 
+    pub fn decode_fragment<'a>(
+        &mut self,
+        data: &'a [u8],
+        now: Instant,
+        binding: &Arc<crate::fragments::Binding>,
+    ) -> Option<Packet<'a>> {
+        if !binding.active(now) {
+            return None;
+        }
+        let parsed = parse(data)?;
+        debug_assert_eq!(parsed.fragment_key(), Some(binding.key));
+        if self.fragments.get(&binding.key).is_some_and(|assembly| {
+            assembly
+                .binding
+                .as_ref()
+                .is_none_or(|old| !Arc::ptr_eq(old, binding))
+        }) {
+            // A reused ID must not inherit an expired or completed assembly.
+            self.fragments.remove(&binding.key);
+        }
+        parsed.decode_with(self, now, Some(binding))
+    }
+
+    pub fn retains(&self, binding: &Arc<crate::fragments::Binding>) -> bool {
+        self.fragments.get(&binding.key).is_some_and(|assembly| {
+            assembly
+                .binding
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, binding))
+        })
+    }
+
     fn reassemble(
         &mut self,
         key: FragmentKey,
@@ -351,6 +391,7 @@ impl Decoder {
         fragment: Fragment,
         data: &[u8],
         now: Instant,
+        binding: Option<&Arc<crate::fragments::Binding>>,
     ) -> Option<Vec<u8>> {
         let Fragment {
             offset,
@@ -366,9 +407,12 @@ impl Decoder {
 
         if let std::collections::hash_map::Entry::Vacant(entry) = self.fragments.entry(key) {
             let lease = self.limits.reserve(ASSEMBLY_METADATA, now)?;
-            let expires = now + REASSEMBLY_LIFETIME;
+            let expires = binding
+                .as_ref()
+                .map_or(now + REASSEMBLY_LIFETIME, |binding| binding.expires);
             self.next_expiry = Some(self.next_expiry.map_or(expires, |at| at.min(expires)));
             entry.insert(Assembly {
+                binding: binding.cloned(),
                 lease,
                 expires,
                 ranges: smoltcp::storage::Assembler::new(),

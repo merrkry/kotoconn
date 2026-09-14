@@ -1,4 +1,4 @@
-"""Run real TUN workloads in a new network namespace, with unique per-run artifacts."""
+"""Run real TUN workloads in a Docker container, with unique per-run artifacts."""
 
 import argparse
 import json

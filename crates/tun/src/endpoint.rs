@@ -33,11 +33,10 @@ pub trait PacketReceive: Send {
             .lease
             .get_or_insert_with(|| buffer.pool.acquire(65575));
         let len = ready!(self.poll_recv(cx, lease.as_mut()))?;
-        // SAFETY: The receive call initialized this prefix, and the lease remains
-        // installed until a complete frame is returned.
-        let lease = buffer.lease.take().expect("receive lease");
+        let (bytes, allocation_size) = buffer.publish(len);
         Poll::Ready(Ok(Received {
-            bytes: lease.publish(len),
+            bytes,
+            allocation_size,
             checksum_verified: false,
             udp_segment_size: None,
         }))
@@ -50,10 +49,34 @@ pub struct ReceiveBuffer {
     pub(crate) lease: Option<kotoconn_protocol::pool::Lease>,
 }
 
+impl ReceiveBuffer {
+    pub(crate) fn publish(&mut self, len: usize) -> (Bytes, usize) {
+        // SAFETY: The completed receive initialized this prefix of the installed
+        // lease. Keep private scratch for short frames; only large frames take it.
+        let lease = self.lease.as_ref().expect("receive lease");
+        debug_assert!(len <= lease.as_ref().len());
+        if len < lease.as_ref().len() / 4 {
+            (
+                self.pool.copy(&lease.as_ref()[..len]),
+                len.max(256).next_power_of_two(),
+            )
+        } else {
+            let allocation_size = lease.as_ref().len().max(256).next_power_of_two();
+            (
+                self.lease.take().expect("receive lease").freeze(len),
+                allocation_size,
+            )
+        }
+    }
+}
+
 /// Offload assertions are accepted only from the device implementation. Ordinary
 /// packet readers leave both metadata fields unset and receive full validation.
 pub struct Received {
     pub bytes: Bytes,
+    /// Retained backing allocation, including capacity outside this view.
+    /// PacketReceive implementations must report it for fragment admission.
+    pub allocation_size: usize,
     pub checksum_verified: bool,
     /// UDP L4 segmentation, never IP fragmentation. Each slice is one datagram.
     pub udp_segment_size: Option<u16>,
@@ -136,7 +159,7 @@ impl Drop for ConnectionGuard {
 }
 
 /// Own queue workers until TCP drains or cancellation stops device I/O.
-/// Queue membership stays fixed so flow and fragment ownership cannot migrate.
+/// Queue membership stays fixed so established flow ownership cannot migrate.
 pub async fn run<R: PacketReceive + 'static, W: PacketSend + 'static>(
     queues: Vec<(R, W)>,
     mtu: usize,
@@ -154,11 +177,13 @@ pub async fn run<R: PacketReceive + 'static, W: PacketSend + 'static>(
         .map(|_| queue::channel(queue::INITIAL_BYTES, worker::Forwarded::size))
         .unzip();
     let (drained, mut drains) = mpsc::unbounded_channel();
+    let reassembly = crate::packet::ReassemblyLimits::default();
     let shared = Arc::new(Shared {
         drained,
         hash: RandomState::new(),
         inboxes,
-        reassembly: Default::default(),
+        fragments: crate::fragments::Routes::new(queues.len(), reassembly.clone()),
+        reassembly,
         stop: CancellationToken::new(),
     });
     // Each writer owns its packet storage; only atomic fragment IDs are shared.
@@ -210,6 +235,7 @@ pub async fn run<R: PacketReceive + 'static, W: PacketSend + 'static>(
                 biased;
                 _ = context.scope.cancelled() => return Ok(()),
                 Some(_) = drains.recv() => remaining -= 1,
+                _ = shared.fragments.expire() => {},
                 result = workers.join_next() => {
                     result.ok_or_else(|| anyhow!("TUN has no workers"))??.context("TUN worker failed")?;
                     bail!("TUN worker stopped before shutdown");
@@ -247,6 +273,7 @@ async fn transmit<W: PacketSend>(
 ) -> Result<()> {
     let mut items = Vec::with_capacity(64);
     let mut packets = Vec::with_capacity(64);
+    let mut parts = Vec::with_capacity(64);
     let mut sent_packets = 0u64;
     let mut sent_bytes = 0u64;
 
@@ -283,7 +310,8 @@ async fn transmit<W: PacketSend>(
                         && size != 0
                         && encoder.can_offload(source, destination, size)
                     {
-                        let mut parts = vec![payload];
+                        debug_assert!(parts.is_empty());
+                        parts.push(payload);
                         while parts.len() < 64 && (parts.len() + 1) * size <= 65507 {
                             if !matches!(pending.peek(), Some(Transmit::Datagram { source: s, destination: d, payload: p })
                                 if *s == source && *d == destination && p.len() == size)
@@ -313,6 +341,7 @@ async fn transmit<W: PacketSend>(
                             .await?;
                         sent_packets += parts.len() as u64;
                         sent_bytes += (header.len() * parts.len() + size * parts.len()) as u64;
+                        parts.clear();
                         continue;
                     }
                     let datagram = encoder.encode(source, destination, &payload);

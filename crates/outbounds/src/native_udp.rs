@@ -1,5 +1,9 @@
-use kotoconn_protocol::{pool::Pool, *};
+use kotoconn_protocol::{
+    pool::{Lease, Pool},
+    *,
+};
 use std::{
+    cell::RefCell,
     future::poll_fn,
     io,
     task::{Context, Poll, ready},
@@ -7,6 +11,12 @@ use std::{
 #[cfg(target_os = "linux")]
 use tokio::io::Interest;
 use tokio::{net::UdpSocket, sync::oneshot};
+
+thread_local! {
+    // Synchronous receive scratch is shared by sockets on this executor thread.
+    // At most 32 maximum datagrams stay private, independent of idle flow count.
+    static RECEIVE: RefCell<Vec<Lease>> = const { RefCell::new(Vec::new()) };
+}
 
 struct Native {
     socket: UdpSocket,
@@ -74,56 +84,11 @@ impl PacketIo for Native {
     ) -> Poll<io::Result<usize>> {
         loop {
             ready!(self.socket.poll_recv_ready(cx))?;
-            let mut buffers: Vec<_> = (0..self.batch).map(|_| self.pool.acquire(65536)).collect();
-            let mut lengths = [0; 32];
-            #[cfg(target_os = "linux")]
-            let mut segments = [0; 32];
-            #[cfg(not(target_os = "linux"))]
-            let segments = [0; 32];
-            #[cfg(target_os = "linux")]
-            let result = self.socket.try_io(Interest::READABLE, || {
-                crate::udp_batch::receive(&self.socket, &mut buffers, &mut lengths, &mut segments)
-            });
-            #[cfg(not(target_os = "linux"))]
-            let result = self.socket.try_recv(buffers[0].as_mut()).map(|n| {
-                lengths[0] = n;
-                1
-            });
-            let count = match result {
+            let result = RECEIVE.with_borrow_mut(|buffers| self.receive(buffers, out));
+            let (count, datagrams) = match result {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
                 result => result?,
             };
-            let before = out.len();
-            for (i, buffer) in buffers.into_iter().enumerate().take(count) {
-                let length = lengths[i];
-                if length == usize::MAX {
-                    continue;
-                }
-                // Compact small receives; retain shared GRO aggregate storage.
-                let payload = if length >= 8192 {
-                    buffer.freeze(length)
-                } else {
-                    self.pool.copy(&buffer.as_ref()[..length])
-                };
-                let size = if segments[i] == 0 {
-                    length.max(1)
-                } else {
-                    usize::from(segments[i])
-                };
-                let mut offset = 0;
-                loop {
-                    let end = (offset + size).min(length);
-                    out.push(Packet {
-                        target: self.target.clone(),
-                        payload: payload.slice(offset..end),
-                    });
-                    if end == length {
-                        break;
-                    }
-                    offset = end;
-                }
-            }
-            let datagrams = out.len() - before;
             // recvmmsg counts messages, while a GRO message contains many
             // datagrams. Bound the next turn by datagrams rather than aggregates.
             let messages = if count == self.batch {
@@ -140,6 +105,67 @@ impl PacketIo for Native {
                 return Poll::Ready(Ok(datagrams));
             }
         }
+    }
+}
+
+impl Native {
+    fn receive(
+        &self,
+        buffers: &mut Vec<Lease>,
+        out: &mut Vec<Packet>,
+    ) -> io::Result<(usize, usize)> {
+        debug_assert!((1..=32).contains(&self.batch));
+        while buffers.len() < self.batch {
+            buffers.push(self.pool.acquire(65536));
+        }
+        let buffers = &mut buffers[..self.batch];
+        let mut lengths = [0; 32];
+        #[cfg(target_os = "linux")]
+        let mut segments = [0; 32];
+        #[cfg(not(target_os = "linux"))]
+        let segments = [0; 32];
+        #[cfg(target_os = "linux")]
+        let count = self.socket.try_io(Interest::READABLE, || {
+            crate::udp_batch::receive(&self.socket, buffers, &mut lengths, &mut segments)
+        })?;
+        #[cfg(not(target_os = "linux"))]
+        let count = self.socket.try_recv(buffers[0].as_mut()).map(|n| {
+            lengths[0] = n;
+            1
+        })?;
+
+        let before = out.len();
+        for (i, buffer) in buffers.iter_mut().enumerate().take(count) {
+            let length = lengths[i];
+            if length == usize::MAX {
+                continue;
+            }
+            // Small datagrams copy once without returning receive scratch to the
+            // pool. Large/GRO messages transfer ownership and replace that slot.
+            let payload = if length >= 8192 {
+                std::mem::replace(buffer, self.pool.acquire(65536)).freeze(length)
+            } else {
+                self.pool.copy(&buffer.as_ref()[..length])
+            };
+            let size = if segments[i] == 0 {
+                length.max(1)
+            } else {
+                usize::from(segments[i])
+            };
+            let mut offset = 0;
+            loop {
+                let end = (offset + size).min(length);
+                out.push(Packet {
+                    target: self.target.clone(),
+                    payload: payload.slice(offset..end),
+                });
+                if end == length {
+                    break;
+                }
+                offset = end;
+            }
+        }
+        Ok((count, out.len() - before))
     }
 }
 
@@ -226,6 +252,49 @@ async fn drive(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shared_receive_scratch_preserves_retained_packets_across_sockets_and_sizes() {
+        let mut sockets = Vec::new();
+        for _ in 0..2 {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            socket.connect(peer.local_addr().unwrap()).await.unwrap();
+            peer.connect(socket.local_addr().unwrap()).await.unwrap();
+            sockets.push((
+                Native {
+                    socket,
+                    target: target(peer.local_addr().unwrap()),
+                    pool: Pool::shared(),
+                    batch: 32,
+                    #[cfg(target_os = "linux")]
+                    sender: crate::udp_batch::Sender::default(),
+                },
+                peer,
+            ));
+        }
+        let mut retained = Vec::new();
+        let mut expected = Vec::new();
+        for size in [0, 1, 1200, 8191, 8192, 60000, 1200] {
+            for (index, (native, peer)) in sockets.iter_mut().enumerate() {
+                let bytes = vec![(size % 251 + index) as u8; size];
+                peer.send(&bytes).await.unwrap();
+                assert_eq!(
+                    poll_fn(|cx| native.poll_recv(cx, &mut retained))
+                        .await
+                        .unwrap(),
+                    1
+                );
+                expected.push((native.target.clone(), bytes));
+            }
+        }
+        drop(sockets);
+        assert_eq!(retained.len(), expected.len());
+        for (packet, (target, bytes)) in retained.iter().zip(expected) {
+            assert_eq!(packet.target, target);
+            assert_eq!(packet.payload, bytes);
+        }
+    }
 
     #[tokio::test]
     async fn transfer_keeps_queued_replies_before_native_replies_and_closes_idle_io() {

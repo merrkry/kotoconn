@@ -1,4 +1,4 @@
-"""Measure verified TUN workloads in a private network namespace."""
+"""Measure verified TUN workloads in a Docker container."""
 
 import argparse
 import sys
@@ -15,6 +15,7 @@ from e2e.tun_support.environment import (
     command,
     configure_network,
     enter,
+    reserve_server_port,
     traffic,
 )
 from e2e.tun_support.measurement import (
@@ -104,6 +105,9 @@ def cases(args):
                         "bytes": 1048577,
                         "close_mode": "exchange",
                         "duration_ms": round(args.duration * 1000),
+                        "worker_threads": args.traffic_workers,
+                        "udp_echo_batch": args.udp_echo_batch,
+                        "udp_server_receive_buffer": args.udp_server_receive_buffer,
                         **spec,
                     },
                 )
@@ -131,6 +135,9 @@ def run(args):
             "repetitions": args.repetitions,
             "seed": args.seed,
             "daemon_cpus": args.daemon_cpus,
+            "traffic_workers": args.traffic_workers,
+            "udp_echo_batch": args.udp_echo_batch,
+            "udp_server_receive_buffer": args.udp_server_receive_buffer,
         },
         "runs": [],
     }
@@ -181,6 +188,12 @@ def run(args):
                                 cpus=args.daemon_cpus,
                             )
                         sample_spec = {**spec, "seed": args.seed + repetition}
+                        if spec.get("protocol") == "udp":
+                            # UDP has no FIN. Warmup associations retain outbound
+                            # ports until idle expiry; changing the destination
+                            # doubles that population and can exhaust Linux's
+                            # ephemeral range before measurement completes.
+                            sample_spec["port"] = reserve_server_port()
                         if args.warmup:
                             warmup = directory / "warmup"
                             warmup.mkdir()
@@ -262,6 +275,17 @@ def run(args):
     print(f"Results: {path}", flush=True)
 
 
+def add_traffic_arguments(parser):
+    parser.add_argument(
+        "--udp-server-receive-buffer",
+        type=int,
+        default=1048576,
+        help="echo SO_RCVBUF request in bytes; 0 inherits the host default",
+    )
+    parser.add_argument("--udp-echo-batch", type=int, choices=range(1, 33), default=32)
+    parser.add_argument("--traffic-workers", type=int, choices=range(1, 65), default=4)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     add_arguments(parser, release=True)
@@ -274,6 +298,7 @@ def main():
     parser.add_argument("--duration", type=float, default=3)
     parser.add_argument("--warmup", type=float, default=1)
     parser.add_argument("--repetitions", type=int, default=3)
+    add_traffic_arguments(parser)
     parser.add_argument(
         "--udp-rate", type=int, default=10000, help="offered datagrams/s per UDP flow"
     )
@@ -287,9 +312,6 @@ def main():
     args.traffic_binary = args.traffic_binary.resolve(strict=True)
     if args.sing_box:
         args.sing_box = args.sing_box.resolve(strict=True)
-        args.reference_version = command(str(args.sing_box), "version").stdout.strip()
-        if not args.reference_version.startswith("sing-box version 1.15."):
-            parser.error("the reference must be sing-box 1.15 with the go TUN stack")
     args.mtu = list(dict.fromkeys(args.mtu or [1500, 9000]))
     args.family = list(
         dict.fromkeys(args.family or ([4, 6] if args.profile == "full" else [4]))
@@ -299,9 +321,11 @@ def main():
         or args.warmup < 0
         or args.repetitions < 1
         or args.udp_rate < 1
+        or not 0 <= args.udp_server_receive_buffer <= 2147483647
     ):
         parser.error(
-            "duration must be >= 0.2s, warmup >= 0, repetitions and UDP rate positive"
+            "duration must be >= 0.2s, warmup >= 0, repetitions and UDP rate positive; "
+            "receive buffer must be in 0..2147483647"
         )
     selected = list(cases(args))
     if not selected:
@@ -317,6 +341,14 @@ def main():
             f"only {len(SERVER_PORTS)} are available; reduce repetitions or select fewer cases"
         )
     if not enter(args, Path(__file__).resolve(), "benchmarks"):
+        if args.sing_box:
+            args.reference_version = command(
+                str(args.sing_box), "version"
+            ).stdout.strip()
+            if not args.reference_version.startswith("sing-box version 1.15."):
+                parser.error(
+                    "the reference must be sing-box 1.15 with the go TUN stack"
+                )
         run(args)
 
 

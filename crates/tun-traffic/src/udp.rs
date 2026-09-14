@@ -19,9 +19,33 @@ use tokio::{
 pub async fn serve(
     args: Arc<Args>,
     mut stopping: oneshot::Receiver<()>,
-) -> Result<JoinHandle<Result<u64>>> {
+) -> Result<(JoinHandle<Result<u64>>, Option<u32>)> {
     let socket = UdpSocket::bind(SocketAddr::new(args.target, args.port)).await?;
-    Ok(tokio::spawn(async move {
+    #[cfg(target_os = "linux")]
+    let receive_buffer = Some(crate::udp_echo::receive_buffer(
+        &socket,
+        args.udp_server_receive_buffer,
+    )?);
+    #[cfg(not(target_os = "linux"))]
+    let receive_buffer = {
+        ensure!(
+            args.udp_server_receive_buffer == 0,
+            "SO_RCVBUF configuration requires Linux"
+        );
+        None
+    };
+
+    if args.udp_echo_batch > 1 {
+        #[cfg(target_os = "linux")]
+        return Ok((
+            crate::udp_echo::serve(socket, stopping, usize::from(args.udp_echo_batch)),
+            receive_buffer,
+        ));
+        #[cfg(not(target_os = "linux"))]
+        anyhow::bail!("batched UDP echo requires Linux");
+    }
+
+    let server = tokio::spawn(async move {
         let mut bytes = vec![0; 65536];
         let mut controls = 0;
         loop {
@@ -35,7 +59,8 @@ pub async fn serve(
                 }
             }
         }
-    }))
+    });
+    Ok((server, receive_buffer))
 }
 
 fn packet(args: &Args, flow: u64, sequence: u64, size: usize) -> Vec<u8> {

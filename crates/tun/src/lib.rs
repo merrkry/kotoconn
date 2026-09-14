@@ -1,5 +1,6 @@
 //! Linux TUN packet processing and worker-owned TCP connections.
 mod endpoint;
+mod fragments;
 mod linux;
 #[cfg(target_os = "linux")]
 mod offload;

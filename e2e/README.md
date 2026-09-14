@@ -27,23 +27,24 @@ in those logs to identify leftover Compose resources.
 When changing coverage, see [run.py](run.py) for scenarios and
 [traffic.py](traffic.py) for traffic assertions and sing-box limitations.
 
-Linux TUN tests run the real CLI against the kernel TCP/IP stack in a separate
-network namespace. They repeat single and concurrent TCP/UDP workloads at MTU 1500 and 9000,
+Linux TUN tests run the real CLI against the kernel TCP/IP stack in a Docker
+container with a private network. They repeat single and concurrent TCP/UDP workloads at MTU 1500 and 9000,
 including short connections, sparse activity, sustained transfers, mixed
-malformed input, half-close and device cleanup:
+malformed input, half-close and device cleanup.
+
+First [build the TUN binaries and runtime image](tun_support/README.md#real-network-e2e).
+Then run:
 
 ```sh
-cargo build -p kotoconn-cli -p kotoconn-tun-traffic
 python3 e2e/tun.py
 python3 e2e/tun.py --profile stress
 python3 e2e/tun_support/check_isolation.py
 ```
 
-This suite needs `unshare`, `iproute2`, and either unprivileged user namespaces or
-root. Every invocation creates a new network namespace and a unique artifact
-directory, including when `--output` is supplied. Concurrent workspaces can use
-the same interface name and ports without sharing devices. It does not change
-the parent network namespace. See
+This suite needs Docker and `/dev/net/tun`. Every invocation creates a new
+container and a unique artifact directory, including when `--output` is supplied.
+Containers have no external network or host D-Bus access. Concurrent workspaces
+can use the same interface name and ports without sharing devices. See
 [the TUN documentation](../crates/tun/README.md) for its supported protocol scope.
 
 See [TUN test responsibilities](tun_support/README.md) for coverage, scenario
@@ -51,6 +52,6 @@ selection, failure artifacts and the boundary between Rust tests, E2E and
 benchmarks. The stress profile adds MTU 1280/65535 and more connections and
 repetitions. It is available through the E2E workflow dispatch input as well.
 
-TUN E2E and benchmarks share namespace, process, packet-injection and measurement
+TUN E2E and benchmarks share container, process, packet-injection and measurement
 helpers in `tun_support/`. The runners choose their own workloads and pass/fail
 criteria.

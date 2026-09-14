@@ -1,15 +1,20 @@
-"""Run two TUN suites concurrently and verify the parent networking is unchanged."""
+"""Run two TUN containers concurrently and verify host networking is unchanged."""
 
 import argparse
 import json
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+# Allow the launcher's two 5-second client waits and 15-second container removal,
+# plus time for the runner to exit and the parent to observe completion.
+CLEANUP_TIMEOUT = 35
 
 
 def snapshot():
@@ -45,7 +50,15 @@ def snapshot():
             ("-6", "route", "show", "table", "all"),
         )
     ]
+    dns = None
+    if shutil.which("resolvectl"):
+        result = subprocess.run(
+            ["resolvectl", "status"], capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            dns = result.stdout
     return {
+        "dns": dns,
         "network": network,
         "sysctls": {
             name: Path(f"/proc/sys/net/ipv4/{name}").read_text()
@@ -62,12 +75,15 @@ def snapshot():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, default=ROOT / "target/debug/kotoconn")
+    parser.add_argument(
+        "--binary", type=Path, default=ROOT / "target/tun/debug/kotoconn"
+    )
     parser.add_argument(
         "--traffic-binary",
         type=Path,
-        default=ROOT / "target/debug/kotoconn-tun-traffic",
+        default=ROOT / "target/tun/debug/kotoconn-tun-traffic",
     )
+    parser.add_argument("--container-image", default="kotoconn-tun:local")
     args = parser.parse_args()
     base = ROOT / "target/e2e"
     base.mkdir(parents=True, exist_ok=True)
@@ -87,6 +103,8 @@ def main():
                     [
                         sys.executable,
                         str(ROOT / "e2e/tun.py"),
+                        "--container-image",
+                        args.container_image,
                         "--binary",
                         str(args.binary.resolve()),
                         "--traffic-binary",
@@ -124,19 +142,72 @@ def main():
             result["netns"] != parent and result["parent_netns"] == parent
             for result in results
         )
+        # CI uses a rootful engine with a different container UID. Artifacts
+        # must remain usable by the host runner, including in nested directories.
+        for output in directory.glob("tun-*"):
+            for path in output.rglob("*"):
+                assert os.access(path, os.R_OK | os.W_OK), (
+                    f"inaccessible artifact: {path}"
+                )
+                if path.is_dir():
+                    assert os.access(path, os.X_OK), f"inaccessible directory: {path}"
+        # Cancel a real started container and verify that it is removed, rather
+        # than merely observing the host-side Docker client exit.
+        cancel_output = directory / "cancelled"
+        log = (directory / "cancelled.log").open("w")
+        logs.append(log)
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                str(ROOT / "e2e/tun.py"),
+                "--binary",
+                str(args.binary.resolve()),
+                "--traffic-binary",
+                str(args.traffic_binary.resolve()),
+                "--container-image",
+                args.container_image,
+                "--output",
+                str(cancel_output),
+                "--case",
+                "mixed-malformed",
+            ],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+        children.append(child)
+        deadline = time.monotonic() + 15
+        while True:
+            cidfiles = list(cancel_output.glob("tun-*/container.cid"))
+            identifier = cidfiles[0].read_text().strip() if cidfiles else ""
+            if identifier:
+                break
+            if child.poll() is not None or time.monotonic() >= deadline:
+                raise RuntimeError(f"container did not start; see {log.name}")
+            time.sleep(0.01)
+        child.terminate()
+        assert child.wait(timeout=CLEANUP_TIMEOUT) != 0
+        assert (
+            subprocess.run(
+                ["docker", "container", "inspect", identifier],
+                capture_output=True,
+                timeout=10,
+            ).returncode
+            != 0
+        )
+
         after = snapshot()
         (directory / "parent-after.json").write_text(json.dumps(after, indent=2))
         assert after == before, (
-            "parent addresses, routes, rules or TCP settings changed"
+            "host addresses, routes, rules, TCP settings or DNS changed"
         )
         print(
-            f"PASS concurrent namespaces and unchanged parent networking: {directory}"
+            f"PASS concurrent containers, cancellation cleanup and unchanged host networking: {directory}"
         )
     finally:
         for child in children:
             if child.poll() is None:
                 child.send_signal(signal.SIGINT)
-                child.wait(timeout=15)
+                child.wait(timeout=CLEANUP_TIMEOUT)
         for log in logs:
             log.close()
 
