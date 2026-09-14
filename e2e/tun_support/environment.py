@@ -6,7 +6,6 @@ import itertools
 import json
 import os
 import queue
-import re
 import signal
 import subprocess
 import sys
@@ -130,7 +129,6 @@ def enter(args, script, category, *, sysctls=None):
     # independently selectable inside the same container CPU allowance.
     generator_cpus = ",".join(map(str, sorted(os.sched_getaffinity(0))))
     overrides = []
-    libraries = set()
     for option in ("binary", "traffic_binary", "sing_box"):
         binary = getattr(args, option, None)
         if binary is None:
@@ -139,12 +137,6 @@ def enter(args, script, category, *, sysctls=None):
         target = f"/inputs/{option}"
         argv += ["--mount", f"type=bind,source={binary},target={target},readonly"]
         overrides += ["--" + option.replace("_", "-"), target]
-        # Nix ELF binaries name their immutable loader and libraries by store
-        # path. Mount only those runtime packages, never /run or the host root.
-        linked = command("ldd", str(binary), check=False)
-        libraries.update(re.findall(r"/nix/store/[^/\s]+", linked.stdout))
-    for path in sorted(libraries):
-        argv += ["--mount", f"type=bind,source={path},target={path},readonly"]
     argv += [
         "--entrypoint",
         "taskset",
@@ -159,7 +151,7 @@ def enter(args, script, category, *, sysctls=None):
         "--output",
         "/artifacts",
     ]
-    metadata.update(command=argv, sysctls=settings, runtime_packages=sorted(libraries))
+    metadata.update(command=argv, sysctls=settings)
     (directory / "container.json").write_text(json.dumps(metadata, indent=2) + "\n")
     print(f"Artifacts: {directory}", flush=True)
     child = subprocess.Popen(argv, start_new_session=True)
@@ -505,12 +497,12 @@ def traffic(binary, daemon, directory, spec, *, inject=None):
 def add_arguments(parser, *, release=False):
     profile = "release" if release else "debug"
     parser.add_argument(
-        "--binary", type=Path, default=ROOT / "target" / profile / "kotoconn"
+        "--binary", type=Path, default=ROOT / "target/tun" / profile / "kotoconn"
     )
     parser.add_argument(
         "--traffic-binary",
         type=Path,
-        default=ROOT / "target" / profile / "kotoconn-tun-traffic",
+        default=ROOT / "target/tun" / profile / "kotoconn-tun-traffic",
     )
     parser.add_argument(
         "--output", type=Path, help="parent directory; each run gets a unique child"

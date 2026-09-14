@@ -1,11 +1,10 @@
 # Benchmarks
 
 The [TUN workload suite](tun/README.md) shares verified traffic generation and
-network isolation with the TUN E2E tests.
+network isolation with the TUN E2E tests. Build the container binaries and
+runtime image using the [setup instructions](tun/README.md), then run:
 
 ```sh
-cargo build --release -p kotoconn-cli -p kotoconn-tun-traffic
-docker build -f e2e/tun.Dockerfile -t kotoconn-tun:local .
 python3 benchmarks/run.py
 ```
 

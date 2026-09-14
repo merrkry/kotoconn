@@ -12,6 +12,9 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+# Allow the launcher's two 5-second client waits and 15-second container removal,
+# plus time for the runner to exit and the parent to observe completion.
+CLEANUP_TIMEOUT = 35
 
 
 def snapshot():
@@ -72,11 +75,13 @@ def snapshot():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, default=ROOT / "target/debug/kotoconn")
+    parser.add_argument(
+        "--binary", type=Path, default=ROOT / "target/tun/debug/kotoconn"
+    )
     parser.add_argument(
         "--traffic-binary",
         type=Path,
-        default=ROOT / "target/debug/kotoconn-tun-traffic",
+        default=ROOT / "target/tun/debug/kotoconn-tun-traffic",
     )
     parser.add_argument("--container-image", default="kotoconn-tun:local")
     args = parser.parse_args()
@@ -180,7 +185,7 @@ def main():
                 raise RuntimeError(f"container did not start; see {log.name}")
             time.sleep(0.01)
         child.terminate()
-        assert child.wait(timeout=15) != 0
+        assert child.wait(timeout=CLEANUP_TIMEOUT) != 0
         assert (
             subprocess.run(
                 ["docker", "container", "inspect", identifier],
@@ -202,7 +207,7 @@ def main():
         for child in children:
             if child.poll() is None:
                 child.send_signal(signal.SIGINT)
-                child.wait(timeout=15)
+                child.wait(timeout=CLEANUP_TIMEOUT)
         for log in logs:
             log.close()
 

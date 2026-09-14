@@ -64,8 +64,26 @@ proxy. Linux sockets provide its real transport peer. The optional sing-box
 
 ## Real-network E2E
 
+Build the binaries in Docker and copy them out without starting the image.
+This uses the same Debian runtime as CI, independently of the host toolchain:
+
 ```sh
-cargo build -p kotoconn-cli -p kotoconn-tun-traffic
+docker build -f e2e/Dockerfile -t kotoconn-e2e:local .
+mkdir -p target/tun/debug
+(
+    tun_build=$(docker create kotoconn-e2e:local)
+    trap 'docker rm -f "$tun_build"' EXIT
+    docker cp "$tun_build:/usr/local/bin/kotoconn" target/tun/debug/kotoconn
+    docker cp "$tun_build:/usr/local/bin/kotoconn-tun-traffic" target/tun/debug/kotoconn-tun-traffic
+)
+docker build -f e2e/tun.Dockerfile -t kotoconn-tun:local .
+```
+
+Rebuild and copy the binaries after code changes. The TUN E2E runners default
+to `target/tun/debug/`, separate from host Cargo artifacts. Use `--binary` and
+`--traffic-binary` to select other binaries compatible with Debian Bookworm.
+
+```sh
 python3 e2e/tun.py
 python3 e2e/tun.py --profile stress
 python3 e2e/tun.py --case mixed-malformed --mtu 9000 --family 6 --repeat 8 --seed 23
@@ -73,9 +91,9 @@ python3 e2e/tun.py --case generic-relay
 python3 e2e/tun_support/check_isolation.py
 ```
 
-For optimized-code verification, build with `cargo build --release -p kotoconn-cli
--p kotoconn-tun-traffic` and pass `--binary target/release/kotoconn
---traffic-binary target/release/kotoconn-tun-traffic` to the stress command.
+For optimized-code verification, follow the [release build instructions](../../benchmarks/tun/README.md)
+and pass `--binary target/tun/release/kotoconn
+--traffic-binary target/tun/release/kotoconn-tun-traffic` to the stress command.
 
 The quick profile repeats 18 workload recipes twice at MTU 1500 and 9000 over
 IPv4 and IPv6. It covers one and four connections, persistent TCP transfers,
@@ -121,14 +139,6 @@ path is being exercised.
 
 ## Isolation and artifacts
 
-Build the runtime once, then use the same Python entry points:
-
-```sh
-docker build -f e2e/tun.Dockerfile -t kotoconn-tun:local .
-python3 e2e/tun.py
-python3 e2e/tun_support/check_isolation.py
-```
-
 Each invocation starts a Docker container with `--network none`, a read-only
 root, NET_ADMIN, NET_RAW and `/dev/net/tun`. No host network, D-Bus socket,
 `/run` directory or container-engine socket is mounted. Network setup refuses
@@ -139,8 +149,8 @@ Source and binaries are mounted read-only, with only this run's unique
 artifact directory writable. That directory inherits its host group, and the
 container joins that group. Group write permissions keep nested results usable
 by both the host runner and rootful Docker without filesystem override capabilities.
-Nix ELF binaries mount their immutable loader
-and library packages read-only; other binaries need a compatible Debian ABI.
+The launcher does not inspect or mount host runtime libraries. Supplied binaries
+execute only inside the container, including reference version checks.
 The launcher records the host source revision and image ID before starting,
 so the container does not need access to a worktree's external Git directory.
 Docker applies the test sysctls only to the container network. Source

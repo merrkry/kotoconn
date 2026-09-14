@@ -26,15 +26,19 @@ ICMP echo forwarding, multicast, source routing, IPsec and unsupported IPv6 exte
 
 For queue ownership, TCP scheduling and shutdown, see [ADR 0009](../../docs/adr/0009-independent-tun-connection-drivers.md). For overload behavior, adaptive queues and packet storage, see [TUN buffering](../../docs/tun-buffering.md).
 
-Run the protocol tests and isolated Linux E2E tests with:
+Run the protocol tests with:
 
 ```sh
 cargo test -p kotoconn-tun
-cargo build -p kotoconn-cli -p kotoconn-tun-traffic
-python3 e2e/tun.py
 ```
 
-The E2E runner creates a network namespace, exercises the real CLI against Linux TCP/UDP sockets, injects malformed IP packets, and checks graceful and forced shutdown. It needs `unshare`, `iproute2`, and either unprivileged user namespaces or root. Each invocation owns a new network namespace and artifact directory, so workspaces can run concurrently. See [TUN test responsibilities](../../e2e/tun_support/README.md) for the quick/stress profiles, deterministic tests, mixed malformed traffic and isolation checks.
+For Linux E2E tests, [build the container binaries and runtime image](../../e2e/tun_support/README.md#real-network-e2e), then run `python3 e2e/tun.py`.
+The runner exercises the real CLI against Linux TCP/UDP sockets, injects malformed
+IP packets, and checks graceful and forced shutdown. It needs Docker and
+`/dev/net/tun`. Each invocation owns a container with a private network and a
+unique artifact directory. It has no host network or D-Bus access. See
+[TUN test responsibilities](../../e2e/tun_support/README.md) for the quick/stress
+profiles, deterministic tests, mixed malformed traffic and isolation checks.
 
 ## smoltcp fork
 

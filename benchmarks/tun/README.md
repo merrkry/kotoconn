@@ -1,25 +1,39 @@
 # TUN workloads
 
-Build the candidate and the shared traffic tool, then run from the repository root:
+Build release binaries in Docker, copy them out without starting the image,
+and build the TUN runtime. Run from the repository root:
 
 ```sh
-cargo build --release -p kotoconn-cli -p kotoconn-tun-traffic
+docker build -f e2e/Dockerfile --build-arg CARGO_PROFILE=release -t kotoconn-bench:local .
+mkdir -p target/tun/release
+(
+    tun_build=$(docker create kotoconn-bench:local)
+    trap 'docker rm -f "$tun_build"' EXIT
+    docker cp "$tun_build:/usr/local/bin/kotoconn" target/tun/release/kotoconn
+    docker cp "$tun_build:/usr/local/bin/kotoconn-tun-traffic" target/tun/release/kotoconn-tun-traffic
+)
 docker build -f e2e/tun.Dockerfile -t kotoconn-tun:local .
+```
+
+Rebuild and copy the binaries after code changes. They are separate from host
+Cargo artifacts. The benchmark defaults to `target/tun/release/`; use `--binary`
+and `--traffic-binary` to select other binaries compatible with Debian Bookworm.
+
+```sh
 python3 benchmarks/run.py
 python3 benchmarks/run.py --profile full
 python3 benchmarks/check_udp_churn.py
 ```
 
-The runner needs Linux, Python 3.10+, Docker, `ldd`, and `/dev/net/tun`.
+The runner needs Linux, Python 3.10+, Docker, and `/dev/net/tun`.
 It starts one container per invocation, with no external network, published
 ports, host D-Bus or host network access. The container receives only NET_ADMIN,
 NET_RAW and the TUN device. It does not use `unshare` or require host root.
 The runtime image is built explicitly; `--container-image` selects its tag.
 
 Each run gets a unique child of `target/benchmarks/`, or of `--output`, mounted
-writable as `/artifacts`. Source and selected binaries are read-only. Nix-built
-binaries also mount their immutable runtime library packages read-only; other
-binaries must be compatible with the image's Debian runtime. The container's
+writable as `/artifacts`. Source and selected binaries are read-only. All binaries
+execute inside the container, including the reference version check. The container's
 ID, image ID, command, source revision and settings are recorded in
 `container.json`. Cancellation removes only that run's container.
 Source-address routing

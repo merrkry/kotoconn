@@ -30,11 +30,12 @@ When changing coverage, see [run.py](run.py) for scenarios and
 Linux TUN tests run the real CLI against the kernel TCP/IP stack in a Docker
 container with a private network. They repeat single and concurrent TCP/UDP workloads at MTU 1500 and 9000,
 including short connections, sparse activity, sustained transfers, mixed
-malformed input, half-close and device cleanup:
+malformed input, half-close and device cleanup.
+
+First [build the TUN binaries and runtime image](tun_support/README.md#real-network-e2e).
+Then run:
 
 ```sh
-cargo build -p kotoconn-cli -p kotoconn-tun-traffic
-docker build -f e2e/tun.Dockerfile -t kotoconn-tun:local .
 python3 e2e/tun.py
 python3 e2e/tun.py --profile stress
 python3 e2e/tun_support/check_isolation.py

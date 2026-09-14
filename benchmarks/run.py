@@ -312,9 +312,6 @@ def main():
     args.traffic_binary = args.traffic_binary.resolve(strict=True)
     if args.sing_box:
         args.sing_box = args.sing_box.resolve(strict=True)
-        args.reference_version = command(str(args.sing_box), "version").stdout.strip()
-        if not args.reference_version.startswith("sing-box version 1.15."):
-            parser.error("the reference must be sing-box 1.15 with the go TUN stack")
     args.mtu = list(dict.fromkeys(args.mtu or [1500, 9000]))
     args.family = list(
         dict.fromkeys(args.family or ([4, 6] if args.profile == "full" else [4]))
@@ -344,6 +341,14 @@ def main():
             f"only {len(SERVER_PORTS)} are available; reduce repetitions or select fewer cases"
         )
     if not enter(args, Path(__file__).resolve(), "benchmarks"):
+        if args.sing_box:
+            args.reference_version = command(
+                str(args.sing_box), "version"
+            ).stdout.strip()
+            if not args.reference_version.startswith("sing-box version 1.15."):
+                parser.error(
+                    "the reference must be sing-box 1.15 with the go TUN stack"
+                )
         run(args)
 
 
