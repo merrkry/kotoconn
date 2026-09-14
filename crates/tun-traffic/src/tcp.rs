@@ -1,5 +1,5 @@
 use crate::{
-    Args, Direction, Workload, payload,
+    Args, CloseMode, Direction, Workload, payload,
     stats::{Stats, record},
 };
 use anyhow::{Result, ensure};
@@ -83,6 +83,9 @@ async fn respond(stream: TcpStream, seed: u64) -> Result<()> {
     loop {
         let mut opcode = [0];
         if reader.read(&mut opcode).await? == 0 {
+            break;
+        }
+        if opcode[0] == 3 {
             break;
         }
         ensure!(opcode[0] <= 2, "unknown TCP operation");
@@ -186,10 +189,15 @@ pub async fn run(args: &Args, flow: u64) -> Result<Stats> {
                 break;
             }
         }
-        writer.shutdown().await?;
+        if args.close_mode == CloseMode::HalfClose {
+            writer.shutdown().await?;
+        } else {
+            writer.write_u8(3).await?;
+        }
         let mut trailer = Vec::new();
         reader.read_to_end(&mut trailer).await?;
         ensure!(trailer == TRAILER, "half-close lost trailer or added bytes");
+        writer.shutdown().await?;
         if !args.more(sequence, started) {
             break;
         }

@@ -37,6 +37,12 @@ enum Direction {
     Duplex,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CloseMode {
+    HalfClose,
+    Exchange,
+}
+
 #[derive(Clone, Parser)]
 struct Args {
     #[arg(long)]
@@ -51,6 +57,9 @@ struct Args {
     workload: Workload,
     #[arg(long, value_enum, default_value = "duplex")]
     direction: Direction,
+    /// E2E checks replies after FIN; comparisons can finish their protocol before FIN.
+    #[arg(long, value_enum, default_value = "half-close")]
+    close_mode: CloseMode,
     #[arg(long, default_value_t = 1)]
     connections: usize,
     #[arg(long, default_value_t = 8)]
