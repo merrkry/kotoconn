@@ -219,6 +219,58 @@ fn udp_offload_encodes_a_computed_zero_checksum_as_all_ones() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn udp_output_views_segment_into_valid_wire_datagrams() {
+    for ipv6 in [false, true] {
+        let flow = flow(ipv6);
+        let mut encoder = udp::Encoder::new(1500);
+        let size = 1232;
+        let payload: Vec<_> = (0..3).flat_map(|i| vec![i; size]).collect();
+        let header = encoder
+            .header(flow.source, flow.destination, size, payload.len())
+            .unwrap();
+        let mut aggregate = header.to_vec();
+        aggregate.extend_from_slice(&payload);
+        let metadata = tun_rs::VirtioNetHdr {
+            flags: 1,
+            gso_type: tun_rs::VIRTIO_NET_HDR_GSO_UDP_L4,
+            hdr_len: header.len() as u16,
+            gso_size: size as u16,
+            csum_start: if ipv6 { 40 } else { 20 },
+            csum_offset: 6,
+        };
+        let mut packets = vec![vec![0; 1500]; 3];
+        let mut lengths = [0; 3];
+        assert_eq!(
+            tun_rs::gso_split(
+                &mut aggregate,
+                metadata,
+                &mut packets,
+                &mut lengths,
+                0,
+                ipv6
+            )
+            .unwrap(),
+            3
+        );
+        for (i, packet) in packets.iter().enumerate() {
+            let packet = decoded(&packet[..lengths[i]]);
+            let (actual, data) = packet.udp().unwrap();
+            assert_eq!(actual, flow);
+            assert_eq!(data, vec![i as u8; size]);
+        }
+        assert!(!encoder.can_offload(flow.source, flow.destination, 4096));
+        assert!(
+            encoder
+                .encode(flow.source, flow.destination, &[0; 4096])
+                .unwrap()
+                .len()
+                > 1
+        );
+    }
+}
+
 #[test]
 fn udp_roundtrips_empty_and_fragmented_datagrams_in_both_families() {
     for ipv6 in [false, true] {

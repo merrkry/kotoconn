@@ -20,8 +20,6 @@ pub(crate) struct Receiver {
 
 pub(crate) struct Sender {
     device: Arc<AsyncDevice>,
-    gro: tun_rs::GROTable,
-    buffers: Vec<Vec<u8>>,
 }
 
 pub(super) fn tcp_gso_header(
@@ -59,11 +57,7 @@ fn split(device: AsyncDevice) -> (Receiver, Sender) {
         Receiver {
             device: device.clone(),
         },
-        Sender {
-            device,
-            gro: tun_rs::GROTable::default(),
-            buffers: Vec::new(),
-        },
+        Sender { device },
     )
 }
 
@@ -134,6 +128,38 @@ impl PacketSend for Sender {
         self.device.tcp_gso()
     }
 
+    fn udp_gso(&self) -> bool {
+        self.device.udp_gso()
+    }
+
+    async fn send_udp_segments(
+        &mut self,
+        header: &[u8],
+        payload: &[Bytes],
+        size: u16,
+    ) -> io::Result<()> {
+        let ip_len = match header.first().map(|b| b >> 4) {
+            Some(4) => 20,
+            Some(6) => 40,
+            _ => return Err(invalid("invalid UDP IP version")),
+        };
+        let mut virtio = [0; VIRTIO_NET_HDR_LEN];
+        VirtioNetHdr {
+            flags: 1,
+            gso_type: if payload.len() > 1 {
+                VIRTIO_NET_HDR_GSO_UDP_L4
+            } else {
+                0
+            },
+            hdr_len: ip_len + 8,
+            gso_size: if payload.len() > 1 { size } else { 0 },
+            csum_start: ip_len,
+            csum_offset: 6,
+        }
+        .encode(&mut virtio)?;
+        send_vectors(&self.device, &virtio, header, payload).await
+    }
+
     async fn send_tcp_gso(&mut self, packet: &[u8], segment_size: u16) -> io::Result<()> {
         let header = tcp_gso_header(packet, segment_size)?;
         let len = loop {
@@ -159,51 +185,7 @@ impl PacketSend for Sender {
         segment_size: u16,
     ) -> io::Result<()> {
         let virtio = tcp_gso_header(header, segment_size)?;
-        let mut vectors = Vec::with_capacity(payload.len() + 2);
-        vectors.push(IoSlice::new(&virtio));
-        vectors.push(IoSlice::new(header));
-        vectors.extend(payload.iter().map(|part| IoSlice::new(part)));
-        loop {
-            std::future::poll_fn(|cx| self.device.poll_writable(cx)).await?;
-            match self.device.try_send_vectored(&vectors) {
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                result => {
-                    let n = result?;
-                    if n != vectors.iter().map(|v| v.len()).sum::<usize>() {
-                        return Err(invalid("partial TUN GSO write"));
-                    }
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    async fn send_batch(&mut self, packets: &[Bytes]) -> io::Result<()> {
-        let offset = if self.device.tcp_gso() {
-            VIRTIO_NET_HDR_LEN
-        } else {
-            0
-        };
-        // GRO needs room to combine complete IP packets. This reusable scratch
-        // pool belongs to this writer, independently of queued packet storage.
-        while self.buffers.len() < packets.len().min(64) {
-            self.buffers
-                .push(Vec::with_capacity(MAX_IP_PACKET + 2 * VIRTIO_NET_HDR_LEN));
-        }
-
-        // SAFETY: The pool was grown to hold each bounded batch.
-        debug_assert!(self.buffers.len() >= packets.len().min(64));
-        for chunk in packets.chunks(64) {
-            for (buffer, packet) in self.buffers.iter_mut().zip(chunk) {
-                buffer.clear();
-                buffer.resize(offset, 0);
-                buffer.extend_from_slice(packet);
-            }
-            self.device
-                .send_multiple(&mut self.gro, &mut self.buffers[..chunk.len()], offset)
-                .await?;
-        }
-        Ok(())
+        send_vectors(&self.device, &virtio, header, payload).await
     }
 
     fn poll_send(&mut self, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
@@ -224,6 +206,35 @@ impl PacketSend for Sender {
                             .ok_or_else(|| invalid("short virtio write"))
                     }));
                 }
+            }
+        }
+    }
+}
+
+async fn send_vectors(
+    device: &AsyncDevice,
+    virtio: &[u8],
+    header: &[u8],
+    payload: &[Bytes],
+) -> io::Result<()> {
+    // TCP bounds its descriptor count at 64; the endpoint does the same for UDP.
+    debug_assert!(payload.len() <= 64);
+    let mut vectors = [IoSlice::new(&[]); 66];
+    vectors[0] = IoSlice::new(virtio);
+    vectors[1] = IoSlice::new(header);
+    for (out, part) in vectors[2..].iter_mut().zip(payload) {
+        *out = IoSlice::new(part);
+    }
+    let vectors = &vectors[..payload.len() + 2];
+    loop {
+        std::future::poll_fn(|cx| device.poll_writable(cx)).await?;
+        match device.try_send_vectored(vectors) {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            result => {
+                if result? != vectors.iter().map(|v| v.len()).sum::<usize>() {
+                    return Err(invalid("partial TUN offload write"));
+                }
+                return Ok(());
             }
         }
     }

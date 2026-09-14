@@ -48,6 +48,55 @@ impl Encoder {
         }
     }
 
+    pub fn can_offload(&self, source: SocketAddr, destination: SocketAddr, size: usize) -> bool {
+        source.is_ipv4() == destination.is_ipv4()
+            && source.port() != 0
+            && size + if source.is_ipv4() { 28 } else { 48 } <= self.mtu
+    }
+
+    /// Header for a checksum-offloaded UDP aggregate. Individual datagrams must
+    /// fit the link MTU; IP fragmentation remains the ordinary encoder's job.
+    pub fn header(
+        &mut self,
+        source: SocketAddr,
+        destination: SocketAddr,
+        size: usize,
+        total: usize,
+    ) -> Option<Bytes> {
+        let ip_len = if source.is_ipv4() { 20 } else { 40 };
+        if !self.can_offload(source, destination, size)
+            || total > if source.is_ipv4() { 65507 } else { 65527 }
+        {
+            return None;
+        }
+        let ip = IpRepr::new(
+            source.ip().into(),
+            destination.ip().into(),
+            IpProtocol::Udp,
+            8 + total,
+            64,
+        );
+        Some(
+            self.arena
+                .encode(ip_len + 8, |bytes| {
+                    ip.emit(&mut bytes[..ip_len], &ChecksumCapabilities::default());
+                    // SAFETY: The arena allocated both fixed headers; the checks above
+                    // bound the aggregate's UDP length and preserve address families.
+                    let mut udp = UdpPacket::new_unchecked(&mut bytes[ip_len..]);
+                    udp.set_src_port(source.port());
+                    udp.set_dst_port(destination.port());
+                    udp.set_len((8 + total) as u16);
+                    udp.set_checksum(checksum::pseudo_header(
+                        &ip.src_addr(),
+                        &ip.dst_addr(),
+                        IpProtocol::Udp,
+                        (8 + total) as u32,
+                    ));
+                })
+                .1,
+        )
+    }
+
     pub fn encode(
         &mut self,
         source: SocketAddr,
