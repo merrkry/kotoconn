@@ -3,18 +3,26 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "bindings": "pnpm --filter @kotoconn/bindings run generate",
-    "build": "pnpm -r run build",
-    "format": "oxfmt packages package.json pnpm-workspace.yaml tsconfig.json .oxfmtrc.json .oxlintrc.json",
-    "format:check": "oxfmt --check packages package.json pnpm-workspace.yaml tsconfig.json .oxfmtrc.json .oxlintrc.json",
-    "lint": "oxlint packages",
-    "typecheck": "pnpm run bindings && pnpm -r run typecheck",
-    "test": "pnpm -r --if-present run test",
-    "check": "pnpm run format:check && pnpm run lint && pnpm run build && pnpm -r run typecheck && pnpm run test"
+    "build": "nx run workspace:build",
+    "format": "nx run workspace:format",
+    "format:check": "nx run workspace:format-check",
+    "lint": "nx run workspace:lint",
+    "typecheck": "nx run workspace:typecheck",
+    "test": "nx run workspace:test",
+    "check": "nx run workspace:check",
+    "bindings": "nx run @kotoconn/bindings:generate"
   },
   "devDependencies": {
+    "nx": "^23.2.1",
     "oxfmt": "^0.66.0",
     "oxlint": "^1.81.0",
     "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "packageManager": "pnpm@11.25.0",
+  "nx": {
+    "includedScripts": []
   }
 }

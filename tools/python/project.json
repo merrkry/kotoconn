@@ -1,0 +1,45 @@
+{
+  "name": "python",
+  "targets": {
+    "sync": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "uv sync --locked"
+      }
+    },
+    "format": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "uv run --locked ruff format"
+      }
+    },
+    "format-check": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "uv run --locked ruff format --check"
+      },
+      "inputs": ["python"]
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "uv run --locked ruff check"
+      },
+      "inputs": ["python"]
+    },
+    "typecheck": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "uv run --locked pyrefly check"
+      },
+      "inputs": ["python"]
+    },
+    "check": {
+      "executor": "nx:noop",
+      "dependsOn": ["format-check", "lint", "typecheck"]
+    }
+  },
+  "namedInputs": {
+    "default": ["{projectRoot}/**/*", "pythonSources", "sharedGlobals"]
+  }
+}

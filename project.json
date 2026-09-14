@@ -1,0 +1,122 @@
+{
+  "name": "workspace",
+  "targets": {
+    "build": {
+      "executor": "nx:noop",
+      "dependsOn": [
+        {
+          "projects": ["rust"],
+          "target": "build",
+          "params": "ignore"
+        },
+        {
+          "projects": ["@kotoconn/api"],
+          "target": "build",
+          "params": "ignore"
+        }
+      ]
+    },
+    "format": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "oxfmt packages tools *.json pnpm-workspace.yaml .oxfmtrc.json .oxlintrc.json crates/project.json e2e/project.json benchmarks/project.json .github"
+      }
+    },
+    "format-check": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "oxfmt --check packages tools *.json pnpm-workspace.yaml .oxfmtrc.json .oxlintrc.json crates/project.json e2e/project.json benchmarks/project.json .github"
+      }
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "oxlint packages tools"
+      }
+    },
+    "typecheck": {
+      "executor": "nx:noop",
+      "dependsOn": [
+        {
+          "projects": ["@kotoconn/api"],
+          "target": "typecheck",
+          "params": "ignore"
+        },
+        {
+          "projects": ["@kotoconn/bindings"],
+          "target": "typecheck",
+          "params": "ignore"
+        }
+      ]
+    },
+    "test": {
+      "executor": "nx:noop",
+      "dependsOn": [
+        {
+          "projects": ["@kotoconn/bindings"],
+          "target": "test",
+          "params": "ignore"
+        }
+      ]
+    },
+    "check": {
+      "executor": "nx:noop",
+      "dependsOn": [
+        "format-check",
+        "lint",
+        "typecheck",
+        "test",
+        {
+          "projects": ["@kotoconn/api"],
+          "target": "build",
+          "params": "ignore"
+        }
+      ]
+    },
+    "verify": {
+      "executor": "nx:noop",
+      "dependsOn": [
+        "check",
+        {
+          "projects": ["rust"],
+          "target": "check",
+          "params": "ignore"
+        },
+        {
+          "projects": ["python"],
+          "target": "check",
+          "params": "ignore"
+        },
+        "task-test"
+      ]
+    },
+    "setup": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "uv sync --locked"
+      }
+    },
+    "ci": {
+      "executor": "nx:noop",
+      "dependsOn": [
+        "verify",
+        {
+          "projects": ["e2e"],
+          "target": "check",
+          "params": "ignore"
+        },
+        {
+          "projects": ["benchmarks"],
+          "target": "check",
+          "params": "ignore"
+        }
+      ]
+    },
+    "task-test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "node --test tools/tests/tasks.test.mjs"
+      }
+    }
+  }
+}

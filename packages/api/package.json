@@ -8,11 +8,10 @@
       "import": "./dist/index.js"
     }
   },
-  "scripts": {
-    "build": "tsc",
-    "typecheck": "tsc --noEmit && tsc -p examples/tsconfig.json"
-  },
   "dependencies": {
     "@kotoconn/bindings": "workspace:*"
+  },
+  "nx": {
+    "includedScripts": []
   }
 }
