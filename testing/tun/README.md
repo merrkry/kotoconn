@@ -149,7 +149,7 @@ searches for or deletes another run's resources.
 
 `check_isolation.py` runs two suites concurrently with different working
 directories and the same artifact parent. It verifies distinct namespace IDs
-and compares the parent's addresses, rules and routes before and after. DHCP
+and compares the parent's addresses, rules, routes and TCP settings before and after. DHCP
 and router-advertisement countdown fields are excluded from that comparison.
 Use `--daemon-cpus` to select one available CPU when exercising a single worker;
 the default affinity includes up to two already available CPUs. Affinity does

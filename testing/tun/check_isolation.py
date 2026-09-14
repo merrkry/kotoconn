@@ -25,7 +25,7 @@ def snapshot():
             return [stable(item) for item in value]
         return value
 
-    return [
+    network = [
         stable(
             json.loads(
                 subprocess.run(
@@ -45,6 +45,19 @@ def snapshot():
             ("-6", "route", "show", "table", "all"),
         )
     ]
+    return {
+        "network": network,
+        "sysctls": {
+            name: Path(f"/proc/sys/net/ipv4/{name}").read_text()
+            for name in (
+                "conf/all/rp_filter",
+                "conf/all/accept_local",
+                "tcp_tw_reuse",
+                "ip_local_port_range",
+                "ip_local_reserved_ports",
+            )
+        },
+    }
 
 
 def main():
@@ -112,7 +125,9 @@ def main():
         )
         after = snapshot()
         (directory / "parent-after.json").write_text(json.dumps(after, indent=2))
-        assert after == before, "parent addresses, routes or rules changed"
+        assert after == before, (
+            "parent addresses, routes, rules or TCP settings changed"
+        )
         print(
             f"PASS concurrent namespaces and unchanged parent networking: {directory}"
         )
