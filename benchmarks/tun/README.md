@@ -116,6 +116,9 @@ Reference binaries are supplied by the caller, never downloaded or rebuilt
 implicitly. Omitting `--sing-box` runs only Kotoconn.
 
 Both implementations receive the same addresses, MTU, payload seed and workload.
+The reference runs only clean traffic. `mixed-malformed` measures Kotoconn alone;
+`mixed-clean` in the full profile compares the same flow mix without injection.
+This keeps differences in malformed-input policy out of performance comparisons.
 Their order alternates between repetitions. Raw samples and medians remain
 available; no fixed performance threshold fails shared CI. Once measurement
 and payload validation complete, the reference process is killed and its TUN

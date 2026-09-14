@@ -130,6 +130,7 @@ def run(args):
     }
     if args.sing_box:
         result["metadata"]["reference_version"] = args.reference_version
+        result["metadata"]["reference_scope"] = "clean traffic only"
         result["metadata"]["reference_cleanup"] = (
             "process killed after verified measurement"
         )
@@ -140,6 +141,10 @@ def run(args):
                 # Alternate order within each pair; every sample starts a fresh daemon.
                 order = names if repetition % 2 == 0 else list(reversed(names))
                 for implementation in order:
+                    # Malformed-input policy belongs to Kotoconn's tests. Compare
+                    # the same flow mix without raw injection in mixed-clean.
+                    if implementation == "sing-box-go" and name == "mixed-malformed":
+                        continue
                     directory = args.output / f"{case_id}-{repetition}-{implementation}"
                     directory.mkdir()
                     entry = {
