@@ -17,22 +17,19 @@
       "executor": "nx:run-commands",
       "options": {
         "command": "uv run --locked ruff format --check"
-      },
-      "inputs": ["python"]
+      }
     },
     "lint": {
       "executor": "nx:run-commands",
       "options": {
         "command": "uv run --locked ruff check"
-      },
-      "inputs": ["python"]
+      }
     },
     "typecheck": {
       "executor": "nx:run-commands",
       "options": {
         "command": "uv run --locked pyrefly check"
-      },
-      "inputs": ["python"]
+      }
     },
     "check": {
       "executor": "nx:noop",

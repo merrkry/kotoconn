@@ -17,8 +17,7 @@
       "executor": "nx:run-commands",
       "options": {
         "command": "cargo-zigbuild run --target-dir target --target ${KOTOCONN_RUST_TARGET:-x86_64-unknown-linux-gnu.2.36} --locked -p kotoconn-cli --"
-      },
-      "dependsOn": ["build"]
+      }
     },
     "format": {
       "executor": "nx:run-commands",
@@ -60,6 +59,6 @@
     }
   },
   "namedInputs": {
-    "default": ["{projectRoot}/**/*", "rustSources", "sharedGlobals"]
+    "default": ["rustSources", "sharedGlobals"]
   }
 }

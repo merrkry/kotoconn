@@ -21,7 +21,7 @@
     "typecheck": {
       "executor": "nx:run-commands",
       "options": {
-        "command": "tsc -p packages/api/tsconfig.json --noEmit && tsc -p packages/api/examples/tsconfig.json"
+        "command": "tsc -p packages/api/examples/tsconfig.json"
       },
       "dependsOn": ["build"],
       "cache": true,

@@ -24,9 +24,6 @@
         "env": "RUSTFLAGS"
       },
       {
-        "env": "CARGO_BUILD_TARGET"
-      },
-      {
         "runtime": "git -C external/smoltcp rev-parse HEAD"
       },
       {
@@ -37,22 +34,16 @@
       },
       {
         "runtime": "zig version"
-      }
-    ],
-    "python": [
-      "pythonSources",
+      },
       {
-        "runtime": "uv run --locked python --version"
+        "env": "CARGO_ENCODED_RUSTFLAGS"
       }
     ],
     "rustSources": [
       "{workspaceRoot}/Cargo.toml",
       "{workspaceRoot}/Cargo.lock",
-      "{workspaceRoot}/mise.toml",
       "{workspaceRoot}/crates/**/*",
-      "{workspaceRoot}/external/smoltcp/**/*",
-      "{workspaceRoot}/pyproject.toml",
-      "{workspaceRoot}/uv.lock"
+      "{workspaceRoot}/external/smoltcp/**/*"
     ],
     "pythonSources": [
       "{workspaceRoot}/e2e/**/*.py",

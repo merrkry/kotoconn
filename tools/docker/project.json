@@ -40,7 +40,6 @@
   "namedInputs": {
     "default": [
       "{projectRoot}/**/*",
-      "rustSources",
       "sharedGlobals",
       "{workspaceRoot}/docker-bake.hcl",
       "{workspaceRoot}/.dockerignore",

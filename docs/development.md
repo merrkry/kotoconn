@@ -19,8 +19,8 @@ mise exec -- pnpm exec nx run workspace:verify
 
 `mise.toml` pins Node, pnpm, uv, Rust/Cargo, cargo-zigbuild and Zig. mise installs
 native tools; uv manages Python 3.14 and the Ruff/Pyrefly environment in `.venv`
-using `.python-version`, `pyproject.toml` and `uv.lock`. `workspace:setup` runs
-`uv sync --locked`. Subsequent examples assume a
+using `.python-version`, `pyproject.toml` and `uv.lock`. `workspace:setup` delegates
+to `python:sync`, which runs `uv sync --locked`. Subsequent examples assume a
 [mise-activated shell](https://mise.jdx.dev/dev-tools/); otherwise prefix each
 command with `mise exec --`.
 
@@ -98,7 +98,8 @@ tracks crate dependencies and features within its workspace.
 Nx caches generated declarations and TypeScript compilation/checks. Their inputs
 include Rust sources, manifests, the smoltcp revision, compiler identity,
 the cargo-zigbuild/Zig versions, selected target, TypeScript configuration and
-the mise configuration and lockfiles. Generated declarations and API
+the mise configuration and native/TypeScript lockfiles. Python dependency
+changes affect Python checks rather than Rust binding generation. Generated declarations and API
 `dist` files are declared outputs, so deleting them is repaired by cache restore.
 Cargo keeps its own incremental artifacts under `target`; Nx always invokes
 cargo-zigbuild for builds, Clippy and Rust tests. Python checks also run each time.

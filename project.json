@@ -61,17 +61,7 @@
     },
     "check": {
       "executor": "nx:noop",
-      "dependsOn": [
-        "format-check",
-        "lint",
-        "typecheck",
-        "test",
-        {
-          "projects": ["@kotoconn/api"],
-          "target": "build",
-          "params": "ignore"
-        }
-      ]
+      "dependsOn": ["format-check", "lint", "typecheck", "test"]
     },
     "verify": {
       "executor": "nx:noop",
@@ -91,10 +81,14 @@
       ]
     },
     "setup": {
-      "executor": "nx:run-commands",
-      "options": {
-        "command": "uv sync --locked"
-      }
+      "executor": "nx:noop",
+      "dependsOn": [
+        {
+          "projects": ["python"],
+          "target": "sync",
+          "params": "ignore"
+        }
+      ]
     },
     "ci": {
       "executor": "nx:noop",
