@@ -35,3 +35,26 @@ python3 e2e/tun.py
 ```
 
 The E2E runner creates a network namespace, exercises the real CLI against Linux TCP/UDP sockets, injects malformed IP packets, and checks graceful and forced shutdown. It needs `unshare`, `iproute2`, and either unprivileged user namespaces or root. Each invocation owns a new network namespace and artifact directory, so workspaces can run concurrently. See [TUN test responsibilities](../../testing/tun/README.md) for the quick/stress profiles, deterministic tests, mixed malformed traffic and isolation checks.
+
+## smoltcp fork
+
+Maintain the fork on `kotoconn` in `merrkry/smoltcp`. `.gitmodules` tracks that
+branch and uses merge updates to keep an existing development checkout attached.
+After initializing a new workspace, attach the branch once:
+
+```sh
+git submodule update --init external/smoltcp
+git -C external/smoltcp switch kotoconn
+```
+
+Commit and push fork changes on this branch, then commit the updated
+`external/smoltcp` gitlink in Kotoconn. To advance to the published branch:
+
+```sh
+git -C external/smoltcp fetch origin kotoconn
+git -C external/smoltcp merge --ff-only origin/kotoconn
+```
+
+The gitlink still records the exact dependency revision. Use
+`git submodule update --checkout external/smoltcp` when an exact detached
+checkout is intentional, such as reproducing an older revision.
