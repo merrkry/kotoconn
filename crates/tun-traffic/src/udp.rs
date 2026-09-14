@@ -3,7 +3,12 @@ use crate::{
     stats::{Stats, record},
 };
 use anyhow::{Context, Result, ensure};
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    net::SocketAddr,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     net::UdpSocket,
     sync::{oneshot, watch},
@@ -135,15 +140,29 @@ async fn receive_paced(
         }
         tokio::select! {
             changed = finishing.changed(), if total.is_none() => { changed?; }
-            _ = async { if let Some(at) = deadline { tokio::time::sleep_until(at).await } else { std::future::pending().await } } => break,
+            _ = async {
+                match deadline {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => break,
             received = socket.recv(&mut bytes) => {
                 let size = received?;
                 let at = Instant::now();
                 ensure!(size == args.datagram_bytes, "paced UDP length differs");
                 let sequence = u64::from_be_bytes(bytes[8..16].try_into()?);
-                ensure!(bytes[..size] == packet(args, flow, sequence, size), "paced UDP payload differs: flow={flow} sequence={sequence}");
-                if seen.insert(sequence, at).is_some() { stats.duplicates += 1; }
-                else if sequence < last { stats.reordered += 1; }
+                ensure!(
+                    bytes[..size] == packet(args, flow, sequence, size),
+                    "paced UDP payload differs: flow={flow} sequence={sequence}"
+                );
+                match seen.entry(sequence) {
+                    Entry::Occupied(_) => stats.duplicates += 1,
+                    Entry::Vacant(entry) => {
+                        // Latency ends at the first reply, even if another arrives later.
+                        entry.insert(at);
+                        stats.reordered += u64::from(sequence < last);
+                    }
+                }
                 last = last.max(sequence);
             }
         }
@@ -178,6 +197,7 @@ async fn paced(args: &Args, flow: u64) -> Result<Stats> {
     };
     let receive = receive_paced(args, flow, &socket, finishing);
     let (timestamps, (received, mut stats)) = tokio::try_join!(send, receive)?;
+    stats.connections = 1;
     for (sequence, at) in &received {
         let &(planned, actual) = timestamps
             .get(usize::try_from(*sequence)?)
@@ -215,15 +235,18 @@ mod tests {
                 .unwrap();
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        sender
-            .send_to(
-                &packet(&args, 7, 0, args.datagram_bytes),
-                receiver.local_addr().unwrap(),
-            )
-            .await
-            .unwrap();
-        // Completion predates the first receive poll; sequence 1 never arrives.
-        let (_finished, finishing) = watch::channel(Some(2));
+        for sequence in [2, 0, 0] {
+            sender
+                .send_to(
+                    &packet(&args, 7, sequence, args.datagram_bytes),
+                    receiver.local_addr().unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        // Completion predates the first receive poll. Missing sequences 1 and 3
+        // still require a bounded drain despite duplicate and reordered replies.
+        let (_finished, finishing) = watch::channel(Some(4));
         let (received, stats) = tokio::time::timeout(
             Duration::from_secs(5),
             receive_paced(&args, 7, &receiver, finishing),
@@ -231,8 +254,10 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(received.len(), 1);
+        assert_eq!(received.len(), 2);
         assert!(received.contains_key(&0));
-        assert_eq!(stats.duplicates, 0);
+        assert!(received.contains_key(&2));
+        assert_eq!(stats.duplicates, 1);
+        assert_eq!(stats.reordered, 1);
     }
 }
