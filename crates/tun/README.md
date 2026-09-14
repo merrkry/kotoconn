@@ -38,23 +38,30 @@ The E2E runner creates a network namespace, exercises the real CLI against Linux
 
 ## smoltcp fork
 
-Maintain the fork on `kotoconn` in `merrkry/smoltcp`. `.gitmodules` tracks that
-branch and uses merge updates to keep an existing development checkout attached.
-After initializing a new workspace, attach the branch once:
+Cargo patches smoltcp to `external/smoltcp`, based on upstream 0.14.0. The fork
+keeps TCP sequence handling, ACKs, retransmission and congestion control, while
+adding the interfaces this crate needs:
+
+- `TcpContext` and direct socket driving let the receive worker supply time,
+  addresses and link capabilities without a per-connection Interface or device.
+- Replaceable TCP byte storage accepts sparse immutable payload blocks. Receive
+  targets are independent of allocated bytes, and receive context preserves views
+  into owned input frames. Contiguous TX ranges may span multiple blocks.
+- `dispatch_scattered` returns headers and logical payload ranges. TUN can retain
+  their block views for vectored GSO output without gathering the data first.
+- Dynamic receive windows preserve previously advertised space when a target
+  falls. Scaling does not create extra credit, and a larger window waits for
+  handshake completion instead of repeatedly transmitting SYN-ACK.
+
+The ordinary Interface and ring-buffer APIs remain available. Runtime scheduling,
+allocation policy, pools and worker ownership stay in Kotoconn. See
+[TUN buffering](../../docs/tun-buffering.md) for their implementation.
+
+The fork is excluded from the parent Cargo workspace. Run its tests separately:
 
 ```sh
-git submodule update --init external/smoltcp
-git -C external/smoltcp switch kotoconn
+cargo test --manifest-path external/smoltcp/Cargo.toml --lib --no-default-features --features std,medium-ip,proto-ipv4,proto-ipv6,socket-tcp,socket-tcp-cubic,assembler-max-segment-count-32,segmentation-offload
 ```
 
-Commit and push fork changes on this branch, then commit the updated
-`external/smoltcp` gitlink in Kotoconn. To advance to the published branch:
-
-```sh
-git -C external/smoltcp fetch origin kotoconn
-git -C external/smoltcp merge --ff-only origin/kotoconn
-```
-
-The gitlink still records the exact dependency revision. Use
-`git submodule update --checkout external/smoltcp` when an exact detached
-checkout is intentional, such as reproducing an older revision.
+Git branch and submodule operations are documented in
+[external sources](../../external/README.md).
