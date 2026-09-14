@@ -138,6 +138,32 @@ impl PacketSend for Sender {
         Ok(())
     }
 
+    async fn send_tcp_segments(
+        &mut self,
+        header: &[u8],
+        payload: &[Bytes],
+        segment_size: u16,
+    ) -> io::Result<()> {
+        let virtio = tcp_gso_header(header, segment_size)?;
+        let mut vectors = Vec::with_capacity(payload.len() + 2);
+        vectors.push(IoSlice::new(&virtio));
+        vectors.push(IoSlice::new(header));
+        vectors.extend(payload.iter().map(|part| IoSlice::new(part)));
+        loop {
+            std::future::poll_fn(|cx| self.device.poll_writable(cx)).await?;
+            match self.device.try_send_vectored(&vectors) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                result => {
+                    let n = result?;
+                    if n != vectors.iter().map(|v| v.len()).sum::<usize>() {
+                        return Err(invalid("partial TUN GSO write"));
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     async fn send_batch(&mut self, packets: &[Bytes]) -> io::Result<()> {
         let offset = if self.device.tcp_gso() {
             VIRTIO_NET_HDR_LEN

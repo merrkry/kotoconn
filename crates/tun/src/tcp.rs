@@ -574,11 +574,22 @@ impl Connection {
         }
         for _ in 0..32 {
             let mut sent = false;
-            let result = self.socket.dispatch(&mut self.host, |_, meta, (ip, repr)| {
-                let result = emit(arena, output, ip, repr, meta.segmentation_offload_size);
-                sent = result.is_ok();
-                result
-            });
+            let result = self.socket.dispatch_scattered(
+                &mut self.host,
+                |_, meta, (ip, repr), storage, range| {
+                    let result = emit_scattered(
+                        arena,
+                        output,
+                        ip,
+                        repr,
+                        meta.segmentation_offload_size,
+                        storage,
+                        range,
+                    );
+                    sent = result.is_ok();
+                    result
+                },
+            );
             match result {
                 Err((queue::Error::Full, bytes)) => return Progress::Blocked(bytes),
                 Err((queue::Error::Closed, _)) => return Progress::Closed,
@@ -622,6 +633,70 @@ impl Drop for Connection {
     }
 }
 
+fn emit_scattered(
+    arena: &mut PacketArena,
+    output: &queue::Sender<Transmit>,
+    ip: IpRepr,
+    repr: TcpRepr<'_>,
+    segment_size: Option<std::num::NonZeroU16>,
+    storage: &Storage,
+    range: std::ops::Range<usize>,
+) -> Result<(), (queue::Error, usize)> {
+    if range.is_empty() {
+        return emit(arena, output, ip, repr, segment_size);
+    }
+    let count = storage.segments(range);
+    let cost = crate::storage::charge(ip.buffer_len()) + count.len() * std::mem::size_of::<Bytes>();
+    let permit = output.try_reserve(cost).map_err(|e| (e, cost))?;
+    let header_len = ip.header_len() + repr.header_len();
+    let len = if segment_size.is_some() {
+        header_len
+    } else {
+        ip.buffer_len()
+    };
+    let (_, packet) = arena.encode(len, |bytes| {
+        ip.emit(
+            &mut bytes[..ip.header_len()],
+            &ChecksumCapabilities::default(),
+        );
+        let tcp = &mut bytes[ip.header_len()..];
+        let mut checksums = ChecksumCapabilities::default();
+        checksums.tcp = smoltcp::phy::Checksum::Rx;
+        // SAFETY: The allocation includes the complete IP and TCP headers.
+        repr.emit(
+            &mut TcpPacket::new_unchecked(&mut *tcp),
+            &ip.src_addr(),
+            &ip.dst_addr(),
+            &checksums,
+        );
+        if segment_size.is_some() {
+            let seed = checksum::pseudo_header(
+                &ip.src_addr(),
+                &ip.dst_addr(),
+                IpProtocol::Tcp,
+                ip.payload_len() as u32,
+            );
+            TcpPacket::new_unchecked(tcp).set_checksum(seed);
+        } else {
+            let mut at = repr.header_len();
+            for part in &count {
+                tcp[at..at + part.len()].copy_from_slice(part);
+                at += part.len();
+            }
+            TcpPacket::new_unchecked(tcp).fill_checksum(&ip.src_addr(), &ip.dst_addr());
+        }
+    });
+    permit.send(match segment_size {
+        Some(size) => Transmit::TcpGso {
+            packet,
+            payload: count,
+            segment_size: size.get(),
+        },
+        None => Transmit::Packet(packet),
+    });
+    Ok(())
+}
+
 fn emit(
     arena: &mut PacketArena,
     output: &queue::Sender<Transmit>,
@@ -660,6 +735,7 @@ fn emit(
     permit.send(match segment_size {
         Some(size) => Transmit::TcpGso {
             packet,
+            payload: Vec::new(),
             segment_size: size.get(),
         },
         None => Transmit::Packet(packet),
@@ -729,21 +805,45 @@ mod tests {
             };
             let ip = IpRepr::new(source, destination, IpProtocol::Tcp, repr.buffer_len(), 64);
             let (output, mut input) = queue::channel(INITIAL, Transmit::size);
-            emit(
+            let mut storage = Storage::new(
+                Pool::default(),
+                Arc::new(AtomicUsize::new(INITIAL)),
+                true,
+                Arc::new(AtomicUsize::new(data.len())),
+                Arc::new(AtomicUsize::new(0)),
+            );
+            for part in data.chunks(8192) {
+                storage.push(Bytes::copy_from_slice(part));
+            }
+            let repr = TcpRepr {
+                payload: &[],
+                ..repr
+            };
+            emit_scattered(
                 &mut PacketArena::default(),
                 &output,
                 ip,
                 repr,
                 std::num::NonZeroU16::new(1200),
+                &storage,
+                0..data.len(),
             )
             .unwrap();
             let Transmit::TcpGso {
                 packet,
                 segment_size,
+                payload,
             } = input.try_recv().unwrap()
             else {
                 panic!()
             };
+            assert!(payload.len() > 1);
+            smoltcp::socket::tcp::Buffer::dequeue_allocated(&mut storage, data.len());
+            let mut full_packet = packet.to_vec();
+            for part in payload {
+                full_packet.extend_from_slice(&part);
+            }
+            let packet = Bytes::from(full_packet);
             let header = crate::offload::tcp_gso_header(&packet, segment_size).unwrap();
             let header = tun_rs::VirtioNetHdr::decode(&header).unwrap();
             assert_eq!(header.flags, 1);

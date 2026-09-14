@@ -41,6 +41,22 @@ pub trait PacketSend: Send {
         async { Err(io::ErrorKind::Unsupported.into()) }
     }
 
+    /// Header and payload vectors belong to a single GSO frame.
+    fn send_tcp_segments(
+        &mut self,
+        header: &[u8],
+        payload: &[Bytes],
+        segment_size: u16,
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        async move {
+            let mut packet = header.to_vec();
+            for part in payload {
+                packet.extend_from_slice(part);
+            }
+            self.send_tcp_gso(&packet, segment_size).await
+        }
+    }
+
     /// Send only packets already available. Cancellation may transmit a prefix;
     /// the caller must not retry a cancelled batch.
     fn send_batch(&mut self, packets: &[Bytes]) -> impl Future<Output = io::Result<()>> + Send {
@@ -189,6 +205,7 @@ async fn transmit<W: PacketSend>(
                 Transmit::Packet(packet) => packets.push(packet),
                 Transmit::TcpGso {
                     packet,
+                    payload,
                     segment_size,
                 } => {
                     if !packets.is_empty() {
@@ -197,9 +214,12 @@ async fn transmit<W: PacketSend>(
                         sent_bytes += packets.iter().map(|p| p.len() as u64).sum::<u64>();
                         packets.clear();
                     }
-                    device.send_tcp_gso(&packet, segment_size).await?;
+                    device
+                        .send_tcp_segments(&packet, &payload, segment_size)
+                        .await?;
                     sent_packets += 1;
-                    sent_bytes += packet.len() as u64;
+                    sent_bytes +=
+                        packet.len() as u64 + payload.iter().map(|p| p.len() as u64).sum::<u64>();
                 }
                 Transmit::Datagram {
                     source,
