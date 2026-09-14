@@ -137,6 +137,15 @@ def main():
             result["netns"] != parent and result["parent_netns"] == parent
             for result in results
         )
+        # CI uses a rootful engine with a different container UID. Artifacts
+        # must remain usable by the host runner, including in nested directories.
+        for output in directory.glob("tun-*"):
+            for path in output.rglob("*"):
+                assert os.access(path, os.R_OK | os.W_OK), (
+                    f"inaccessible artifact: {path}"
+                )
+                if path.is_dir():
+                    assert os.access(path, os.X_OK), f"inaccessible directory: {path}"
         # Cancel a real started container and verify that it is removed, rather
         # than merely observing the host-side Docker client exit.
         cancel_output = directory / "cancelled"

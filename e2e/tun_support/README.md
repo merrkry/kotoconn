@@ -136,7 +136,10 @@ to run outside this launcher. The existing `docker` command may be provided by
 Podman's Docker-compatible interface. Neither path invokes `unshare`.
 
 Source and binaries are mounted read-only, with only this run's unique
-artifact directory writable. Nix ELF binaries mount their immutable loader
+artifact directory writable. That directory inherits its host group, and the
+container joins that group. Group write permissions keep nested results usable
+by both the host runner and rootful Docker without filesystem override capabilities.
+Nix ELF binaries mount their immutable loader
 and library packages read-only; other binaries need a compatible Debian ABI.
 The launcher records the host source revision and image ID before starting,
 so the container does not need access to a worktree's external Git directory.

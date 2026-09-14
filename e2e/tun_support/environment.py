@@ -51,12 +51,15 @@ def enter(args, script, category, *, sysctls=None):
     """Start one container per run; only its unique artifact directory is writable."""
     if args.inside:
         isolated()
+        # Keep nested artifacts writable by the directory's inherited group.
+        os.umask(0o002)
         return False
     base = (args.output or ROOT / "target" / category).resolve()
     base.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix="tun-", dir=base))
-    # Rootful CI containers create readable artifacts for the upload step.
-    directory.chmod(0o755)
+    # Rootful Docker's UID 0 differs from the host runner. Grant the directory's
+    # group write access and inherit that group for files created by either side.
+    directory.chmod(0o2770)
     image = command(
         "docker", "image", "inspect", args.container_image, "--format", "{{.Id}}"
     )
@@ -92,6 +95,8 @@ def enter(args, script, category, *, sysctls=None):
         "NET_ADMIN",
         "--cap-add",
         "NET_RAW",
+        "--group-add",
+        str(directory.stat().st_gid),
         "--device",
         "/dev/net/tun",
         "--security-opt",
