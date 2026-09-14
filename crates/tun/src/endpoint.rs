@@ -33,8 +33,10 @@ pub trait PacketReceive: Send {
             .lease
             .get_or_insert_with(|| buffer.pool.acquire(65575));
         let len = ready!(self.poll_recv(cx, lease.as_mut()))?;
+        let (bytes, allocation_size) = buffer.publish(len);
         Poll::Ready(Ok(Received {
-            bytes: buffer.publish(len),
+            bytes,
+            allocation_size,
             checksum_verified: false,
             udp_segment_size: None,
         }))
@@ -48,15 +50,22 @@ pub struct ReceiveBuffer {
 }
 
 impl ReceiveBuffer {
-    pub(crate) fn publish(&mut self, len: usize) -> Bytes {
+    pub(crate) fn publish(&mut self, len: usize) -> (Bytes, usize) {
         // SAFETY: The completed receive initialized this prefix of the installed
         // lease. Keep private scratch for short frames; only large frames take it.
         let lease = self.lease.as_ref().expect("receive lease");
         debug_assert!(len <= lease.as_ref().len());
         if len < lease.as_ref().len() / 4 {
-            self.pool.copy(&lease.as_ref()[..len])
+            (
+                self.pool.copy(&lease.as_ref()[..len]),
+                len.max(256).next_power_of_two(),
+            )
         } else {
-            self.lease.take().expect("receive lease").freeze(len)
+            let allocation_size = lease.as_ref().len().max(256).next_power_of_two();
+            (
+                self.lease.take().expect("receive lease").freeze(len),
+                allocation_size,
+            )
         }
     }
 }
@@ -65,6 +74,9 @@ impl ReceiveBuffer {
 /// packet readers leave both metadata fields unset and receive full validation.
 pub struct Received {
     pub bytes: Bytes,
+    /// Retained backing allocation, including capacity outside this view.
+    /// PacketReceive implementations must report it for fragment admission.
+    pub allocation_size: usize,
     pub checksum_verified: bool,
     /// UDP L4 segmentation, never IP fragmentation. Each slice is one datagram.
     pub udp_segment_size: Option<u16>,
@@ -147,7 +159,7 @@ impl Drop for ConnectionGuard {
 }
 
 /// Own queue workers until TCP drains or cancellation stops device I/O.
-/// Queue membership stays fixed so flow and fragment ownership cannot migrate.
+/// Queue membership stays fixed so established flow ownership cannot migrate.
 pub async fn run<R: PacketReceive + 'static, W: PacketSend + 'static>(
     queues: Vec<(R, W)>,
     mtu: usize,
@@ -165,11 +177,13 @@ pub async fn run<R: PacketReceive + 'static, W: PacketSend + 'static>(
         .map(|_| queue::channel(queue::INITIAL_BYTES, worker::Forwarded::size))
         .unzip();
     let (drained, mut drains) = mpsc::unbounded_channel();
+    let reassembly = crate::packet::ReassemblyLimits::default();
     let shared = Arc::new(Shared {
         drained,
         hash: RandomState::new(),
         inboxes,
-        reassembly: Default::default(),
+        fragments: crate::fragments::Routes::new(queues.len(), reassembly.clone()),
+        reassembly,
         stop: CancellationToken::new(),
     });
     // Each writer owns its packet storage; only atomic fragment IDs are shared.
@@ -221,6 +235,7 @@ pub async fn run<R: PacketReceive + 'static, W: PacketSend + 'static>(
                 biased;
                 _ = context.scope.cancelled() => return Ok(()),
                 Some(_) = drains.recv() => remaining -= 1,
+                _ = shared.fragments.expire() => {},
                 result = workers.join_next() => {
                     result.ok_or_else(|| anyhow!("TUN has no workers"))??.context("TUN worker failed")?;
                     bail!("TUN worker stopped before shutdown");

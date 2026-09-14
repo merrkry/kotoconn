@@ -24,6 +24,7 @@ pub(crate) struct Shared {
     pub hash: RandomState,
     pub inboxes: Vec<queue::Sender<Forwarded>>,
     pub reassembly: ReassemblyLimits,
+    pub fragments: crate::fragments::Routes,
     pub stop: CancellationToken,
 }
 
@@ -44,6 +45,7 @@ impl Forwarded {
         match &self.packet {
             ForwardedPacket::Frame(frame) => frame.bytes.len(),
             ForwardedPacket::Reassembled(packet) => packet.storage_size(),
+            ForwardedPacket::Fragments(delivery) => delivery.size(),
         }
     }
 }
@@ -51,6 +53,7 @@ impl Forwarded {
 enum ForwardedPacket {
     Frame(crate::Received),
     Reassembled(Packet<'static>),
+    Fragments(crate::fragments::Delivery),
 }
 
 struct Statistics {
@@ -214,10 +217,70 @@ impl Worker {
             return Ok(());
         };
         let owner = self.shared.owner(key);
+        if let RouteKey::Fragment(key) = key {
+            let first_owner = parsed.first_route().map(|key| self.shared.owner(key));
+            if let Some(delivery) =
+                self.shared
+                    .fragments
+                    .route(owner, key, first_owner, frame, Instant::now())
+            {
+                if delivery.owner == self.id {
+                    self.fragments(delivery, decoder)?;
+                } else {
+                    let Ok(entry) =
+                        self.shared.inboxes[delivery.owner].try_reserve(delivery.size())
+                    else {
+                        self.stats.forwarding_drops += 1;
+                        return Ok(());
+                    };
+                    self.stats.forwarded_packets += 1 + delivery
+                        .pending
+                        .as_ref()
+                        .map_or(0, |pending| pending.frames.len() as u64);
+                    entry.send(Forwarded {
+                        packet: ForwardedPacket::Fragments(delivery),
+                    });
+                }
+            }
+            return Ok(());
+        }
+
         if owner != self.id {
             self.forward_raw(frame, owner);
         } else if let Some(packet) = parsed.decode(decoder, Instant::now()) {
             self.packet(packet, Some(&frame))?;
+        }
+        Ok(())
+    }
+
+    fn fragments(
+        &mut self,
+        mut delivery: crate::fragments::Delivery,
+        decoder: &mut Decoder,
+    ) -> Result<()> {
+        debug_assert_eq!(delivery.owner, self.id);
+        if let Some(pending) = &mut delivery.pending {
+            for frame in pending.frames.drain(..) {
+                self.fragment(frame, &delivery.binding, decoder)?;
+            }
+        }
+        // Release pending storage before admitting the offset-zero fragment.
+        drop(delivery.pending);
+        self.fragment(delivery.frame, &delivery.binding, decoder)
+    }
+
+    fn fragment(
+        &mut self,
+        frame: crate::Received,
+        binding: &Arc<crate::fragments::Binding>,
+        decoder: &mut Decoder,
+    ) -> Result<()> {
+        let packet = decoder.decode_fragment(&frame.bytes, Instant::now(), binding);
+        if !decoder.retains(binding) {
+            self.shared.fragments.finish(binding);
+        }
+        if let Some(packet) = packet {
+            self.packet(packet, None)?;
         }
         Ok(())
     }
@@ -639,6 +702,7 @@ pub(crate) async fn dispatch<R: PacketReceive>(
                     }
                 }
                 ForwardedPacket::Reassembled(packet) => worker.packet(packet, None)?,
+                ForwardedPacket::Fragments(delivery) => worker.fragments(delivery, &mut decoder)?,
             },
             Input::Read(frame) => {
                 worker.frame(frame, &mut decoder)?;
@@ -757,6 +821,7 @@ mod tests {
                 hash: RandomState::new(),
                 inboxes: vec![],
                 reassembly: ReassemblyLimits::default(),
+                fragments: crate::fragments::Routes::new(1, ReassemblyLimits::default()),
                 stop: CancellationToken::new(),
             }),
             tcp: HashMap::from([(flow, entry)]),
