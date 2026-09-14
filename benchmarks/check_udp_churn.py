@@ -21,7 +21,15 @@ def fixed_work(binary, daemon, directory, spec, **kwargs):
         binary,
         daemon,
         directory,
-        {**spec, "duration_ms": 0, "rounds": 512, "timeout": 5},
+        {
+            **spec,
+            "duration_ms": 0,
+            "rounds": 512,
+            "timeout": 5,
+            # Client binds must not occupy the proxy's 60000..60063 budget.
+            # Eight disjoint eight-port cycles create exactly 64 associations.
+            "udp_source_ports": "50000-50063",
+        },
         **kwargs,
     )
 

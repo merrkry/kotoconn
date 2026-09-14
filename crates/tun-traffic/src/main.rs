@@ -59,6 +59,9 @@ struct Args {
     /// Receive and echo up to N datagrams per syscall; one selects ordinary I/O.
     #[arg(long, default_value_t = if cfg!(target_os = "linux") { 32 } else { 1 }, value_parser = clap::value_parser!(u8).range(1..=32))]
     udp_echo_batch: u8,
+    /// Explicit source ports for strict UDP churn, partitioned evenly among flows.
+    #[arg(long)]
+    udp_source_ports: Option<udp::SourcePorts>,
     /// Generator workers, independent of the daemon CPU budget.
     #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..=64))]
     worker_threads: u16,
@@ -162,6 +165,14 @@ async fn run(args: Args) -> Result<()> {
         args.rate <= 1_000_000,
         "per-flow rate exceeds one million datagrams/s"
     );
+
+    if let Some(ports) = args.udp_source_ports {
+        ensure!(
+            args.protocol == Protocol::Udp && args.workload == Workload::Churn && args.rate == 0,
+            "udp-source-ports requires strict UDP churn"
+        );
+        ports.validate(args.connections)?;
+    }
 
     let args = Arc::new(args);
     let (stop, stopping) = oneshot::channel();

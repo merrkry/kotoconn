@@ -36,7 +36,10 @@ ephemeral-port and TCP TIME_WAIT settings limit interference from earlier TCP tr
 ## Cases
 
 `check_udp_churn.py` runs the actual UDP benchmark phases over IPv4 and IPv6
-with only 64 namespace-local ephemeral ports. Each phase completes 4096 strict
+with only 64 namespace-local ephemeral ports for the proxy. Clients cycle through
+64 explicit ports outside that range, partitioned into eight disjoint sets. This
+keeps client binds from consuming the proxy's wildcard-bind budget and visits
+every source tuple during each phase. Each phase completes 4096 strict
 request/reply exchanges. It catches the port exhaustion caused by retaining
 warmup associations under a different destination, without changing idle
 timeouts or allowing packet loss.

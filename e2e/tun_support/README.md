@@ -146,7 +146,9 @@ Docker applies the test sysctls only to the container network. Source
 routing includes kernel-generated TCP control packets after application exit.
 Traffic invocations use server ports in 12000..19999. Benchmark UDP warmup and
 measurement share one port within a sample so live warmup associations do not
-consume a second set of outbound ports. Other invocations use separate server
+consume a second set of outbound ports. The 64-port regression assigns clients
+explicit ports outside the restricted ephemeral range; those client sockets
+must not consume the proxy's allocation budget. Other invocations use separate server
 ports. TCP clients defer source-port allocation until connect, so earlier cases' TIME_WAIT sockets do
 not exhaust a new case's tuple space. The namespace uses ephemeral ports
 20000..65535 and enables timestamp-protected TCP TIME_WAIT reuse for outbound
