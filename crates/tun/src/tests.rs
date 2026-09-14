@@ -358,10 +358,10 @@ fn closed_tcp_ports_use_rfc_reset_sequence_numbers() {
     for ipv6 in [false, true] {
         let mut rejector = tcp::Rejector::new(1280);
         let (output, mut replies) =
-            kotoconn_protocol::queue::channel(128 * 1024, device::Transmit::size);
+            kotoconn_protocol::queue::channel(128 * 1024, transmit::Transmit::size);
         let syn = decoded(&segment(flow(ipv6), 100, None, TcpControl::Syn, &[]));
         rejector.reject(&syn, &output).unwrap();
-        let device::Transmit::Packet(bytes) = replies.try_recv().unwrap() else {
+        let transmit::Transmit::Packet(bytes) = replies.try_recv().unwrap() else {
             panic!("packet expected")
         };
         let reply = decoded(&bytes);
@@ -370,7 +370,7 @@ fn closed_tcp_ports_use_rfc_reset_sequence_numbers() {
         assert_eq!(repr.ack_number, Some(TcpSeqNumber(101)));
         let ack = decoded(&segment(flow(ipv6), 100, Some(999), TcpControl::None, &[]));
         rejector.reject(&ack, &output).unwrap();
-        let device::Transmit::Packet(bytes) = replies.try_recv().unwrap() else {
+        let transmit::Transmit::Packet(bytes) = replies.try_recv().unwrap() else {
             panic!("packet expected")
         };
         let reply = decoded(&bytes);
@@ -389,7 +389,7 @@ async fn dropped_resets_do_not_scatter_queued_packets_across_blocks() {
 
     for mtu in [1500, 65535] {
         let mut rejector = tcp::Rejector::new(mtu);
-        let (output, mut replies) = queue::channel(128 * 1024, device::Transmit::size);
+        let (output, mut replies) = queue::channel(128 * 1024, transmit::Transmit::size);
         let syn = decoded(&segment(flow(false), 100, None, TcpControl::Syn, &[]));
         let mut queued = 0;
         while rejector.reject(&syn, &output).is_ok() {
@@ -407,7 +407,7 @@ async fn dropped_resets_do_not_scatter_queued_packets_across_blocks() {
             }
         }
         let mut packets = Vec::new();
-        while let Ok(device::Transmit::Packet(packet)) = replies.try_recv() {
+        while let Ok(transmit::Transmit::Packet(packet)) = replies.try_recv() {
             assert_eq!(packet.len(), 40);
             assert_eq!(decoded(&packet).tcp().unwrap().1.control, TcpControl::Rst);
             packets.push(packet);
@@ -428,12 +428,12 @@ async fn accepted(
 ) -> (
     tcp::Stream,
     kotoconn_protocol::queue::Sender<tcp::QueuedPacket>,
-    kotoconn_protocol::queue::Receiver<device::Transmit>,
+    kotoconn_protocol::queue::Receiver<transmit::Transmit>,
     tokio::task::JoinHandle<io::Result<()>>,
     i32,
 ) {
     let (output, mut replies) =
-        kotoconn_protocol::queue::channel(128 * 1024, device::Transmit::size);
+        kotoconn_protocol::queue::channel(128 * 1024, transmit::Transmit::size);
     let conn = tcp::connection(flow(ipv6), 1280, output, CancellationToken::new());
     let driver = tokio::spawn(conn.driver);
     conn.packets
@@ -541,7 +541,7 @@ async fn tcp_drop_aborts_and_remote_reset_is_an_io_error() {
 #[tokio::test(start_paused = true)]
 async fn tcp_retransmits_without_caller_polling_and_cancelled_admission_releases_state() {
     let (output, mut replies) =
-        kotoconn_protocol::queue::channel(128 * 1024, device::Transmit::size);
+        kotoconn_protocol::queue::channel(128 * 1024, transmit::Transmit::size);
     let conn = tcp::connection(flow(false), 1280, output, CancellationToken::new());
     let driver = tokio::spawn(conn.driver);
     conn.packets
@@ -584,11 +584,11 @@ fn udp_zero_checksum_is_only_valid_for_ipv4_and_source_port_may_be_omitted() {
     }
 }
 
-impl device::Transmit {
+impl transmit::Transmit {
     fn packet(self) -> Vec<u8> {
         match self {
             Self::Packet(packet) => packet.to_vec(),
-            Self::Datagram { .. } => panic!("expected TCP packet"),
+            Self::Datagram { .. } | Self::TcpGso { .. } => panic!("expected ordinary TCP packet"),
         }
     }
 }
@@ -596,7 +596,7 @@ impl device::Transmit {
 #[tokio::test(start_paused = true)]
 async fn reset_during_handshake_releases_state_without_waiting_for_a_timeout() {
     let (output, mut replies) =
-        kotoconn_protocol::queue::channel(128 * 1024, device::Transmit::size);
+        kotoconn_protocol::queue::channel(128 * 1024, transmit::Transmit::size);
     let conn = tcp::connection(flow(false), 1280, output, CancellationToken::new());
     let driver = tokio::spawn(conn.driver);
     conn.packets

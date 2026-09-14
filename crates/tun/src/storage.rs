@@ -8,16 +8,22 @@ const BLOCK: usize = 16 * 1024;
 #[derive(Default)]
 pub(crate) struct PacketArena {
     tail: BytesMut,
+    pool: crate::pool::Pool,
 }
 
 impl PacketArena {
+    pub fn with_pool(pool: crate::pool::Pool) -> Self {
+        Self {
+            tail: BytesMut::new(),
+            pool,
+        }
+    }
+
     /// Encode directly into a contiguous slice, then publish an immutable view.
-    /// Small packets share a block; large packets get their exact requested size.
+    /// Small packets share a block; large packets reuse a power-of-two pool block.
     pub fn encode<R>(&mut self, len: usize, emit: impl FnOnce(&mut [u8]) -> R) -> (R, Bytes) {
         if len > BLOCK / 2 {
-            let mut bytes = BytesMut::zeroed(len);
-            let result = emit(&mut bytes);
-            return (result, bytes.freeze());
+            return self.pool.encode(len, emit);
         }
 
         if self.tail.capacity() < len {
@@ -32,13 +38,14 @@ impl PacketArena {
 }
 
 /// Conservative packing charge, excluding descriptor metadata. A retired block
-/// is over half full because pooled packets are at most half a block. FIFO
+/// is over half full because packed packets are at most half a block. Large
+/// packets occupy a power-of-two allocation smaller than twice their length. FIFO
 /// consumers can additionally retain a partial head block and the producer's
 /// current tail. This assumes every published view is consumed in order;
 /// repeated admission drops must not advance the arena. This is queue
 /// accounting, not a process memory quota.
 pub(crate) fn charge(len: usize) -> usize {
-    if len <= BLOCK / 2 { 2 * len } else { len }
+    2 * len
 }
 
 #[cfg(test)]

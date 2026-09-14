@@ -1,41 +1,37 @@
 # TUN buffering
 
-TUN admits TCP connections and UDP associations without fixed count quotas. Queues bound accumulated work using local consumption feedback. Transport ownership and inbound/outbound independence follow [ADR 0005](adr/0005-independent-protocol-admission-and-session-execution.md); worker ownership and shutdown follow [ADR 0009](adr/0009-independent-tun-connection-drivers.md).
+TUN admits TCP connections and UDP associations without fixed count quotas. Queues constrain accumulated work using local consumption feedback. Transport independence follows [ADR 0005](adr/0005-independent-protocol-admission-and-session-execution.md); ownership and shutdown follow [ADR 0009](adr/0009-independent-tun-connection-drivers.md).
+
+## TCP storage
+
+Our smoltcp fork in `external/smoltcp` retains the TCP state machine, sequence handling, acknowledgments, retransmission and congestion control. Its storage interface accepts Kotoconn's sparse immutable blocks instead of fixed rings. New and idle connections allocate no RX/TX payload capacity in advance. Received segments allocate their payload, including when out of order; holes consume no payload storage. Overlap handling preserves the bytes and logical offsets expected by smoltcp's assembler.
+
+The worker publishes contiguous RX blocks directly to Stream. Consumption returns receive credit and wakes the worker for window updates. Stream submits TX blocks directly to TCP storage; their credit returns only after ACK. Both paths transfer block ownership without a second byte queue. When a wire segment spans TX blocks, a reusable scratch block gathers that segment; ordinary contiguous views need no gathering. Stream implements cooperative async reads and writes; block exchange uses concurrent queues and atomic counters, while only the worker accesses protocol state.
+
+Each direction starts with a 128 KiB target and adapts to its own completed bytes using the common `Capacity` feedback. Receive completion means application consumption; transmit completion means ACK. Stalled consumers cannot grow the target merely by adding arrivals. Window scale 7 is selected for the fast local TUN leg, giving 128-byte granularity and a negotiated receive range just below 8 MiB. No outbound transport parameters enter this calculation. A peer without window scaling retains the ordinary 65535-byte wire limit.
+
+Lowering a receive target preserves the largest promised receive right edge in byte precision. In-flight segments covered by the old window remain acceptable even when the new target is smaller. The scaled wire field rounds down, so its right edge may differ by at most 127 bytes; that rounding never grants new credit to a stalled reader. Payload storage is released as blocks are consumed or acknowledged, independently of the window target. FIN preserves unread bytes and the other direction; RST or cancellation reports a connection error.
+
+## Pools and packet storage
+
+Each worker shares a payload pool with its Streams. Blocks use power-of-two size classes, at least 256 bytes and at most 64 KiB per block. The free cache retains at most 32 blocks per class; exhaustion allocates another block and never rejects a connection because a cache is empty. Cache bounds limit retained free memory, not live connections. A block returns only when its final immutable view is dropped. Shutdown trims free blocks. Allocation uses ordinary Rust allocation and is not a recoverable process-wide OOM contract.
+
+A worker owns one `PacketArena` for TCP emission. It reserves output allowance before encoding, so rejected packets cannot leave gaps between published views. Small packets share 16 KiB blocks and are charged twice their length; large packets use the same power-of-two pool as payloads and are also charged twice their length. Descriptor metadata is charged by the queue. Sharing an arena is safe because all of this worker's TCP packets enter the same output queue.
+
+UDP writers own their encoders and share atomic fragment identifiers. Unfragmented UDP is encoded directly into final packet storage. Fragmented UDP first computes the checksum over the full datagram. When the Linux writer supports TCP GSO, smoltcp emits an aggregate and its segment size directly. A vectored TUN write passes the virtio header and immutable packet without copying through GRO scratch storage. Non-GSO TCP and UDP still use tun-rs GRO scratch storage for coalescing; that scratch belongs to the writer and holds a bounded batch.
 
 ## Backlog policy
 
 | Storage | Behavior when its allowance is exhausted |
 | --- | --- |
-| Cross-worker and per-flow ingress packet queues | Drop new packets so a stalled flow cannot block shared reception |
-| TCP application byte queues | Apply backpressure and preserve accepted bytes |
-| TUN transmit queue | Dedicated TCP/UDP producers wait; closed-port replies use nonblocking admission |
-| UDP GSO segments | Reject an aggregate whose duplicated headers and payload exceed the local allowance; drain admitted segments before receiving another aggregate |
-| IP reassembly | Reject storage growth beyond the allowance shared by all workers; expiry releases incomplete datagrams |
+| Cross-worker ingress | Drop new packets |
+| TCP RX | Advertise available receive credit; retain already accepted data |
+| TCP TX | Apply Stream write backpressure until ACK returns credit |
+| TUN transmit queue | TCP connections retry from the worker's blocked list; dedicated UDP writers wait; immediate ACK/reset replies use nonblocking admission |
+| UDP association ingress | Drop new datagrams without blocking shared reception |
+| UDP GSO segments | Reject aggregates beyond local allowance; drain admitted segments before receiving another aggregate |
+| IP reassembly | Reject growth beyond shared allowance before allocation; expiry releases incomplete datagrams |
 
-[`Capacity`](../crates/protocol/src/queue.rs) measures completed bytes over a feedback interval. The target is the largest of the initial allowance, the observed consumption rate multiplied by a target delay, and the previous target halved per elapsed interval. Arrivals alone cannot grow a stalled queue. A smaller target constrains new admission without discarding accepted data.
+`Capacity` measures completed bytes over a feedback interval. The target is the largest of the initial allowance, measured consumption rate times a target delay, and the previous target halved per elapsed interval. A smaller queue target constrains new admission without discarding accepted items. An empty packet queue can admit one complete item larger than its target, so a valid datagram remains sendable.
 
-Packet queue charges include payload storage and descriptor metadata, including for empty datagrams. An empty queue can admit one complete item larger than its target so a valid datagram remains sendable. Reassembly charges retained storage across workers and samples only successful completions; malformed fragments and expiry cannot increase its allowance. These are backlog policies, not process memory quotas.
-
-The constants live alongside the queue policy. TCP ingress starts with room for two receive-buffer-sized bursts. Reassembly has its own initial allowance. These choices absorb scheduling bursts while each queue adapts to its own consumer.
-
-## TCP working storage
-
-Unmodified smoltcp owns TCP acknowledgments, receive windows, out-of-order data and retransmission. Its contiguous RX/TX buffers stay fixed for each socket's lifetime. [`tcp.rs`](../crates/tun/src/tcp.rs) sets their sizes for the local TCP leg's throughput and feedback delay.
-
-Application bytes use separately allocated chunks in [`BufferedStream`](../crates/protocol/src/stream_buffer.rs). Growth does not move previously buffered payload; consumed chunks are released. These queues absorb application scheduling bursts, but do not enlarge smoltcp's advertised window or retransmission storage. Backpressure reaches the TCP peer when the daemon stops consuming bytes.
-
-## Packet storage
-
-Each TCP driver and UDP writer owns a [`PacketArena`](../crates/tun/src/storage.rs). Small packets share blocks through immutable `Bytes` views; packets larger than half a block allocate their requested size. Each packet stays contiguous for smoltcp and OS I/O. Publishing another view does not copy existing packets, and queued views remain valid after the producer exits.
-
-A retired small-packet block is more than half full. Queue accounting therefore charges small packets twice their length and large packets their length, plus descriptor metadata. FIFO consumption can additionally retain a partial head block and the producer's current tail. Separate arenas prevent independently stalled producers from retaining each other's blocks.
-
-This packing bound requires admission before encoding on paths that can drop packets. The closed-port rejector reserves room for an IP header and the maximum TCP header before asking smoltcp for a reset. Otherwise, dropped responses could leave holes between admitted views and let a few small packets retain many blocks. Established TCP producers wait for output capacity; UDP writers encode datagrams already received from the transmit queue.
-
-[`PacketSend`](../crates/tun/src/endpoint.rs) accepts immutable views. The Linux writer copies them into its reusable GRO scratch buffers, because coalescing needs mutable storage and extra room. Scratch storage is local to the writer and holds one bounded batch. Writer-local UDP encoders share only atomic fragment identifiers.
-
-## Allocation and scheduling
-
-Storage uses ordinary Rust allocation. Queue `reserve` and `try_reserve` operations acquire backlog allowance, not heap memory; allocation failure is outside the recoverable error contract.
-
-Async queue operations and stream reads and writes participate in Tokio cooperative scheduling. This allows reverse traffic and cancellation to progress when another I/O direction stays ready. Synchronous packet processing uses bounded batches.
+These policies constrain backlog, not total process memory. Flow metadata, application tasks, outbound transports and pool caches still consume resources. Removing fixed per-connection payload allocation improves scaling but does not make unlimited connections cost-free.

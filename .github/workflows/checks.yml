@@ -24,6 +24,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
@@ -43,6 +46,10 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Lint Rust
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test smoltcp fork
+        run: |
+          cargo fmt --manifest-path external/smoltcp/Cargo.toml -- --check
+          cargo test --manifest-path external/smoltcp/Cargo.toml --lib --no-default-features --features std,medium-ip,proto-ipv4,proto-ipv6,socket-tcp,socket-tcp-cubic,assembler-max-segment-count-32,segmentation-offload
       - name: Test Rust
         run: cargo test --workspace --locked
       # TypeScript checks generate bindings with Cargo and reuse the build above.

@@ -1,5 +1,5 @@
 use crate::{
-    device::Transmit,
+    transmit::Transmit,
     udp,
     worker::{self, Shared},
 };
@@ -26,6 +26,20 @@ pub trait PacketReceive: Send {
 /// A queue has one transmit owner, independent of its receive owner.
 pub trait PacketSend: Send {
     fn poll_send(&mut self, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>>;
+
+    /// Whether this writer accepts TCP aggregates with partial checksums.
+    fn tcp_gso(&self) -> bool {
+        false
+    }
+
+    /// Write one TCP aggregate. Only called when tcp_gso returned true.
+    fn send_tcp_gso(
+        &mut self,
+        _packet: &[u8],
+        _segment_size: u16,
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        async { Err(io::ErrorKind::Unsupported.into()) }
+    }
 
     /// Send only packets already available. Cancellation may transmit a prefix;
     /// the caller must not retry a cancelled batch.
@@ -86,6 +100,7 @@ pub async fn run<R: PacketReceive + 'static, W: PacketSend + 'static>(
     let count = queues.len();
     for (id, ((read, write), inbox)) in queues.into_iter().zip(receivers).enumerate() {
         let (output, packets) = queue::channel(queue::INITIAL_BYTES, Transmit::size);
+        let gso = write.tcp_gso();
         let state = shared.clone();
         let context = context.clone();
         let encoder = encoder.clone();
@@ -95,9 +110,17 @@ pub async fn run<R: PacketReceive + 'static, W: PacketSend + 'static>(
                 // Other queues run in parallel; a pending writer does not stop this receiver.
                 tokio::try_join!(
                     async {
-                        worker::dispatch(id, read, inbox, state, mtu, context, output)
-                            .await
-                            .with_context(|| format!("TUN receive queue {id}"))
+                        worker::dispatch(
+                            id,
+                            read,
+                            inbox,
+                            state,
+                            crate::tcp::Link { mtu, gso },
+                            context,
+                            output,
+                        )
+                        .await
+                        .with_context(|| format!("TUN receive queue {id}"))
                     },
                     async {
                         transmit(id, write, packets, encoder)
@@ -113,7 +136,7 @@ pub async fn run<R: PacketReceive + 'static, W: PacketSend + 'static>(
 
     let result = async {
         // A worker reports only after observing stop and removing every TCP
-        // driver. No finite connection permit set is needed for graceful drain.
+        // connection. No finite connection permit set is needed for graceful drain.
         let mut remaining = count;
         while remaining > 0 {
             tokio::select! {
@@ -164,6 +187,20 @@ async fn transmit<W: PacketSend>(
         for item in items.drain(..) {
             match item {
                 Transmit::Packet(packet) => packets.push(packet),
+                Transmit::TcpGso {
+                    packet,
+                    segment_size,
+                } => {
+                    if !packets.is_empty() {
+                        device.send_batch(&packets).await?;
+                        sent_packets += packets.len() as u64;
+                        sent_bytes += packets.iter().map(|p| p.len() as u64).sum::<u64>();
+                        packets.clear();
+                    }
+                    device.send_tcp_gso(&packet, segment_size).await?;
+                    sent_packets += 1;
+                    sent_bytes += packet.len() as u64;
+                }
                 Transmit::Datagram {
                     source,
                     destination,

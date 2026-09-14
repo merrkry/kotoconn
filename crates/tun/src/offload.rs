@@ -30,6 +30,35 @@ pub(crate) struct Sender {
     buffers: Vec<Vec<u8>>,
 }
 
+pub(super) fn tcp_gso_header(
+    packet: &[u8],
+    segment_size: u16,
+) -> io::Result<[u8; VIRTIO_NET_HDR_LEN]> {
+    let (ip_len, gso_type) = match packet.first().map(|b| b >> 4) {
+        Some(4) => (usize::from(packet[0] & 15) * 4, VIRTIO_NET_HDR_GSO_TCPV4),
+        Some(6) => (40, VIRTIO_NET_HDR_GSO_TCPV6),
+        _ => return Err(invalid("invalid GSO IP version")),
+    };
+    let payload = packet
+        .get(ip_len..)
+        .ok_or_else(|| invalid("short GSO IP header"))?;
+    let tcp = TcpPacket::new_checked(payload).map_err(|_| invalid("invalid GSO TCP header"))?;
+    if segment_size == 0 {
+        return Err(invalid("zero GSO segment size"));
+    }
+    let mut bytes = [0; VIRTIO_NET_HDR_LEN];
+    VirtioNetHdr {
+        flags: 1, // VIRTIO_NET_HDR_F_NEEDS_CSUM
+        gso_type,
+        hdr_len: (ip_len + usize::from(tcp.header_len())) as u16,
+        gso_size: segment_size,
+        csum_start: ip_len as u16,
+        csum_offset: 16,
+    }
+    .encode(&mut bytes)?;
+    Ok(bytes)
+}
+
 fn split(device: AsyncDevice) -> (Receiver, Sender) {
     let device = Arc::new(device);
     (
@@ -87,6 +116,28 @@ impl PacketReceive for Receiver {
 }
 
 impl PacketSend for Sender {
+    fn tcp_gso(&self) -> bool {
+        self.device.tcp_gso()
+    }
+
+    async fn send_tcp_gso(&mut self, packet: &[u8], segment_size: u16) -> io::Result<()> {
+        let header = tcp_gso_header(packet, segment_size)?;
+        let len = loop {
+            std::future::poll_fn(|cx| self.device.poll_writable(cx)).await?;
+            match self
+                .device
+                .try_send_vectored(&[IoSlice::new(&header), IoSlice::new(packet)])
+            {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                result => break result?,
+            }
+        };
+        if len != header.len() + packet.len() {
+            return Err(invalid("partial TUN GSO write"));
+        }
+        Ok(())
+    }
+
     async fn send_batch(&mut self, packets: &[Bytes]) -> io::Result<()> {
         let offset = if self.device.tcp_gso() {
             VIRTIO_NET_HDR_LEN

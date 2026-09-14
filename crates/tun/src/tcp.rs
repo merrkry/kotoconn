@@ -1,483 +1,827 @@
-//! Each connection owns its smoltcp state and timer. Applications exchange bytes
-//! through adaptive chunked buffers; no lock protects a protocol state machine.
+//! TCP state belongs to the receive worker. Stream handles exchange immutable
+//! payload blocks and consumption notifications without locking the socket.
 use crate::{
-    device::{Device, Transmit},
-    packet::Flow,
+    packet::{Flow, Packet},
+    pool::Pool,
+    storage::PacketArena,
+    tcp_storage::Storage,
+    transmit::Transmit,
 };
-use kotoconn_protocol::{
-    queue,
-    stream_buffer::{self, BufferedStream},
-};
+use bytes::{Buf, Bytes};
+use crossbeam_queue::SegQueue;
+use futures_util::task::AtomicWaker;
+use kotoconn_protocol::queue::{self, Capacity};
 use smoltcp::{
-    iface::{Config, Interface, SocketSet},
-    socket::tcp::{self, State},
+    phy::ChecksumCapabilities,
+    socket::{
+        PollAt,
+        tcp::{self, State},
+    },
     wire::*,
 };
+use std::result::Result;
 use std::{
-    future::poll_fn,
     io,
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    task::{Context, Poll},
+    task::{Context, Poll, ready},
     time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    sync::oneshot,
+    sync::{mpsc, oneshot},
+    task::coop,
     time::Instant,
 };
 
-const BUFFER_SIZE: usize = 512 * 1024;
-
-// The receive window must cover bursts while the application and endpoint
-// drivers run. smoltcp fixes its receive storage and window scale at creation.
-const RECEIVE_BUFFER_SIZE: usize = 256 * 1024;
-
+const INITIAL: usize = 128 * 1024;
+const MAX_WINDOW: usize = (u16::MAX as usize) << 7;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
-// SAFETY: Each TCP interface needs one address and one route. Reject smoltcp
-// configurations without that capacity before the insertion unwraps can run.
-const _: () = {
-    assert!(smoltcp::config::IFACE_MAX_ADDR_COUNT > 0);
-    assert!(smoltcp::config::IFACE_MAX_ROUTE_COUNT > 0);
-    // smoltcp's sequence arithmetic requires receive storage below 2^30.
-    assert!(RECEIVE_BUFFER_SIZE < (1 << 30));
-};
+#[derive(Clone, Copy)]
+pub(crate) struct Link {
+    pub mtu: usize,
+    pub gso: bool,
+}
+
+pub(crate) type Ready = (Flow, u64);
+
+struct Shared {
+    incoming: SegQueue<Bytes>,
+    outgoing: SegQueue<Bytes>,
+    rx_used: Arc<AtomicUsize>,
+    rx_consumed: Arc<AtomicUsize>,
+    tx_used: Arc<AtomicUsize>,
+    tx_acked: Arc<AtomicUsize>,
+    rx_target: Arc<AtomicUsize>,
+    tx_target: Arc<AtomicUsize>,
+    reader: AtomicWaker,
+    writer: AtomicWaker,
+    eof: AtomicBool,
+    finish: AtomicBool,
+    abort: AtomicBool,
+    reset: AtomicBool,
+    queued: AtomicBool,
+    ready: mpsc::UnboundedSender<Ready>,
+    id: Ready,
+    pool: Pool,
+}
+
+impl Shared {
+    fn wake(&self) {
+        if !self.queued.swap(true, Ordering::AcqRel) {
+            let _ = self.ready.send(self.id);
+        }
+    }
+}
 
 pub(crate) struct Stream {
-    inner: BufferedStream,
-    reset: Arc<AtomicBool>,
-    dropped: Option<oneshot::Sender<bool>>,
+    shared: Arc<Shared>,
+    head: Bytes,
     read_eof: bool,
     write_eof: bool,
 }
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        if let Some(tx) = self.dropped.take() {
-            let _ = tx.send(self.read_eof && self.write_eof);
+        if !(self.read_eof && self.write_eof) {
+            self.shared.abort.store(true, Ordering::Release);
         }
+        self.shared.wake();
     }
 }
 
 fn reset_error() -> io::Error {
-    io::Error::from(io::ErrorKind::ConnectionReset)
+    io::ErrorKind::ConnectionReset.into()
 }
 
 impl AsyncRead for Stream {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
+        out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if buf.remaining() == 0 {
+        if out.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
-        if self.reset.load(Ordering::Acquire) {
+        let budget = ready!(coop::poll_proceed(cx));
+        self.shared.reader.register(cx.waker());
+        if self.shared.reset.load(Ordering::Acquire) {
             return Poll::Ready(Err(reset_error()));
         }
-        let before = buf.filled().len();
-        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if matches!(result, Poll::Ready(Ok(()))) && buf.filled().len() == before {
-            self.read_eof = true;
+        let before = out.filled().len();
+        while out.remaining() != 0 {
+            if self.head.is_empty() {
+                let Some(bytes) = self.shared.incoming.pop() else {
+                    break;
+                };
+                self.head = bytes;
+            }
+            let n = out.remaining().min(self.head.len());
+            out.put_slice(&self.head[..n]);
+            self.head.advance(n);
         }
-        result
+        let n = out.filled().len() - before;
+        if n != 0 {
+            let old = self.shared.rx_used.fetch_sub(n, Ordering::AcqRel);
+            debug_assert!(old >= n);
+            self.shared.rx_consumed.fetch_add(n, Ordering::Release);
+            self.shared.wake();
+            budget.made_progress();
+            return Poll::Ready(Ok(()));
+        }
+        if self.shared.eof.load(Ordering::Acquire) {
+            // EOF publication follows the final block. Recheck after acquiring
+            // EOF in case it raced with the earlier empty-queue observation.
+            if let Some(bytes) = self.shared.incoming.pop() {
+                self.head = bytes;
+                return self.poll_read(cx, out);
+            }
+            self.read_eof = true;
+            budget.made_progress();
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
     }
 }
 
 impl AsyncWrite for Stream {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &[u8],
+        data: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if self.reset.load(Ordering::Acquire) {
+        let budget = ready!(coop::poll_proceed(cx));
+        self.shared.writer.register(cx.waker());
+        if self.shared.reset.load(Ordering::Acquire) {
             return Poll::Ready(Err(reset_error()));
         }
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+        if self.write_eof {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+        if data.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let available = self
+            .shared
+            .tx_target
+            .load(Ordering::Acquire)
+            .saturating_sub(self.shared.tx_used.load(Ordering::Acquire));
+        let n = data.len().min(available).min(65536);
+        if n == 0 {
+            return Poll::Pending;
+        }
+        let bytes = self.shared.pool.copy(&data[..n]);
+        self.shared.tx_used.fetch_add(n, Ordering::Release);
+        self.shared.outgoing.push(bytes);
+        self.shared.wake();
+        budget.made_progress();
+        Poll::Ready(Ok(n))
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.reset.load(Ordering::Acquire) {
-            return Poll::Ready(Err(reset_error()));
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.shared.reset.load(Ordering::Acquire) {
+            Poll::Ready(Err(reset_error()))
+        } else {
+            Poll::Ready(Ok(()))
         }
-        Pin::new(&mut self.inner).poll_flush(cx)
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.reset.load(Ordering::Acquire) {
+    fn poll_shutdown(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.shared.reset.load(Ordering::Acquire) {
             return Poll::Ready(Err(reset_error()));
         }
-        let result = Pin::new(&mut self.inner).poll_shutdown(cx);
-        if matches!(result, Poll::Ready(Ok(()))) {
-            self.write_eof = true;
+        self.write_eof = true;
+        self.shared.finish.store(true, Ordering::Release);
+        self.shared.wake();
+        Poll::Ready(Ok(()))
+    }
+}
+
+pub(crate) struct Accept {
+    receiver: oneshot::Receiver<Stream>,
+    shared: Arc<Shared>,
+    completed: bool,
+}
+
+impl Future for Accept {
+    type Output = Result<Stream, oneshot::error::RecvError>;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let result = Pin::new(&mut self.receiver).poll(cx);
+        if result.is_ready() {
+            self.completed = true;
         }
         result
     }
 }
 
-struct ResetOnDrop {
-    reset: Arc<AtomicBool>,
-    armed: bool,
-}
-
-impl Drop for ResetOnDrop {
+impl Drop for Accept {
     fn drop(&mut self) {
-        if self.armed {
-            self.reset.store(true, Ordering::Release);
+        if !self.completed {
+            self.shared.abort.store(true, Ordering::Release);
+            self.shared.wake();
         }
     }
 }
 
-pub(crate) struct QueuedPacket {
-    pub bytes: Vec<u8>,
+struct Host {
+    now: smoltcp::time::Instant,
+    mtu: usize,
+    local: IpAddress,
+    gso: bool,
+}
+
+impl tcp::TcpContext for Host {
+    fn now(&self) -> smoltcp::time::Instant {
+        self.now
+    }
+
+    fn random_u32(&mut self) -> u32 {
+        rand::random()
+    }
+
+    fn ip_mtu(&self) -> usize {
+        self.mtu
+    }
+
+    fn segmentation_caps(&self) -> smoltcp::phy::SegmentationCapabilities {
+        let capacity = if self.gso {
+            std::num::NonZeroUsize::new(65535)
+        } else {
+            None
+        };
+        let mut caps = smoltcp::phy::SegmentationCapabilities::default();
+        caps.tcpv4 = capacity;
+        caps.tcpv6 = capacity;
+        caps
+    }
+
+    fn has_ip_addr(&self, address: IpAddress) -> bool {
+        address == self.local
+    }
+
+    fn get_source_address(&self, _: &IpAddress) -> Option<IpAddress> {
+        Some(self.local)
+    }
 }
 
 pub(crate) struct Connection {
-    pub packets: queue::Sender<QueuedPacket>,
-    pub accepted: oneshot::Receiver<Stream>,
-    pub driver: Pin<Box<dyn Future<Output = io::Result<()>> + Send>>,
+    socket: tcp::Socket<'static, Storage>,
+    shared: Arc<Shared>,
+    admission: Option<(oneshot::Sender<Stream>, Stream)>,
+    host: Host,
+    epoch: Instant,
+    started: bool,
+    rx_capacity: Capacity,
+    tx_capacity: Capacity,
+    closed_normally: bool,
 }
 
-pub(crate) fn connection(
-    flow: Flow,
-    mtu: usize,
-    output: queue::Sender<Transmit>,
-    stopping: tokio_util::sync::CancellationToken,
-) -> Connection {
-    // SAFETY: Dispatch constructs flows from validated unicast IP packets and
-    // run validates the MTU before constructing any connection.
-    debug_assert_eq!(flow.source.is_ipv4(), flow.destination.is_ipv4());
-    debug_assert!(crate::packet::unicast(flow.source.ip().into()));
-    debug_assert!(crate::packet::unicast(flow.destination.ip().into()));
-    debug_assert_ne!(flow.destination.port(), 0);
-    debug_assert!((1280..=65535).contains(&mtu));
+pub(crate) enum Progress {
+    Idle(Option<Instant>),
+    Again,
+    Blocked(usize),
+    Closed,
+}
 
-    let (packets, mut incoming) = queue::channel(
-        queue::INITIAL_BYTES.max(2 * RECEIVE_BUFFER_SIZE),
-        |packet: &QueuedPacket| packet.bytes.len(),
-    );
-    let receive_buffer = vec![0; RECEIVE_BUFFER_SIZE];
-    let send_buffer = vec![0; BUFFER_SIZE];
-    let (accepted_tx, accepted) = oneshot::channel();
-    let (local, mut app) = stream_buffer::duplex();
-    let (dropped, mut drop_rx) = oneshot::channel();
-    let reset = Arc::new(AtomicBool::new(false));
-
-    let stream = Stream {
-        inner: local,
-        reset: reset.clone(),
-        dropped: Some(dropped),
-        read_eof: false,
-        write_eof: false,
-    };
-    let driver = Box::pin(async move {
-        let mut guard = ResetOnDrop { reset, armed: true };
-        let epoch = Instant::now();
-
-        let mut device = Device::new(mtu);
-        let mut config = Config::new(HardwareAddress::Ip);
-        config.random_seed = rand::random();
-        let mut iface = Interface::new(config, &mut device, smoltcp::time::Instant::ZERO);
-
-        let destination: IpAddress = flow.destination.ip().into();
-        let source: IpAddress = flow.source.ip().into();
-        iface.update_ip_addrs(|addrs| {
-            // SAFETY: This is a fresh interface and the capacity is checked
-            // above at compile time. Only this destination is inserted.
-            debug_assert!(addrs.is_empty());
-            debug_assert!(addrs.len() < addrs.capacity());
-            addrs
-                .push(IpCidr::new(
-                    destination,
-                    if flow.destination.is_ipv4() { 32 } else { 128 },
-                ))
-                .unwrap();
+impl Connection {
+    pub fn new(
+        flow: Flow,
+        link: Link,
+        ready: mpsc::UnboundedSender<Ready>,
+        generation: u64,
+        pool: Pool,
+    ) -> io::Result<(Self, Accept)> {
+        let shared = Arc::new(Shared {
+            incoming: SegQueue::new(),
+            outgoing: SegQueue::new(),
+            rx_used: Arc::new(AtomicUsize::new(0)),
+            rx_consumed: Arc::new(AtomicUsize::new(0)),
+            tx_used: Arc::new(AtomicUsize::new(0)),
+            tx_acked: Arc::new(AtomicUsize::new(0)),
+            rx_target: Arc::new(AtomicUsize::new(INITIAL)),
+            tx_target: Arc::new(AtomicUsize::new(INITIAL)),
+            reader: AtomicWaker::new(),
+            writer: AtomicWaker::new(),
+            eof: AtomicBool::new(false),
+            finish: AtomicBool::new(false),
+            abort: AtomicBool::new(false),
+            reset: AtomicBool::new(false),
+            queued: AtomicBool::new(false),
+            ready,
+            id: (flow, generation),
+            pool: pool.clone(),
         });
-
-        // SAFETY: Both match arms insert one route into this fresh table;
-        // the compile-time capacity assertion guarantees a free slot.
-        iface.routes_mut().update(|routes| {
-            debug_assert!(routes.is_empty());
-            debug_assert!(routes.len() < routes.capacity());
-        });
-        match source {
-            IpAddress::Ipv4(ip) => {
-                iface.routes_mut().add_default_ipv4_route(ip).unwrap();
-            }
-            IpAddress::Ipv6(ip) => {
-                iface.routes_mut().add_default_ipv6_route(ip).unwrap();
-            }
-        }
-
-        let mut socket = tcp::Socket::new(
-            tcp::SocketBuffer::new(receive_buffer),
-            tcp::SocketBuffer::new(send_buffer),
+        let rx = Storage::new(
+            pool.clone(),
+            shared.rx_target.clone(),
+            false,
+            shared.rx_used.clone(),
+            shared.rx_consumed.clone(),
         );
+        let tx = Storage::new(
+            pool,
+            shared.tx_target.clone(),
+            true,
+            shared.tx_used.clone(),
+            shared.tx_acked.clone(),
+        );
+        let mut socket = tcp::Socket::with_buffers(rx, tx);
         socket.set_congestion_control(tcp::CongestionControl::Cubic);
         socket.set_timeout(Some(smoltcp::time::Duration::from_secs(120)));
         socket
-            .listen(IpEndpoint::new(destination, flow.destination.port()))
+            .listen(IpEndpoint::new(
+                flow.destination.ip().into(),
+                flow.destination.port(),
+            ))
             .map_err(io::Error::other)?;
+        let stream = Stream {
+            shared: shared.clone(),
+            head: Bytes::new(),
+            read_eof: false,
+            write_eof: false,
+        };
+        let (sender, receiver) = oneshot::channel();
+        let accept = Accept {
+            receiver,
+            shared: shared.clone(),
+            completed: false,
+        };
+        Ok((
+            Self {
+                socket,
+                shared,
+                admission: Some((sender, stream)),
+                host: Host {
+                    now: smoltcp::time::Instant::ZERO,
+                    mtu: link.mtu,
+                    gso: link.gso,
+                    local: flow.destination.ip().into(),
+                },
+                epoch: Instant::now(),
+                started: false,
+                rx_capacity: Capacity::new(INITIAL),
+                tx_capacity: Capacity::new(INITIAL),
+                closed_normally: false,
+            },
+            accept,
+        ))
+    }
 
-        let mut sockets = SocketSet::new(vec![]);
-        let handle = sockets.add(socket);
-        let mut admission = Some((accepted_tx, stream));
+    pub fn wake(&self) {
+        self.shared.wake();
+    }
 
-        let mut read_eof = false;
-        let mut write_eof = false;
-        let mut drop_seen = false;
-        let mut turns = 0;
-        let mut stop_seen = false;
-        let mut handshake_started = false;
+    pub fn begin_turn(&self) {
+        self.shared.queued.store(false, Ordering::Release);
+    }
 
-        loop {
-            let now = smoltcp::time::Instant::from_micros(epoch.elapsed().as_micros() as i64);
-            iface.poll(now, &mut device, &mut sockets);
-            // SAFETY: The set owns exactly this TCP socket. Neither polling nor
-            // any select branch removes it, so all get_mut calls keep this type
-            // and handle for the driver's entire lifetime.
-            debug_assert_eq!(sockets.iter().count(), 1);
-            debug_assert!(sockets.iter().any(|(id, socket)| {
-                id == handle && matches!(socket, smoltcp::socket::Socket::Tcp(_))
-            }));
-            let socket = sockets.get_mut::<tcp::Socket>(handle);
-            if socket.state() == State::SynReceived {
-                handshake_started = true;
-            }
-            // A smoltcp listener returns to Listen on an aborted handshake. This
-            // driver represents one connection, so that transition ends it.
-            if handshake_started && socket.state() == State::Listen {
-                socket.abort();
-            }
-            if matches!(socket.state(), State::Established | State::CloseWait)
-                && let Some((tx, stream)) = admission.take()
-                && tx.send(stream).is_err()
+    fn refresh(&mut self, now: Instant) {
+        self.host.now = smoltcp::time::Instant::from_micros(
+            now.saturating_duration_since(self.epoch).as_micros() as i64,
+        );
+        self.rx_capacity
+            .complete(self.shared.rx_consumed.swap(0, Ordering::AcqRel), now);
+        self.tx_capacity
+            .complete(self.shared.tx_acked.swap(0, Ordering::AcqRel), now);
+        self.shared.rx_target.store(
+            self.rx_capacity.target(now).min(MAX_WINDOW),
+            Ordering::Release,
+        );
+        self.shared.tx_target.store(
+            self.tx_capacity.target(now).min(MAX_WINDOW),
+            Ordering::Release,
+        );
+    }
+
+    pub fn input(
+        &mut self,
+        ip: &IpRepr,
+        repr: &TcpRepr<'_>,
+        now: Instant,
+        output: &queue::Sender<Transmit>,
+        arena: &mut PacketArena,
+    ) {
+        self.refresh(now);
+        if !self.socket.accepts(&mut self.host, ip, repr) {
+            return;
+        }
+        let previous = self.socket.state();
+        if let Some((ip, repr)) = self.socket.process(&mut self.host, ip, repr) {
+            // Immediate ACKs may be lost like network packets. Data ownership is
+            // unaffected; the peer retries and TCP still schedules later ACKs.
+            let _ = emit(arena, output, ip, repr, None);
+        }
+        if self.socket.state() == State::TimeWait
+            || (previous == State::LastAck
+                && self.socket.state() == State::Closed
+                && repr.control != TcpControl::Rst)
+        {
+            self.closed_normally = true;
+        }
+        if self.socket.state() == State::SynReceived {
+            self.started = true;
+        }
+        if self.started && self.socket.state() == State::Listen {
+            self.socket.abort();
+        }
+        self.wake();
+    }
+
+    pub fn poll(
+        &mut self,
+        now: Instant,
+        stopping: bool,
+        output: &queue::Sender<Transmit>,
+        arena: &mut PacketArena,
+    ) -> Progress {
+        self.refresh(now);
+        if self.shared.abort.load(Ordering::Acquire)
+            || (self.admission.is_some() && now >= self.epoch + HANDSHAKE_TIMEOUT)
+        {
+            self.socket.abort();
+        }
+        if matches!(self.socket.state(), State::Established | State::CloseWait) {
+            if let Some((sender, stream)) = self.admission.take()
+                && sender.send(stream).is_err()
             {
-                socket.abort();
+                self.socket.abort();
             }
-            if socket.state() == State::Closed
-                || (socket.state() == State::TimeWait && stopping.is_cancelled())
-            {
-                while let Some(packet) = device.outgoing.pop_front() {
-                    output
-                        .send(Transmit::Packet(packet))
-                        .await
-                        .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+            for _ in 0..32 {
+                let Some(bytes) = self.shared.outgoing.pop() else {
+                    break;
+                };
+                if self
+                    .socket
+                    .send_buffer(|buffer| {
+                        let n = buffer.push(bytes);
+                        (n, ())
+                    })
+                    .is_err()
+                {
+                    self.socket.abort();
+                    break;
                 }
-                if read_eof && write_eof {
-                    // Dropping the driver after an orderly close must leave EOF readable.
-                    guard.armed = false;
-                    return Ok(());
-                }
-                return Err(reset_error());
             }
-            let deadline = iface
-                .poll_at(now, &sockets)
-                .map(|at| epoch + Duration::from_micros(at.total_micros().max(0) as u64));
-            // Bound work per scheduler turn even when all channels stay ready.
-            turns += 1;
-            if turns == 64 {
-                tokio::task::yield_now().await;
-                turns = 0;
+            if self.shared.finish.load(Ordering::Acquire) && self.shared.outgoing.is_empty() {
+                self.socket.close();
             }
-            let admitting = admission.is_some();
-            tokio::select! {
-                _ = async {
-                    if let Some((tx, _)) = &mut admission {
-                        tx.closed().await;
-                    } else {
-                        std::future::pending().await
-                    }
-                }, if admitting => {
-                    sockets.get_mut::<tcp::Socket>(handle).abort();
+        }
+        if self.socket.can_recv() {
+            let shared = &self.shared;
+            let _ = self.socket.recv_buffer(|buffer| {
+                let mut count = 0;
+                for _ in 0..32 {
+                    let Some(bytes) = buffer.take() else {
+                        break;
+                    };
+                    count += bytes.len();
+                    shared.rx_used.fetch_add(bytes.len(), Ordering::Release);
+                    shared.incoming.push(bytes);
                 }
-                _ = stopping.cancelled(), if !stop_seen => {
-                    stop_seen = true;
-                }
-                result = &mut drop_rx, if !drop_seen => {
-                    drop_seen = true;
-                    if result != Ok(true) {
-                        sockets.get_mut::<tcp::Socket>(handle).abort();
-                    }
-                }
-                _ = tokio::time::sleep_until(epoch + HANDSHAKE_TIMEOUT), if admitting => {
-                    sockets.get_mut::<tcp::Socket>(handle).abort();
-                }
-                permit = output.reserve(device.outgoing.front().map_or(0, |packet| crate::storage::charge(packet.len()))), if !device.outgoing.is_empty() => {
-                    // SAFETY: The select guard observed a packet. This driver
-                    // alone owns the queue, and no other branch handler runs
-                    // between that guard and this pop.
-                    debug_assert!(!device.outgoing.is_empty());
-                    permit
-                        .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?
-                        .send(Transmit::Packet(device.outgoing.pop_front().unwrap()));
-                    // Hand over the rest of this bounded burst while capacity
-                    // is ready, so the endpoint can coalesce adjacent segments.
-                    while !device.outgoing.is_empty() {
-                        let Ok(permit) = output.try_reserve(device.outgoing.front().map_or(0, |packet| crate::storage::charge(packet.len()))) else {
-                            break;
-                        };
-                        // SAFETY: This driver alone owns the queue, and the
-                        // loop condition checked it before reserving capacity.
-                        debug_assert!(!device.outgoing.is_empty());
-                        permit.send(Transmit::Packet(device.outgoing.pop_front().unwrap()));
-                    }
-                }
-                packet = incoming.recv(), if device.incoming.is_none() && device.outgoing.len() < 32 => {
-                    match packet {
-                        Some(packet) => device.incoming = Some(packet.bytes),
-                        None => return Err(reset_error()),
-                    }
-                }
-                result = poll_fn(|cx| bridge(
-                    cx,
-                    sockets.get_mut::<tcp::Socket>(handle),
-                    &mut app,
-                    &mut read_eof,
-                    &mut write_eof,
-                )), if !admitting => {
-                    if result.is_err() {
-                        sockets.get_mut::<tcp::Socket>(handle).abort();
-                    }
-                }
-                _ = async {
-                    match deadline {
-                        Some(at) => tokio::time::sleep_until(at).await,
-                        None => std::future::pending().await,
-                    }
-                }, if device.outgoing.len() < 32 => {}
+                (count, ())
+            });
+            self.shared.reader.wake();
+        }
+        if self.admission.is_none()
+            && !self.socket.may_recv()
+            && (self.socket.state() != State::Closed || self.closed_normally)
+        {
+            self.shared.eof.store(true, Ordering::Release);
+            self.shared.reader.wake();
+        }
+        self.shared.writer.wake();
+        if self.socket.state() == State::Closed && !self.closed_normally {
+            self.shared.reset.store(true, Ordering::Release);
+            self.shared.reader.wake();
+        }
+        if self.socket.state() == State::TimeWait && stopping {
+            self.closed_normally = true;
+            return Progress::Closed;
+        }
+        for _ in 0..32 {
+            let mut sent = false;
+            let result = self.socket.dispatch(&mut self.host, |_, meta, (ip, repr)| {
+                let result = emit(arena, output, ip, repr, meta.segmentation_offload_size);
+                sent = result.is_ok();
+                result
+            });
+            match result {
+                Err((queue::Error::Full, bytes)) => return Progress::Blocked(bytes),
+                Err((queue::Error::Closed, _)) => return Progress::Closed,
+                Ok(()) => {}
             }
+            if self.socket.state() == State::Closed {
+                return Progress::Closed;
+            }
+            if !sent {
+                break;
+            }
+        }
+        if self.socket.can_recv() || !self.shared.outgoing.is_empty() {
+            return Progress::Again;
+        }
+        let deadline = match self.socket.poll_at(&mut self.host) {
+            PollAt::Now => return Progress::Again,
+            PollAt::Time(at) => {
+                Some(self.epoch + Duration::from_micros(at.total_micros().max(0) as u64))
+            }
+            PollAt::Ingress => None,
+        };
+        let deadline = if self.admission.is_some() {
+            Some(deadline.map_or(self.epoch + HANDSHAKE_TIMEOUT, |at| {
+                at.min(self.epoch + HANDSHAKE_TIMEOUT)
+            }))
+        } else {
+            deadline
+        };
+        Progress::Idle(deadline)
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if !self.closed_normally {
+            self.shared.reset.store(true, Ordering::Release);
+        }
+        self.shared.reader.wake();
+        self.shared.writer.wake();
+    }
+}
+
+fn emit(
+    arena: &mut PacketArena,
+    output: &queue::Sender<Transmit>,
+    ip: IpRepr,
+    repr: TcpRepr<'_>,
+    segment_size: Option<std::num::NonZeroU16>,
+) -> Result<(), (queue::Error, usize)> {
+    let cost = crate::storage::charge(ip.buffer_len());
+    let permit = output.try_reserve(cost).map_err(|error| (error, cost))?;
+    let (_, packet) = arena.encode(ip.buffer_len(), |bytes| {
+        let (header, payload) = bytes.split_at_mut(ip.header_len());
+        ip.emit(header, &ChecksumCapabilities::default());
+        let mut checksums = ChecksumCapabilities::default();
+        if segment_size.is_some() {
+            checksums.tcp = smoltcp::phy::Checksum::Rx;
+        }
+        // SAFETY: The arena allocated the complete IP/TCP packet length.
+        repr.emit(
+            &mut TcpPacket::new_unchecked(&mut *payload),
+            &ip.src_addr(),
+            &ip.dst_addr(),
+            &checksums,
+        );
+        if segment_size.is_some() {
+            // CHECKSUM_PARTIAL carries the folded pseudo-header sum, without
+            // complement. Linux completes the TCP checksum and segmentation.
+            let seed = checksum::pseudo_header(
+                &ip.src_addr(),
+                &ip.dst_addr(),
+                IpProtocol::Tcp,
+                repr.buffer_len() as u32,
+            );
+            TcpPacket::new_unchecked(payload).set_checksum(seed);
         }
     });
-    Connection {
-        packets,
-        accepted,
-        driver,
-    }
+    permit.send(match segment_size {
+        Some(size) => Transmit::TcpGso {
+            packet,
+            segment_size: size.get(),
+        },
+        None => Transmit::Packet(packet),
+    });
+    Ok(())
 }
 
-fn bridge(
-    cx: &mut Context<'_>,
-    socket: &mut tcp::Socket<'_>,
-    app: &mut BufferedStream,
-    read_eof: &mut bool,
-    write_eof: &mut bool,
-) -> Poll<io::Result<()>> {
-    let mut progressed = false;
-    if socket.can_recv() {
-        let result = socket
-            .recv(|bytes| match Pin::new(&mut *app).poll_write(cx, bytes) {
-                Poll::Ready(Ok(n)) => (n, Poll::Ready(Ok(()))),
-                result => (0, result.map_ok(|_| ())),
-            })
-            .map_err(io::Error::other)?;
-
-        if let Poll::Ready(result) = result {
-            result?;
-            progressed = true;
-        }
-    }
-    if !socket.may_recv()
-        && !socket.can_recv()
-        && !*read_eof
-        && let Poll::Ready(result) = Pin::new(&mut *app).poll_shutdown(cx)
-    {
-        result?;
-        *read_eof = true;
-        progressed = true;
-    }
-
-    if socket.can_send() && !*write_eof {
-        let result = socket
-            .send(|bytes| {
-                let mut buf = ReadBuf::new(bytes);
-                match Pin::new(&mut *app).poll_read(cx, &mut buf) {
-                    Poll::Ready(Ok(())) => {
-                        (buf.filled().len(), Poll::Ready(Ok(buf.filled().len())))
-                    }
-                    result => (0, result.map_ok(|_| 0)),
-                }
-            })
-            .map_err(io::Error::other)?;
-        if let Poll::Ready(result) = result {
-            if result? == 0 {
-                socket.close();
-                *write_eof = true;
-            }
-            progressed = true;
-        }
-    }
-    if progressed {
-        Poll::Ready(Ok(()))
-    } else {
-        Poll::Pending
-    }
-}
-
-/// Closed-port replies use smoltcp's TCP reset semantics, including ACK numbers
-/// and the rule that an RST never elicits another RST.
 pub(crate) struct Rejector {
-    iface: Interface,
-    device: Device,
-    sockets: SocketSet<'static>,
+    arena: PacketArena,
 }
 
 impl Rejector {
-    pub fn new(mtu: usize) -> Self {
-        let mut device = Device::new(mtu);
-        let mut config = Config::new(HardwareAddress::Ip);
-        config.random_seed = rand::random();
-        let iface = Interface::new(config, &mut device, smoltcp::time::Instant::ZERO);
+    pub fn new(_: usize) -> Self {
         Self {
-            iface,
-            device,
-            sockets: SocketSet::new(vec![]),
+            arena: PacketArena::default(),
         }
     }
 
     pub fn reject(
         &mut self,
-        packet: &crate::packet::Packet,
+        packet: &Packet<'_>,
         output: &queue::Sender<Transmit>,
-    ) -> std::result::Result<(), queue::Error> {
-        debug_assert_eq!(packet.ip.next_header(), IpProtocol::Tcp);
-        // Closed-port resets have no payload. Reserve the IP header and the
-        // maximum TCP header before encoding, so dropped replies cannot leave
-        // holes that let a few queued packets pin many arena blocks.
-        let permit = output.try_reserve(crate::storage::charge(packet.ip.header_len() + 60))?;
-
-        self.iface.update_ip_addrs(|addrs| {
-            addrs.clear();
-            // SAFETY: Clearing the address list makes room for this single
-            // destination; the capacity is checked above at compile time.
-            debug_assert!(addrs.len() < addrs.capacity());
-            addrs
-                .push(IpCidr::new(
-                    packet.ip.dst_addr(),
-                    if matches!(packet.ip, IpRepr::Ipv4(_)) {
-                        32
-                    } else {
-                        128
-                    },
-                ))
-                .unwrap();
-        });
-        self.device.incoming = Some(packet.encode());
-        self.iface.poll_ingress_single(
-            smoltcp::time::Instant::ZERO,
-            &mut self.device,
-            &mut self.sockets,
-        );
-        // SAFETY: One TCP ingress poll with an empty socket set emits at most
-        // one closed-port reset. No socket can produce additional egress.
-        assert!(self.device.outgoing.len() <= 1);
-        if let Some(response) = self.device.outgoing.pop_front() {
-            permit.send(Transmit::Packet(response));
+    ) -> Result<(), queue::Error> {
+        let Some((_, repr)) = packet.tcp() else {
+            return Ok(());
+        };
+        if repr.control == TcpControl::Rst {
+            return Ok(());
         }
-        Ok(())
+        let (ip, repr) = tcp::Socket::<tcp::SocketBuffer>::rst_reply(&packet.ip, &repr);
+        emit(&mut self.arena, output, ip, repr, None).map_err(|(error, _)| error)
+    }
+}
+
+#[cfg(test)]
+#[path = "tcp_test_driver.rs"]
+mod test_driver;
+#[cfg(test)]
+pub(crate) use test_driver::{QueuedPacket, connection};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packet::Decoder;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_gso_preserves_dual_stack_payload_sequence_and_checksums() {
+        for ipv6 in [false, true] {
+            let source: IpAddress = if ipv6 { "fd00::1" } else { "192.0.2.1" }.parse().unwrap();
+            let destination: IpAddress =
+                if ipv6 { "fd00::2" } else { "192.0.2.2" }.parse().unwrap();
+            let data: Vec<u8> = (0..60001).map(|n| (n % 251) as u8).collect();
+            let repr = TcpRepr {
+                src_port: 443,
+                dst_port: 12345,
+                control: TcpControl::Psh,
+                seq_number: TcpSeqNumber(100),
+                ack_number: Some(TcpSeqNumber(77)),
+                window_len: 1234,
+                window_scale: None,
+                max_seg_size: None,
+                sack_permitted: false,
+                sack_ranges: [None; 3],
+                timestamp: None,
+                payload: &data,
+            };
+            let ip = IpRepr::new(source, destination, IpProtocol::Tcp, repr.buffer_len(), 64);
+            let (output, mut input) = queue::channel(INITIAL, Transmit::size);
+            emit(
+                &mut PacketArena::default(),
+                &output,
+                ip,
+                repr,
+                std::num::NonZeroU16::new(1200),
+            )
+            .unwrap();
+            let Transmit::TcpGso {
+                packet,
+                segment_size,
+            } = input.try_recv().unwrap()
+            else {
+                panic!()
+            };
+            let header = crate::offload::tcp_gso_header(&packet, segment_size).unwrap();
+            let header = tun_rs::VirtioNetHdr::decode(&header).unwrap();
+            assert_eq!(header.flags, 1);
+            assert_eq!(header.gso_size, 1200);
+            let mut frames = vec![vec![0; 1280]; 51];
+            let mut sizes = vec![0; frames.len()];
+            let count = tun_rs::gso_split(
+                &mut packet.to_vec(),
+                header,
+                &mut frames,
+                &mut sizes,
+                0,
+                ipv6,
+            )
+            .unwrap();
+            let mut reconstructed = Vec::new();
+            for (index, (frame, len)) in frames.iter().zip(sizes).take(count).enumerate() {
+                let packet = Decoder::default()
+                    .decode(&frame[..len], Instant::now())
+                    .unwrap()
+                    .into_owned();
+                let (_, tcp) = packet.tcp().unwrap();
+                assert_eq!(tcp.seq_number, TcpSeqNumber(100) + reconstructed.len());
+                assert_eq!(tcp.ack_number, Some(TcpSeqNumber(77)));
+                assert!(tcp.payload.len() <= 1200);
+                assert_eq!(tcp.control == TcpControl::Psh, index + 1 == count);
+                reconstructed.extend_from_slice(tcp.payload);
+            }
+            assert_eq!(reconstructed, data);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dynamic_receive_window_preserves_advertised_space_when_target_falls() {
+        let flow = Flow {
+            source: "192.0.2.2:12345".parse().unwrap(),
+            destination: "198.51.100.1:443".parse().unwrap(),
+        };
+        let (ready, _runnable) = mpsc::unbounded_channel();
+        let (mut conn, accepted) = Connection::new(
+            flow,
+            Link {
+                mtu: 1280,
+                gso: false,
+            },
+            ready,
+            1,
+            Pool::default(),
+        )
+        .unwrap();
+        let (output, mut replies) = queue::channel(INITIAL, Transmit::size);
+        let mut arena = PacketArena::default();
+        let mut repr = TcpRepr {
+            src_port: flow.source.port(),
+            dst_port: flow.destination.port(),
+            control: TcpControl::Syn,
+            seq_number: TcpSeqNumber(100),
+            ack_number: None,
+            window_len: 65535,
+            window_scale: Some(7),
+            max_seg_size: Some(1220),
+            sack_permitted: true,
+            sack_ranges: [None; 3],
+            timestamp: None,
+            payload: &[],
+        };
+        let ip = IpRepr::new(
+            flow.source.ip().into(),
+            flow.destination.ip().into(),
+            IpProtocol::Tcp,
+            repr.buffer_len(),
+            64,
+        );
+        let now = Instant::now();
+        conn.input(&ip, &repr, now, &output, &mut arena);
+        conn.poll(now, false, &output, &mut arena);
+        let Transmit::Packet(synack) = replies.try_recv().unwrap() else {
+            panic!()
+        };
+        let packet = Decoder::default()
+            .decode(&synack, now)
+            .unwrap()
+            .into_owned();
+        let (_, synack) = packet.tcp().unwrap();
+        assert_eq!(synack.window_scale, Some(7));
+        assert_eq!(synack.window_len, 65535);
+        repr.seq_number = TcpSeqNumber(101);
+        repr.ack_number = Some(synack.seq_number + 1);
+        repr.control = TcpControl::None;
+        repr.window_scale = None;
+        conn.input(&ip, &repr, now, &output, &mut arena);
+        conn.poll(now, false, &output, &mut arena);
+        let stream = accepted.await.unwrap();
+        let mut right = 101usize + 65535;
+        while let Ok(Transmit::Packet(bytes)) = replies.try_recv() {
+            let packet = Decoder::default().decode(&bytes, now).unwrap().into_owned();
+            let (_, ack) = packet.tcp().unwrap();
+            right = ack.ack_number.unwrap().0 as usize + ((ack.window_len as usize) << 7);
+        }
+        assert!(right <= 101 + INITIAL);
+        assert!(right > 101 + 65535);
+
+        // Lower the desired window, then receive a segment inside the previously
+        // advertised range. Scaling may round the wire edge down by 127 bytes,
+        // but all previously promised bytes must remain acceptable.
+        conn.rx_capacity = Capacity::new(16384);
+        repr.payload = b"payload";
+        conn.input(&ip, &repr, now, &output, &mut arena);
+        conn.poll(now + Duration::from_millis(20), false, &output, &mut arena);
+        let mut observed = false;
+        while let Ok(Transmit::Packet(bytes)) = replies.try_recv() {
+            let packet = Decoder::default().decode(&bytes, now).unwrap().into_owned();
+            let (_, ack) = packet.tcp().unwrap();
+            let new_right = ack.ack_number.unwrap().0 as usize + ((ack.window_len as usize) << 7);
+            assert!((right - 127..=right).contains(&new_right));
+            observed = true;
+        }
+        assert!(observed);
+
+        // Leave the application stalled. Fill the old window, including its
+        // quantized tail, then probe past it with one-byte segments. Repeated
+        // ACK rounding must not create fresh credit or discard the old tail.
+        let fill = vec![0; 60000];
+        let mut sent = repr.payload.len();
+        while sent < INITIAL - 128 {
+            let n = fill.len().min(INITIAL - 128 - sent);
+            repr.seq_number = TcpSeqNumber(101) + sent;
+            repr.payload = &fill[..n];
+            conn.input(&ip, &repr, now, &output, &mut arena);
+            conn.poll(now + Duration::from_millis(20), false, &output, &mut arena);
+            while replies.try_recv().is_ok() {}
+            sent += n;
+        }
+        let mut final_ack = None;
+        for offset in sent..INITIAL + 256 {
+            repr.seq_number = TcpSeqNumber(101) + offset;
+            repr.payload = b"x";
+            conn.input(&ip, &repr, now, &output, &mut arena);
+            conn.poll(now + Duration::from_millis(20), false, &output, &mut arena);
+            while let Ok(Transmit::Packet(bytes)) = replies.try_recv() {
+                let packet = Decoder::default().decode(&bytes, now).unwrap().into_owned();
+                let (_, ack) = packet.tcp().unwrap();
+                final_ack = Some((ack.ack_number.unwrap(), ack.window_len));
+            }
+        }
+        assert_eq!(conn.shared.rx_used.load(Ordering::Acquire), INITIAL);
+        assert_eq!(final_ack, Some((TcpSeqNumber(101) + INITIAL, 0)));
+        drop(stream);
     }
 }

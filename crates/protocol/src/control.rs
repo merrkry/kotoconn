@@ -11,6 +11,11 @@ pub struct Scope {
     trackers: Arc<Vec<TaskTracker>>,
 }
 
+/// Keeps synchronous work included in scope completion until its owner drops it.
+pub struct WorkGuard {
+    _tokens: Vec<tokio_util::task::task_tracker::TaskTrackerToken>,
+}
+
 impl Default for Scope {
     fn default() -> Self {
         Self::new()
@@ -80,18 +85,22 @@ impl Scope {
             result = work => result,
         }
     }
-    /// Registers before dispatch so close + wait cannot miss an admitted task.
-    pub fn spawn(&self, work: impl Future<Output = Result<()>> + Send + 'static) -> Result<()> {
-        let guards: Vec<_> = self.trackers.iter().map(TaskTracker::token).collect();
-
+    /// Register worker-owned work before exposing it to other tasks.
+    pub fn track(&self) -> Result<WorkGuard> {
+        let tokens = self.trackers.iter().map(TaskTracker::token).collect();
         if self.is_closed() {
             bail!("connection scope closed");
         }
+        Ok(WorkGuard { _tokens: tokens })
+    }
+
+    pub fn spawn(&self, work: impl Future<Output = Result<()>> + Send + 'static) -> Result<()> {
+        let guard = self.track()?;
 
         let scope = self.clone();
         tokio::spawn(
             async move {
-                let _guards = guards;
+                let _guard = guard;
                 if let Err(error) = scope.run(work).await
                     && !scope.is_closed()
                 {

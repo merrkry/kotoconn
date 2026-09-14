@@ -1,0 +1,3 @@
+[submodule "external/smoltcp"]
+	path = external/smoltcp
+	url = https://github.com/merrkry/smoltcp
