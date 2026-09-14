@@ -2,10 +2,12 @@
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
-import run as benchmark
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from benchmarks import run as benchmark
 from e2e.tun_support.environment import (
     add_arguments,
     enter,
