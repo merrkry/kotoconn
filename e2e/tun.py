@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from testing.tun.environment import (
+from e2e.tun_support.environment import (
     CLIENT,
     REMOTE,
     SERVER_PORTS,
@@ -24,9 +24,9 @@ from testing.tun.environment import (
     resource,
     traffic,
 )
-from testing.tun.lifecycle import BANNER, TRAILER, TcpEcho, client, read_exact
-from testing.tun.packets import Injector
-from testing.tun.scenarios import cases
+from e2e.tun_support.lifecycle import BANNER, TRAILER, TcpEcho, client, read_exact
+from e2e.tun_support.packets import Injector
+from e2e.tun_support.scenarios import cases
 
 
 def generic_relay(args, summary):

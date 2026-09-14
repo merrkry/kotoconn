@@ -58,7 +58,7 @@ jobs:
           docker cp "$tun_container:/usr/local/bin/kotoconn-tun-traffic" target/e2e/kotoconn-tun-traffic
           sudo python3 e2e/tun.py --binary target/e2e/kotoconn --traffic-binary target/e2e/kotoconn-tun-traffic --profile "$TUN_PROFILE" --output target/e2e/tun
       - name: Check concurrent TUN isolation
-        run: sudo python3 testing/tun/check_isolation.py --binary target/e2e/kotoconn --traffic-binary target/e2e/kotoconn-tun-traffic
+        run: sudo python3 e2e/tun_support/check_isolation.py --binary target/e2e/kotoconn --traffic-binary target/e2e/kotoconn-tun-traffic
       - name: Check TUN benchmark pipeline
         run: |
           sudo python3 benchmarks/run.py --binary target/e2e/kotoconn --traffic-binary target/e2e/kotoconn-tun-traffic --mtu 1500 --duration 1 --warmup 0 --repetitions 1 --case tcp-bulk-1 --case udp-paced --case mixed-malformed

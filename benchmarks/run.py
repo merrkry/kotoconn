@@ -5,8 +5,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from testing.tun.comparison import SingBox
-from testing.tun.environment import (
+from e2e.tun_support.comparison import SingBox
+from e2e.tun_support.environment import (
     CLIENT,
     REMOTE,
     SERVER_PORTS,
@@ -17,7 +17,7 @@ from testing.tun.environment import (
     enter,
     traffic,
 )
-from testing.tun.measurement import (
+from e2e.tun_support.measurement import (
     comparisons,
     metadata,
     metrics,
@@ -25,7 +25,7 @@ from testing.tun.measurement import (
     save,
     write_csv,
 )
-from testing.tun.packets import Injector
+from e2e.tun_support.packets import Injector
 
 
 def cases(args):

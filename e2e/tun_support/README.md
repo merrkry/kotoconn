@@ -74,7 +74,7 @@ python3 e2e/tun.py
 python3 e2e/tun.py --profile stress
 python3 e2e/tun.py --case mixed-malformed --mtu 9000 --family 6 --repeat 8 --seed 23
 python3 e2e/tun.py --case generic-relay
-python3 testing/tun/check_isolation.py
+python3 e2e/tun_support/check_isolation.py
 ```
 
 For optimized-code verification, build with `cargo build --release -p kotoconn-cli

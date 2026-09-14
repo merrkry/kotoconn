@@ -17,7 +17,7 @@ policy rules and child processes belong to that run. Source-address routing
 keeps TCP TIME_WAIT acknowledgments on the same path as client traffic.
 Each warmup and measurement uses a separate reserved server port. Namespace-local
 ephemeral-port and TCP TIME_WAIT settings prevent earlier samples from consuming
-the next sample's port space; see [isolation details](../../testing/tun/README.md#isolation-and-artifacts).
+the next sample's port space; see [isolation details](../../e2e/tun_support/README.md#isolation-and-artifacts).
 
 ## Cases
 

@@ -34,7 +34,7 @@ cargo build -p kotoconn-cli -p kotoconn-tun-traffic
 python3 e2e/tun.py
 ```
 
-The E2E runner creates a network namespace, exercises the real CLI against Linux TCP/UDP sockets, injects malformed IP packets, and checks graceful and forced shutdown. It needs `unshare`, `iproute2`, and either unprivileged user namespaces or root. Each invocation owns a new network namespace and artifact directory, so workspaces can run concurrently. See [TUN test responsibilities](../../testing/tun/README.md) for the quick/stress profiles, deterministic tests, mixed malformed traffic and isolation checks.
+The E2E runner creates a network namespace, exercises the real CLI against Linux TCP/UDP sockets, injects malformed IP packets, and checks graceful and forced shutdown. It needs `unshare`, `iproute2`, and either unprivileged user namespaces or root. Each invocation owns a new network namespace and artifact directory, so workspaces can run concurrently. See [TUN test responsibilities](../../e2e/tun_support/README.md) for the quick/stress profiles, deterministic tests, mixed malformed traffic and isolation checks.
 
 ## smoltcp fork
 

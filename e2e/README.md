@@ -36,7 +36,7 @@ malformed input, half-close and device cleanup:
 cargo build -p kotoconn-cli -p kotoconn-tun-traffic
 python3 e2e/tun.py
 python3 e2e/tun.py --profile stress
-python3 testing/tun/check_isolation.py
+python3 e2e/tun_support/check_isolation.py
 ```
 
 This suite needs `unshare`, `iproute2`, and either unprivileged user namespaces or
@@ -46,7 +46,11 @@ the same interface name and ports without sharing devices. It does not change
 the parent network namespace. See
 [the TUN documentation](../crates/tun/README.md) for its supported protocol scope.
 
-See [TUN test responsibilities](../testing/tun/README.md) for coverage, scenario
+See [TUN test responsibilities](tun_support/README.md) for coverage, scenario
 selection, failure artifacts and the boundary between Rust tests, E2E and
 benchmarks. The stress profile adds MTU 1280/65535 and more connections and
 repetitions. It is available through the E2E workflow dispatch input as well.
+
+TUN E2E and benchmarks share namespace, process, packet-injection and measurement
+helpers in `tun_support/`. The runners choose their own workloads and pass/fail
+criteria.
