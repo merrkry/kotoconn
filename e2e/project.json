@@ -1,0 +1,54 @@
+{
+  "name": "e2e",
+  "implicitDependencies": ["docker", "python"],
+  "targets": {
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "uv run --locked python e2e/run.py"
+      },
+      "dependsOn": [
+        {
+          "projects": ["docker"],
+          "target": "build",
+          "params": "ignore"
+        }
+      ]
+    },
+    "tun": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "uv run --locked python e2e/tun.py"
+      },
+      "dependsOn": [
+        {
+          "projects": ["docker"],
+          "target": "build",
+          "params": "ignore"
+        }
+      ],
+      "configurations": {
+        "stress": {
+          "command": "uv run --locked python e2e/tun.py --profile stress"
+        }
+      }
+    },
+    "isolation": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "uv run --locked python e2e/tun_support/check_isolation.py"
+      },
+      "dependsOn": [
+        {
+          "projects": ["docker"],
+          "target": "build",
+          "params": "ignore"
+        }
+      ]
+    },
+    "check": {
+      "executor": "nx:noop",
+      "dependsOn": ["test", "tun", "isolation"]
+    }
+  }
+}

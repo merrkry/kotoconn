@@ -1,0 +1,46 @@
+{
+  "name": "@kotoconn/bindings",
+  "implicitDependencies": ["rust"],
+  "targets": {
+    "generate": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo-zigbuild run --target-dir target --target ${KOTOCONN_RUST_TARGET:-x86_64-unknown-linux-gnu.2.36} --locked --quiet -p kotoconn-script --bin generate-types"
+      },
+      "cache": true,
+      "inputs": ["default", "rust"],
+      "outputs": ["{projectRoot}/src/generated.d.ts"]
+    },
+    "generate-test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo-zigbuild run --target-dir target --target ${KOTOCONN_RUST_TARGET:-x86_64-unknown-linux-gnu.2.36} --locked --quiet -p kotoconn-script --example generate-test-types"
+      },
+      "cache": true,
+      "inputs": ["default", "rust"],
+      "outputs": ["{projectRoot}/tests/generated.d.ts"]
+    },
+    "build": {
+      "executor": "nx:noop",
+      "dependsOn": ["generate"]
+    },
+    "typecheck": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "tsc -p packages/bindings/tsconfig.json --noEmit"
+      },
+      "dependsOn": ["generate"],
+      "cache": true,
+      "inputs": ["default", "rust"]
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "tsc -p packages/bindings/tests/tsconfig.json"
+      },
+      "dependsOn": ["generate", "generate-test"],
+      "cache": true,
+      "inputs": ["default", "rust"]
+    }
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "name": "docker",
+  "implicitDependencies": ["rust"],
+  "targets": {
+    "build": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "docker buildx bake -f docker-bake.hcl"
+      },
+      "parallelism": false,
+      "dependsOn": [
+        {
+          "projects": ["rust"],
+          "target": "build",
+          "params": "ignore"
+        }
+      ]
+    },
+    "release": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "docker buildx bake -f docker-bake.hcl release"
+      },
+      "parallelism": false,
+      "dependsOn": [
+        {
+          "projects": ["rust"],
+          "target": "release",
+          "params": "ignore"
+        }
+      ]
+    },
+    "plan": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "docker buildx bake -f docker-bake.hcl --print"
+      }
+    }
+  },
+  "namedInputs": {
+    "default": [
+      "{projectRoot}/**/*",
+      "sharedGlobals",
+      "{workspaceRoot}/docker-bake.hcl",
+      "{workspaceRoot}/.dockerignore",
+      "{workspaceRoot}/e2e/Dockerfile",
+      "{workspaceRoot}/e2e/tun.Dockerfile"
+    ]
+  }
+}

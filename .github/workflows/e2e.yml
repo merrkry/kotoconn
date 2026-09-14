@@ -2,8 +2,7 @@ name: E2E Tests
 
 on:
   push:
-    branches:
-      - master
+    branches: [master]
   pull_request:
   workflow_dispatch:
     inputs:
@@ -11,9 +10,7 @@ on:
         description: TUN workload profile
         type: choice
         default: quick
-        options:
-          - quick
-          - stress
+        options: [quick, stress]
 
 permissions:
   contents: read
@@ -23,11 +20,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CARGO_TERM_COLOR: always
+  NX_DAEMON: "false"
 
 jobs:
   e2e:
-    name: End-to-end tests
+    name: End-to-end tests and benchmark pipeline
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -35,45 +32,37 @@ jobs:
         with:
           submodules: recursive
           persist-credentials: false
+      - uses: ./.github/actions/setup
+      - name: Build portable binaries with Zig
+        run: pnpm exec nx run rust:build
       - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - name: Build images and export TUN binaries
+        uses: docker/bake-action@v6
         with:
-          context: .
-          file: e2e/Dockerfile
-          build-args: CARGO_TERM_COLOR=${{ env.CARGO_TERM_COLOR }}
-          tags: kotoconn-e2e:local
-          load: true
-          cache-from: type=gha,scope=kotoconn-e2e
-          cache-to: type=gha,scope=kotoconn-e2e,mode=max
-      - name: Run E2E suites
-        run: python3 e2e/run.py
-      - name: Build TUN runtime image
-        run: docker build -f e2e/tun.Dockerfile -t kotoconn-tun:local .
+          source: .
+          files: docker-bake.hcl
+          set: |
+            proxy.cache-from=type=gha,scope=kotoconn-e2e
+            proxy.cache-to=type=gha,scope=kotoconn-e2e,mode=max
+            binaries.cache-from=type=gha,scope=kotoconn-e2e
+            tun-runtime.cache-from=type=gha,scope=kotoconn-tun
+            tun-runtime.cache-to=type=gha,scope=kotoconn-tun,mode=max
+      # Bake above already fulfilled docker:build, including filesystem exports.
+      - name: Run protocol E2E suites
+        run: pnpm exec nx run e2e:test --excludeTaskDependencies
       - name: Run Linux TUN E2E suite
         env:
           TUN_PROFILE: ${{ inputs.tun_profile || 'quick' }}
-        run: |
-          mkdir -p target/e2e/tun
-          tun_container=$(docker create kotoconn-e2e:local)
-          trap 'docker rm -f "$tun_container"' EXIT
-          docker cp "$tun_container:/usr/local/bin/kotoconn" target/e2e/kotoconn
-          docker cp "$tun_container:/usr/local/bin/kotoconn-tun-traffic" target/e2e/kotoconn-tun-traffic
-          python3 e2e/tun.py --binary target/e2e/kotoconn --traffic-binary target/e2e/kotoconn-tun-traffic --profile "$TUN_PROFILE" --output target/e2e/tun
+        run: pnpm exec nx run e2e:tun --excludeTaskDependencies -- --profile "$TUN_PROFILE"
       - name: Check concurrent TUN isolation
-        run: python3 e2e/tun_support/check_isolation.py --binary target/e2e/kotoconn --traffic-binary target/e2e/kotoconn-tun-traffic
-      - name: Check TUN benchmark pipeline
-        run: |
-          python3 benchmarks/run.py --binary target/e2e/kotoconn --traffic-binary target/e2e/kotoconn-tun-traffic --mtu 1500 --duration 1 --warmup 0 --repetitions 1 --case tcp-bulk-1 --case udp-paced --case mixed-malformed
-      - name: Check UDP benchmark warmup reuse
-        run: python3 benchmarks/check_udp_churn.py --binary target/e2e/kotoconn --traffic-binary target/e2e/kotoconn-tun-traffic
+        run: pnpm exec nx run e2e:isolation --excludeTaskDependencies
+      - name: Check benchmark measurement pipeline and UDP warmup reuse
+        run: pnpm exec nx run-many -p benchmarks -t smoke,udp-churn-smoke --excludeTaskDependencies --parallel=1
       - uses: actions/upload-artifact@v4
-        # Upload diagnostic logs even if tests fail or the run is cancelled.
         if: always()
         with:
           name: e2e-results
           path: |
             target/e2e
-            !target/e2e/kotoconn
-            !target/e2e/kotoconn-tun-traffic
             target/benchmarks
           if-no-files-found: ignore

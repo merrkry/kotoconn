@@ -3,6 +3,7 @@
 import argparse
 import sys
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from e2e.tun_support.comparison import SingBox
@@ -158,7 +159,8 @@ def run(args):
                 for implementation in order:
                     directory = args.output / f"{case_id}-{repetition}-{implementation}"
                     directory.mkdir()
-                    entry = {
+                    # JSON report entries collect heterogeneous metrics and failure details.
+                    entry: dict[str, Any] = {
                         "case": case_id,
                         "implementation": implementation,
                         "repetition": repetition,

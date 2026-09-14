@@ -256,12 +256,17 @@ class Process:
             bufsize=1,
             env=env,
         )
+        # SAFETY: Popen creates both streams because stdin and stdout use PIPE.
+        assert self.process.stdin is not None and self.process.stdout is not None
+        self.stdin = self.process.stdin
+        self.stdout = self.process.stdout
+
         self.thread = threading.Thread(target=self.read, daemon=True)
         self.thread.start()
 
     def read(self):
         try:
-            for line in self.process.stdout:
+            for line in self.stdout:
                 self.log.write(line)
                 self.log.flush()
                 self.lines.append(line)
@@ -288,8 +293,8 @@ class Process:
                 return value
 
     def send(self, value):
-        self.process.stdin.write(value + "\n")
-        self.process.stdin.flush()
+        self.stdin.write(value + "\n")
+        self.stdin.flush()
 
     def close(self):
         if self.process.poll() is None:
@@ -300,8 +305,8 @@ class Process:
                 self.process.kill()
                 self.process.wait(timeout=5)
         self.thread.join(timeout=5)
-        self.process.stdin.close()
-        self.process.stdout.close()
+        self.stdin.close()
+        self.stdout.close()
         self.log.close()
 
 

@@ -1,0 +1,64 @@
+{
+  "name": "rust",
+  "targets": {
+    "build": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo zigbuild --target-dir target --target ${KOTOCONN_RUST_TARGET:-x86_64-unknown-linux-gnu.2.36} --workspace --locked"
+      }
+    },
+    "release": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo zigbuild --target-dir target --target ${KOTOCONN_RUST_TARGET:-x86_64-unknown-linux-gnu.2.36} --release --locked -p kotoconn-cli -p kotoconn-tun-traffic"
+      }
+    },
+    "run": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo-zigbuild run --target-dir target --target ${KOTOCONN_RUST_TARGET:-x86_64-unknown-linux-gnu.2.36} --locked -p kotoconn-cli --"
+      }
+    },
+    "format": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo fmt --all"
+      }
+    },
+    "format-check": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo fmt --all -- --check"
+      }
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo-zigbuild clippy --target-dir target --target ${KOTOCONN_RUST_TARGET:-x86_64-unknown-linux-gnu.2.36} --workspace --all-targets --locked -- -D warnings"
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "cargo-zigbuild test --target-dir target --target ${KOTOCONN_RUST_TARGET:-x86_64-unknown-linux-gnu.2.36} --workspace --locked"
+      }
+    },
+    "fork-test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "parallel": false,
+        "commands": [
+          "cargo fmt --manifest-path external/smoltcp/Cargo.toml -- --check",
+          "cargo-zigbuild test --target-dir target --target ${KOTOCONN_RUST_TARGET:-x86_64-unknown-linux-gnu.2.36} --manifest-path external/smoltcp/Cargo.toml --lib --no-default-features --features std,medium-ip,proto-ipv4,proto-ipv6,socket-tcp,socket-tcp-cubic,assembler-max-segment-count-32,segmentation-offload"
+        ]
+      }
+    },
+    "check": {
+      "executor": "nx:noop",
+      "dependsOn": ["format-check", "lint", "test", "fork-test"]
+    }
+  },
+  "namedInputs": {
+    "default": ["rustSources", "sharedGlobals"]
+  }
+}

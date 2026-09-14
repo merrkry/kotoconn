@@ -3,7 +3,7 @@
 Run the example from the repository root:
 
 ```sh
-cargo run -p kotoconn-cli -- run --config packages/api/examples/policy.ts
+pnpm exec nx run rust:run -- run --config packages/api/examples/policy.ts
 ```
 
 `Daemon::start(path, shutdown_timeout)` reads the policy and its imports, evaluates it, and seals registration. CLI only supplies the path. `start_with_sources` accepts an independent source provider for embedding and tests. All configured listeners bind before startup returns. The example opens HTTP CONNECT, SOCKS5 and Shadowsocks 2022 listeners. `listen_addresses()` reports actual socket addresses, including OS-assigned ports. `inbound_addresses()` also reports TUN interface names. See the [Linux TUN inbound](../tun/README.md) for configuration and routing.
@@ -25,7 +25,7 @@ Shadowsocks uses the single-user AES-128-GCM 2022 method in this version. The ex
 The `kotoconn` binary initializes a global tracing subscriber before starting the runtime. Logs go to stderr and default to `info`. Set `RUST_LOG` to control levels by module; an invalid filter fails startup. Use `--log-format json` for newline-delimited JSON, or keep the default `text` format. Text output uses color only when stderr is a terminal.
 
 ```sh
-RUST_LOG=info,kotoconn_daemon=debug cargo run -p kotoconn-cli -- \
+RUST_LOG=info,kotoconn_daemon=debug pnpm exec nx run rust:run -- \
   run --config packages/api/examples/policy.ts --log-format json
 ```
 

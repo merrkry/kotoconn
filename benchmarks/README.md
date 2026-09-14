@@ -1,11 +1,11 @@
 # Benchmarks
 
 The [TUN workload suite](tun/README.md) shares verified traffic generation and
-network isolation with the TUN E2E tests. Build the container binaries and
-runtime image using the [setup instructions](tun/README.md), then run:
+network isolation with the TUN E2E tests. Follow the [setup instructions](tun/README.md),
+then let Nx build the release binaries and run the workloads:
 
 ```sh
-python3 benchmarks/run.py
+pnpm exec nx run benchmarks:run
 ```
 
 Each run writes JSON samples, latency histograms, resource measurements and a

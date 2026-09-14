@@ -3,8 +3,8 @@
 The [example policy](../../packages/api/examples/tun.ts) creates `kototun0` and routes TCP and UDP through a direct outbound. Run it with access to `/dev/net/tun` and `CAP_NET_ADMIN`:
 
 ```sh
-cargo build -p kotoconn-cli
-sudo target/debug/kotoconn run --config packages/api/examples/tun.ts
+pnpm exec nx run rust:build
+sudo target/x86_64-unknown-linux-gnu/debug/kotoconn run --config packages/api/examples/tun.ts
 ```
 
 `tun_inbound` takes an unused interface name, an MTU between 1280 and 65535, and an `addresses` array of native IP addresses and prefix lengths. An empty array leaves address assignment to the operator. One IPv4 address and multiple IPv6 addresses are supported. The interface is not persistent. Failed startup and completed shutdown release it. `Daemon::inbound_addresses()` reports its name; `listen_addresses()` reports only socket listeners.
@@ -29,10 +29,10 @@ For queue ownership, TCP scheduling and shutdown, see [ADR 0009](../../docs/adr/
 Run the protocol tests with:
 
 ```sh
-cargo test -p kotoconn-tun
+cargo-zigbuild test --target x86_64-unknown-linux-gnu.2.36 -p kotoconn-tun
 ```
 
-For Linux E2E tests, [build the container binaries and runtime image](../../e2e/tun_support/README.md#real-network-e2e), then run `python3 e2e/tun.py`.
+For Linux E2E tests, follow the [workspace setup](../../docs/development.md#setup), then run `pnpm exec nx run e2e:tun` to build the container artifacts and run the suite.
 The runner exercises the real CLI against Linux TCP/UDP sockets, injects malformed
 IP packets, and checks graceful and forced shutdown. It needs Docker and
 `/dev/net/tun`. Each invocation owns a container with a private network and a
@@ -68,7 +68,7 @@ allocation policy, pools and worker ownership stay in Kotoconn. See
 The fork is excluded from the parent Cargo workspace. Run its tests separately:
 
 ```sh
-cargo test --manifest-path external/smoltcp/Cargo.toml --lib --no-default-features --features std,medium-ip,proto-ipv4,proto-ipv6,socket-tcp,socket-tcp-cubic,assembler-max-segment-count-32,segmentation-offload
+pnpm exec nx run rust:fork-test
 ```
 
 Git branch and submodule operations are documented in

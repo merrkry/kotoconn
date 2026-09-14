@@ -4,3 +4,6 @@ node_modules/
 dist/
 /packages/bindings/src/generated.d.ts
 /packages/bindings/tests/generated.d.ts
+/.nx/
+/.venv/
+/.ruff_cache/

@@ -6,6 +6,7 @@ use anyhow::{Context, Result, ensure};
 use std::{
     collections::{HashMap, hash_map::Entry},
     net::SocketAddr,
+    str::FromStr,
     sync::Arc,
     time::Duration,
 };
@@ -15,6 +16,59 @@ use tokio::{
     task::JoinHandle,
     time::Instant,
 };
+
+/// Disjoint cyclic client port sets keep the generator out of the proxy's
+/// ephemeral allocation budget while bounding the number of retained sessions.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SourcePorts {
+    first: u16,
+    last: u16,
+}
+
+impl FromStr for SourcePorts {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let (first, last) = value.split_once('-').context("expected START-END ports")?;
+        let first = first.parse()?;
+        let last = last.parse()?;
+
+        ensure!(first != 0 && first <= last, "invalid UDP source port range");
+        Ok(Self { first, last })
+    }
+}
+
+impl SourcePorts {
+    pub(crate) fn validate(self, connections: usize) -> Result<()> {
+        // SAFETY: FromStr is the only constructor and rejects zero/reversed ranges.
+        debug_assert!(self.first != 0 && self.first <= self.last);
+        let count = usize::from(self.last) - usize::from(self.first) + 1;
+        ensure!(
+            connections > 0 && count / connections >= 2 && count.is_multiple_of(connections),
+            "UDP source ports must divide evenly into at least two ports per flow"
+        );
+        Ok(())
+    }
+
+    fn port(self, flow: u64, sequence: u64, connections: usize) -> u16 {
+        // SAFETY: run validates the pool before spawning flows. Each flow's
+        // index is below connections; its contiguous partition stays in range.
+        debug_assert!(self.validate(connections).is_ok());
+        debug_assert!(flow < connections as u64);
+
+        let per_flow = (u64::from(self.last) - u64::from(self.first) + 1) / connections as u64;
+        let port = u64::from(self.first) + flow * per_flow + sequence % per_flow;
+        debug_assert!(port <= u64::from(self.last));
+        port as u16
+    }
+}
+
+fn source(args: &Args, flow: u64, sequence: u64) -> SocketAddr {
+    let port = args
+        .udp_source_ports
+        .map_or(0, |ports| ports.port(flow, sequence, args.connections));
+    SocketAddr::new(args.source, port)
+}
 
 pub async fn serve(
     args: Arc<Args>,
@@ -79,7 +133,7 @@ pub async fn run(args: &Args, flow: u64) -> Result<Stats> {
     }
     let mut stats = Stats::new()?;
     stats.connections = 1;
-    let mut socket = UdpSocket::bind(SocketAddr::new(args.source, 0)).await?;
+    let mut socket = UdpSocket::bind(source(args, flow, 0)).await?;
     socket
         .connect(SocketAddr::new(args.target, args.port))
         .await?;
@@ -108,7 +162,7 @@ pub async fn run(args: &Args, flow: u64) -> Result<Stats> {
             .await;
         }
         if args.workload == Workload::Churn && sequence > 0 {
-            socket = UdpSocket::bind(SocketAddr::new(args.source, 0)).await?;
+            socket = UdpSocket::bind(source(args, flow, sequence)).await?;
             socket
                 .connect(SocketAddr::new(args.target, args.port))
                 .await?;
@@ -252,6 +306,42 @@ async fn paced(args: &Args, flow: u64) -> Result<Stats> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn source_port_cycles_stay_disjoint_when_flows_advance_independently() {
+        let ports: SourcePorts = "50000-50063".parse().unwrap();
+        ports.validate(8).unwrap();
+        let mut all = std::collections::HashSet::new();
+        for flow in 0..8 {
+            let mut used = std::collections::HashSet::new();
+            for sequence in 0..512 {
+                let port = ports.port(flow, sequence, 8);
+                assert!((50000..=50063).contains(&port));
+                assert_ne!(port, ports.port(flow, sequence + 1, 8));
+                used.insert(port);
+            }
+            assert_eq!(used.len(), 8);
+            for port in used {
+                assert!(all.insert(port), "two flows own the same source port");
+            }
+        }
+        assert_eq!(all.len(), 64);
+
+        let edge: SourcePorts = "65520-65535".parse().unwrap();
+        edge.validate(8).unwrap();
+        assert_eq!(edge.port(7, u64::MAX, 8), 65535);
+    }
+
+    #[test]
+    fn source_port_configuration_rejects_unusable_partitions() {
+        for value in ["0-63", "65535-65534", "65536-65537", "50000", "a-b"] {
+            assert!(value.parse::<SourcePorts>().is_err(), "{value}");
+        }
+        let ports: SourcePorts = "50000-50063".parse().unwrap();
+        for connections in [0, 3, 33, 65] {
+            assert!(ports.validate(connections).is_err());
+        }
+    }
 
     #[tokio::test]
     async fn completed_sender_with_missing_replies_still_finishes_receive_drain() {
