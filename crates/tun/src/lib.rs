@@ -21,3 +21,5 @@ pub use linux::{BoundTun, bind};
 mod parallel_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod workload_tests;
