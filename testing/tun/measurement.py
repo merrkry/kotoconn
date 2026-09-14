@@ -118,9 +118,6 @@ def resource_metrics(result):
     for name in ("daemon", "generator"):
         before = result["resources"]["before"][name]
         after = result["resources"]["after"][name]
-        if before is None:
-            metrics[name] = None
-            continue
         cpu = sum(
             after[field] - before[field] for field in ("user_seconds", "system_seconds")
         )
@@ -206,9 +203,9 @@ def write_csv(path, runs):
                     run["repetition"],
                     metric["confirmed_bidirectional_bytes_per_second"],
                     metric["operations_per_second"],
-                    daemon["cpu_cores"] if daemon else None,
+                    daemon["cpu_cores"],
                     run["resources"]["generator"]["cpu_cores"],
-                    daemon["observed_peak_rss_bytes"] if daemon else None,
+                    daemon["observed_peak_rss_bytes"],
                     metric["totals"]["lost_datagrams"],
                     json.dumps(
                         {

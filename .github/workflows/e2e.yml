@@ -6,6 +6,14 @@ on:
       - master
   pull_request:
   workflow_dispatch:
+    inputs:
+      tun_profile:
+        description: TUN workload profile
+        type: choice
+        default: quick
+        options:
+          - quick
+          - stress
 
 permissions:
   contents: read
@@ -40,17 +48,28 @@ jobs:
       - name: Run E2E suites
         run: python3 e2e/run.py
       - name: Run Linux TUN E2E suite
+        env:
+          TUN_PROFILE: ${{ inputs.tun_profile || 'quick' }}
         run: |
           mkdir -p target/e2e/tun
           tun_container=$(docker create kotoconn-e2e:local)
           trap 'docker rm -f "$tun_container"' EXIT
           docker cp "$tun_container:/usr/local/bin/kotoconn" target/e2e/kotoconn
           docker cp "$tun_container:/usr/local/bin/kotoconn-tun-traffic" target/e2e/kotoconn-tun-traffic
-          sudo python3 e2e/tun.py --binary target/e2e/kotoconn --traffic-binary target/e2e/kotoconn-tun-traffic --output target/e2e/tun
+          sudo python3 e2e/tun.py --binary target/e2e/kotoconn --traffic-binary target/e2e/kotoconn-tun-traffic --profile "$TUN_PROFILE" --output target/e2e/tun
+      - name: Check concurrent TUN isolation
+        run: sudo python3 testing/tun/check_isolation.py --binary target/e2e/kotoconn --traffic-binary target/e2e/kotoconn-tun-traffic
+      - name: Check TUN benchmark pipeline
+        run: |
+          sudo python3 benchmarks/run.py --binary target/e2e/kotoconn --traffic-binary target/e2e/kotoconn-tun-traffic --mtu 1500 --duration 1 --warmup 0 --repetitions 1 --case tcp-bulk-1 --case udp-paced --case mixed-malformed
       - uses: actions/upload-artifact@v4
         # Upload diagnostic logs even if tests fail or the run is cancelled.
         if: always()
         with:
           name: e2e-results
-          path: target/e2e
+          path: |
+            target/e2e
+            !target/e2e/kotoconn
+            !target/e2e/kotoconn-tun-traffic
+            target/benchmarks
           if-no-files-found: ignore

@@ -3,7 +3,7 @@
 The [example policy](../../packages/api/examples/tun.ts) creates `kototun0` and routes TCP and UDP through a direct outbound. Run it with access to `/dev/net/tun` and `CAP_NET_ADMIN`:
 
 ```sh
-cargo build -p kotoconn-cli -p kotoconn-tun-traffic
+cargo build -p kotoconn-cli
 sudo target/debug/kotoconn run --config packages/api/examples/tun.ts
 ```
 
@@ -30,8 +30,8 @@ Run the protocol tests and isolated Linux E2E tests with:
 
 ```sh
 cargo test -p kotoconn-tun
-cargo build -p kotoconn-cli
+cargo build -p kotoconn-cli -p kotoconn-tun-traffic
 python3 e2e/tun.py
 ```
 
-The E2E runner creates a network namespace, exercises the real CLI against Linux TCP/UDP sockets, injects malformed IP packets, and checks graceful and forced shutdown. It needs `unshare`, `iproute2`, and either unprivileged user namespaces or root. Logs and generated policy files are retained under `target/`.
+The E2E runner creates a network namespace, exercises the real CLI against Linux TCP/UDP sockets, injects malformed IP packets, and checks graceful and forced shutdown. It needs `unshare`, `iproute2`, and either unprivileged user namespaces or root. Each invocation owns a new network namespace and artifact directory, so workspaces can run concurrently. See [TUN test responsibilities](../../testing/tun/README.md) for the quick/stress profiles, deterministic tests, mixed malformed traffic and isolation checks.

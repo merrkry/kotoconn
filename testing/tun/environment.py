@@ -58,9 +58,16 @@ def enter(args, script, category):
     print(f"Artifacts: {directory}", flush=True)
     env = dict(os.environ, KOTOCONN_TUN_PARENT_NETNS=os.readlink("/proc/self/ns/net"))
     child = subprocess.Popen(argv, env=env, start_new_session=True)
+
+    def interrupted(_signal, _frame):
+        raise KeyboardInterrupt
+
+    # SIGTERM must run the same child cleanup as Ctrl-C, including in CI.
+    previous = signal.signal(signal.SIGTERM, interrupted)
     try:
         code = child.wait()
     finally:
+        signal.signal(signal.SIGTERM, previous)
         # The namespace and all its devices disappear after its last process exits.
         # Also collect descendants on cancellation; never target another run's group.
         try:
@@ -326,7 +333,7 @@ def traffic(binary, daemon, directory, spec, *, inject=None):
                 samples.append(
                     {
                         "seconds": time.monotonic() - started,
-                        "daemon": resource(daemon.process.pid) if daemon else None,
+                        "daemon": resource(daemon.process.pid),
                         "generator": resource(tool.process.pid),
                     }
                 )
@@ -339,7 +346,7 @@ def traffic(binary, daemon, directory, spec, *, inject=None):
     try:
         tool.event("ready")
         before = {
-            "daemon": resource(daemon.process.pid) if daemon else None,
+            "daemon": resource(daemon.process.pid),
             "generator": resource(tool.process.pid),
         }
         network_before = network_snapshot()
@@ -353,7 +360,7 @@ def traffic(binary, daemon, directory, spec, *, inject=None):
         )
         wall = time.monotonic() - started
         after = {
-            "daemon": resource(daemon.process.pid) if daemon else None,
+            "daemon": resource(daemon.process.pid),
             "generator": resource(tool.process.pid),
         }
         stop.set()

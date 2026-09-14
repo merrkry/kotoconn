@@ -11,28 +11,22 @@ BANNER = b"server-first\n"
 TRAILER = b"after-half-close\n"
 
 
-class Echo:
+class TcpEcho:
     def __init__(self):
         self.stop = threading.Event()
         self.sockets = []
         self.threads = []
-        self.bad = []
         self.errors = []
         self.forced = False
-        self.accepted = 0
         for family, address in zip((socket.AF_INET, socket.AF_INET6), REMOTE):
             tcp = socket.socket(family, socket.SOCK_STREAM)
             tcp.bind((address, PORT))
             tcp.listen()
             tcp.settimeout(0.2)
-            udp = socket.socket(family, socket.SOCK_DGRAM)
-            udp.bind((address, PORT))
-            udp.settimeout(0.2)
-            self.sockets.extend((tcp, udp))
-            for target, sock in ((self.accept, tcp), (self.datagrams, udp)):
-                thread = threading.Thread(target=target, args=(sock,), daemon=True)
-                thread.start()
-                self.threads.append(thread)
+            self.sockets.append(tcp)
+            thread = threading.Thread(target=self.accept, args=(tcp,), daemon=True)
+            thread.start()
+            self.threads.append(thread)
 
     def accept(self, listener):
         while not self.stop.is_set():
@@ -42,7 +36,6 @@ class Echo:
                 continue
             except OSError:
                 return
-            self.accepted += 1
             thread = threading.Thread(target=self.stream, args=(conn,), daemon=True)
             thread.start()
             self.threads.append(thread)
@@ -68,18 +61,6 @@ class Echo:
                 ):
                     self.errors.append(str(error))
 
-    def datagrams(self, sock):
-        while not self.stop.is_set():
-            try:
-                data, peer = sock.recvfrom(65536)
-                if data.startswith(b"INVALID"):
-                    self.bad.append(data)
-                sock.sendto(data, peer)
-            except TimeoutError:
-                continue
-            except OSError:
-                return
-
     def close(self):
         self.stop.set()
         for sock in self.sockets:
@@ -89,7 +70,6 @@ class Echo:
         assert all(not thread.is_alive() for thread in self.threads), (
             "echo worker did not stop"
         )
-        assert not self.bad, f"malformed datagrams reached outbound: {self.bad}"
         assert not self.errors, self.errors
 
 

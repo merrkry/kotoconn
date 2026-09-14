@@ -23,7 +23,7 @@ from testing.tun.environment import (
     resource,
     traffic,
 )
-from testing.tun.lifecycle import BANNER, TRAILER, Echo, client, read_exact
+from testing.tun.lifecycle import BANNER, TRAILER, TcpEcho, client, read_exact
 from testing.tun.packets import Injector
 from testing.tun.scenarios import cases
 
@@ -67,7 +67,7 @@ def generic_relay(args, summary):
 
 
 def lifecycle(args):
-    echo = Echo()
+    echo = TcpEcho()
     try:
         daemon = Daemon(
             args.binary, args.output / "graceful", 1500, cpus=args.daemon_cpus

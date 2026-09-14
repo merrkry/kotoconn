@@ -28,13 +28,15 @@ When changing coverage, see [run.py](run.py) for scenarios and
 [traffic.py](traffic.py) for traffic assertions and sing-box limitations.
 
 Linux TUN tests run the real CLI against the kernel TCP/IP stack in a separate
-network namespace. They cover IPv4/IPv6, fragmented UDP, concurrent TCP/UDP
-connections, half-close, server-first traffic, malformed packets and device
-cleanup on shutdown:
+network namespace. They repeat single and concurrent TCP/UDP workloads at MTU 1500 and 9000,
+including short connections, sparse activity, sustained transfers, mixed
+malformed input, half-close and device cleanup:
 
 ```sh
 cargo build -p kotoconn-cli -p kotoconn-tun-traffic
 python3 e2e/tun.py
+python3 e2e/tun.py --profile stress
+python3 testing/tun/check_isolation.py
 ```
 
 This suite needs `unshare`, `iproute2`, and either unprivileged user namespaces or
@@ -43,3 +45,8 @@ directory, including when `--output` is supplied. Concurrent workspaces can use
 the same interface name and ports without sharing devices. It does not change
 the parent network namespace. See
 [the TUN documentation](../crates/tun/README.md) for its supported protocol scope.
+
+See [TUN test responsibilities](../testing/tun/README.md) for coverage, scenario
+selection, failure artifacts and the boundary between Rust tests, E2E and
+benchmarks. The stress profile adds MTU 1280/65535 and more connections and
+repetitions. It is available through the E2E workflow dispatch input as well.

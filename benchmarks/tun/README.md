@@ -96,26 +96,31 @@ Failures remain failures and retain their artifacts. Repetitions are independent
 samples; a successful repetition does not replace an earlier failure.
 
 These are loopback application measurements. Payload generation and verification
-can limit throughput, especially with debug builds. Use the native calibration
-and generator CPU measurements before attributing a limit to the proxy. Process
-CPU does not include all kernel softirq work. RSS need not return to its initial
+can limit throughput, especially with debug builds. Inspect generator CPU
+measurements before attributing a limit to the proxy. Process CPU does not
+include all kernel softirq work. RSS need not return to its initial
 value because allocators and payload pools can retain free memory.
 
 ## Comparisons
 
 ```sh
-python3 benchmarks/run.py --baseline /path/to/previous/kotoconn
-python3 benchmarks/run.py --sing-box /path/to/sing-box --native-baseline
+python3 benchmarks/run.py --sing-box /path/to/sing-box-1.15
 python3 benchmarks/run.py --case udp-paced --udp-rate 20000 --repetitions 5
 ```
 
-The sing-box binary must include its `go` TUN stack. The original reference
-revision is [68b74f9](https://github.com/SagerNet/sing-box/commit/68b74f9516a2b2e126065e71f31344e2802ce507).
-The adapter uses the same
-addresses, MTU and workload; references are never downloaded or rebuilt
-implicitly. Native calibration bypasses TUN and is omitted for malformed-input
-cases. Candidate/reference order alternates between repetitions. Raw samples
-and medians remain available; no fixed performance threshold fails shared CI.
+The only reference is sing-box 1.15 with its go TUN stack. The runner checks
+its version before starting a workload and records the full version output
+and binary hash. The verified release is
+[1.15.0-alpha.3](https://github.com/SagerNet/sing-box/releases/tag/v1.15.0-alpha.3).
+Reference binaries are supplied by the caller, never downloaded or rebuilt
+implicitly. Omitting `--sing-box` runs only Kotoconn.
+
+Both implementations receive the same addresses, MTU, payload seed and workload.
+Their order alternates between repetitions. Raw samples and medians remain
+available; no fixed performance threshold fails shared CI. Once measurement
+and payload validation complete, the reference process is killed and its TUN
+release is checked. Reference graceful-shutdown behavior is not an E2E contract
+of this repository and does not enter the measurement window.
 
 `--daemon-cpus` sets only daemon process affinity. By default it uses the first
 two CPUs already available to the caller, or one when only one is available.

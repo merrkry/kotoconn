@@ -11,6 +11,7 @@ from testing.tun.environment import (
     REMOTE,
     Daemon,
     add_arguments,
+    command,
     configure_network,
     enter,
     traffic,
@@ -110,13 +111,9 @@ def cases(args):
 def run(args):
     configure_network()
     binaries = {"candidate": args.binary}
-    if args.baseline:
-        binaries["baseline"] = args.baseline
     if args.sing_box:
         binaries["sing-box-go"] = args.sing_box
     names = list(binaries)
-    if args.native_baseline:
-        names.append("native")
     result = {
         "schema_version": 2,
         "suite": "tun-workloads",
@@ -131,6 +128,11 @@ def run(args):
         },
         "runs": [],
     }
+    if args.sing_box:
+        result["metadata"]["reference_version"] = args.reference_version
+        result["metadata"]["reference_cleanup"] = (
+            "process killed after verified measurement"
+        )
     path = args.output / "results.json"
     try:
         for case_id, name, spec in cases(args):
@@ -138,8 +140,6 @@ def run(args):
                 # Alternate order within each pair; every sample starts a fresh daemon.
                 order = names if repetition % 2 == 0 else list(reversed(names))
                 for implementation in order:
-                    if implementation == "native" and name == "mixed-malformed":
-                        continue
                     directory = args.output / f"{case_id}-{repetition}-{implementation}"
                     directory.mkdir()
                     entry = {
@@ -164,7 +164,7 @@ def run(args):
                                 spec["mtu"],
                                 args.daemon_cpus,
                             )
-                        elif implementation != "native":
+                        else:
                             daemon = Daemon(
                                 binaries[implementation],
                                 directory / "daemon",
@@ -221,18 +221,14 @@ def run(args):
                         goodput = entry["metrics"][
                             "confirmed_bidirectional_bytes_per_second"
                         ]
-                        if entry["resources"]["daemon"] is not None:
-                            entry["resources"]["daemon"][
-                                "cpu_ns_per_confirmed_byte"
-                            ] = (
-                                entry["resources"]["daemon"]["cpu_seconds"]
-                                * 1e9
-                                / (goodput * sample["wall_seconds"])
-                                if goodput
-                                else None
-                            )
-                        if daemon:
-                            daemon.finish()
+                        entry["resources"]["daemon"]["cpu_ns_per_confirmed_byte"] = (
+                            entry["resources"]["daemon"]["cpu_seconds"]
+                            * 1e9
+                            / (goodput * sample["wall_seconds"])
+                            if goodput
+                            else None
+                        )
+                        daemon.finish()
                         print(
                             f"{case_id} {implementation} {repetition}: {goodput * 8 / 1e9:.3f} Gbit/s, "
                             f"lost={entry['metrics']['totals']['lost_datagrams']}",
@@ -272,22 +268,19 @@ def main():
     parser.add_argument(
         "--udp-rate", type=int, default=10000, help="offered datagrams/s per UDP flow"
     )
-    parser.add_argument("--baseline", type=Path, help="previous Kotoconn binary")
     parser.add_argument(
-        "--sing-box", type=Path, help="optional comparison binary with the go TUN stack"
-    )
-    parser.add_argument(
-        "--native-baseline",
-        action="store_true",
-        help="calibrate the generator without a proxy",
+        "--sing-box",
+        type=Path,
+        help="optional sing-box 1.15 reference with the go TUN stack",
     )
     args = parser.parse_args()
     args.binary = args.binary.resolve(strict=True)
     args.traffic_binary = args.traffic_binary.resolve(strict=True)
-    if args.baseline:
-        args.baseline = args.baseline.resolve(strict=True)
     if args.sing_box:
         args.sing_box = args.sing_box.resolve(strict=True)
+        args.reference_version = command(str(args.sing_box), "version").stdout.strip()
+        if not args.reference_version.startswith("sing-box version 1.15."):
+            parser.error("the reference must be sing-box 1.15 with the go TUN stack")
     args.mtu = args.mtu or [1500, 9000]
     args.family = args.family or ([4, 6] if args.profile == "full" else [4])
     if (
