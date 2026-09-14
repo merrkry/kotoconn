@@ -38,6 +38,8 @@ When reviewing or editing code, scan for consecutive non-empty lines and add a b
 
 Use scoped commits by crate name or aspect, e.g. `config: split outbound mod` `ci: allow workflow_dispatch`.
 
+Before editing `external/smoltcp`, follow the [stable fork branch workflow](crates/tun/README.md#smoltcp-fork). Keep its development checkout attached to the persistent branch.
+
 ## Verification
 
 Use static checks; start a dev server or preview only when explicitly asked.
