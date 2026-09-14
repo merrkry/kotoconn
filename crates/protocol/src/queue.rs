@@ -1,9 +1,12 @@
 //! Byte-weighted queues with local feedback. No transport parameters cross adapters.
+use crossbeam_queue::SegQueue;
 use futures_util::task::AtomicWaker;
 use std::{
-    collections::VecDeque,
     fmt, io,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
     task::{Context, Poll, ready},
     time::Duration,
 };
@@ -84,67 +87,98 @@ impl From<Error> for io::Error {
     }
 }
 
-struct State<T> {
-    items: VecDeque<(T, usize)>,
-    bytes: usize,
-    senders: usize,
-    closed: bool,
-    capacity: Capacity,
-}
-
 struct Shared<T> {
-    state: Mutex<State<T>>,
+    items: SegQueue<(T, usize)>,
+    initial: usize,
+    epoch: Instant,
+    updated: AtomicU64,
+    completed: AtomicUsize,
+    refreshing: AtomicBool,
+    bytes: AtomicUsize,
+    senders: AtomicUsize,
+    closed: AtomicBool,
+    target: AtomicUsize,
     readable: AtomicWaker,
     writable: Notify,
     size: fn(&T) -> usize,
 }
 
 impl<T> Shared<T> {
-    fn lock(&self) -> MutexGuard<'_, State<T>> {
-        // SAFETY: No user callbacks run under this lock. A panic here invalidates
-        // queue accounting; continuing after poisoning could lose accepted data.
-        self.state.lock().expect("queue state poisoned")
+    fn refresh(&self) {
+        let now = self.epoch.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        let updated = self.updated.load(Ordering::Acquire);
+        let elapsed = now.saturating_sub(updated);
+        if elapsed < FEEDBACK_INTERVAL.as_nanos() as u64
+            || self.refreshing.swap(true, Ordering::Acquire)
+        {
+            return;
+        }
+        // Another updater may have finished between the timestamp load and acquisition.
+        let elapsed = now.saturating_sub(self.updated.load(Ordering::Relaxed));
+        if elapsed >= FEEDBACK_INTERVAL.as_nanos() as u64 {
+            let completed = self.completed.swap(0, Ordering::AcqRel);
+            let sample = (completed as u128 * TARGET_DELAY.as_nanos() / elapsed as u128)
+                .min(usize::MAX as u128) as usize;
+            let periods =
+                (elapsed / FEEDBACK_INTERVAL.as_nanos() as u64).min(usize::BITS as u64 - 1) as u32;
+            let target = sample
+                .max(self.target.load(Ordering::Relaxed) >> periods)
+                .max(self.initial);
+            self.target.store(target, Ordering::Release);
+            self.updated.store(now, Ordering::Release);
+        }
+        self.refreshing.store(false, Ordering::Release);
+    }
+
+    fn release(&self, cost: usize) {
+        let old = self.bytes.fetch_sub(cost, Ordering::AcqRel);
+        debug_assert!(old >= cost);
+    }
+
+    fn discard(&self) {
+        while let Some((_, cost)) = self.items.pop() {
+            self.release(cost);
+        }
     }
 }
 
 pub struct Sender<T>(Arc<Shared<T>>);
 
-pub struct Receiver<T>(Arc<Shared<T>>);
+pub struct Receiver<T> {
+    shared: Arc<Shared<T>>,
+}
 
-/// Each queue owns its feedback and backlog accounting. Shared packet paths
-/// use try_send; reliable producers wait with send. Metadata counts even for
-/// empty datagrams.
+/// Byte credits include outstanding reservations. Only the receiver owns the
+/// feedback state; producers atomically reserve against its published target.
 pub fn channel<T>(initial: usize, size: fn(&T) -> usize) -> (Sender<T>, Receiver<T>) {
     let shared = Arc::new(Shared {
-        state: Mutex::new(State {
-            items: VecDeque::new(),
-            bytes: 0,
-            senders: 1,
-            closed: false,
-            capacity: Capacity::new(initial),
-        }),
+        items: SegQueue::new(),
+        initial,
+        epoch: Instant::now(),
+        updated: AtomicU64::new(0),
+        completed: AtomicUsize::new(0),
+        refreshing: AtomicBool::new(false),
+        bytes: AtomicUsize::new(0),
+        senders: AtomicUsize::new(1),
+        closed: AtomicBool::new(false),
+        target: AtomicUsize::new(initial),
         readable: AtomicWaker::new(),
         writable: Notify::new(),
         size,
     });
-    (Sender(shared.clone()), Receiver(shared))
+    (Sender(shared.clone()), Receiver { shared })
 }
 
 impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
-        self.0.lock().senders += 1;
+        self.0.senders.fetch_add(1, Ordering::Relaxed);
         Self(self.0.clone())
     }
 }
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        let mut state = self.0.lock();
-        debug_assert!(state.senders > 0);
-        state.senders -= 1;
-        let last = state.senders == 0;
-        drop(state);
-        if last {
+        if self.0.senders.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.0.readable.wake();
         }
     }
@@ -157,27 +191,32 @@ pub struct Permit<'a, T> {
 
 impl<T> Sender<T> {
     pub fn is_closed(&self) -> bool {
-        self.0.lock().closed
+        self.0.closed.load(Ordering::Acquire)
     }
 
     pub fn try_reserve(&self, bytes: usize) -> Result<Permit<'_, T>, Error> {
+        if self.is_closed() {
+            return Err(Error::Closed);
+        }
         let cost = bytes
             .checked_add(std::mem::size_of::<(T, usize)>().max(1))
             .ok_or(Error::Full)?;
-        let mut state = self.0.lock();
-        if state.closed {
+        self.0.refresh();
+        let target = self.0.target.load(Ordering::Acquire);
+        self.0
+            .bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                if used != 0 && cost > target.saturating_sub(used) {
+                    return None;
+                }
+                used.checked_add(cost)
+            })
+            .map_err(|_| Error::Full)?;
+        let permit = Permit { sender: self, cost };
+        if self.is_closed() {
             return Err(Error::Closed);
         }
-        let target = state.capacity.target(Instant::now());
-        // One complete item can exceed the target, e.g. a maximum UDP datagram.
-        if state.bytes != 0 && cost > target.saturating_sub(state.bytes) {
-            return Err(Error::Full);
-        }
-        let Some(total) = state.bytes.checked_add(cost) else {
-            return Err(Error::Full);
-        };
-        state.bytes = total;
-        Ok(Permit { sender: self, cost })
+        Ok(permit)
     }
 
     pub async fn reserve(&self, bytes: usize) -> Result<Permit<'_, T>, Error> {
@@ -212,13 +251,16 @@ impl<T> Permit<'_, T> {
         debug_assert!(
             (self.sender.0.size)(&item) <= self.cost - std::mem::size_of::<(T, usize)>().max(1)
         );
-        let mut state = self.sender.0.lock();
-        if state.closed {
+        if self.sender.is_closed() {
             return;
         }
-        state.items.push_back((item, self.cost));
+        self.sender.0.items.push((item, self.cost));
         self.cost = 0;
-        drop(state);
+        // Closure may race publication. Whichever observes the published item
+        // releases its credit; SegQueue gives each item to exactly one consumer.
+        if self.sender.is_closed() {
+            self.sender.0.discard();
+        }
         self.sender.0.readable.wake();
     }
 }
@@ -226,37 +268,35 @@ impl<T> Permit<'_, T> {
 impl<T> Drop for Permit<'_, T> {
     fn drop(&mut self) {
         if self.cost != 0 {
-            let mut state = self.sender.0.lock();
-            debug_assert!(state.bytes >= self.cost);
-            state.bytes -= self.cost;
-            drop(state);
+            self.sender.0.release(self.cost);
             self.sender.0.writable.notify_waiters();
         }
     }
 }
 
 impl<T> Receiver<T> {
-    pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
-        let coop = ready!(coop::poll_proceed(cx));
-        let result = self.poll_recv_inner(cx);
-        if result.is_ready() {
-            coop.made_progress();
-        }
-        result
+    fn complete(&mut self, cost: usize) {
+        self.shared.release(cost);
+        self.shared.refresh();
+        self.shared.completed.fetch_add(cost, Ordering::Relaxed);
+        self.shared.writable.notify_waiters();
     }
 
-    fn poll_recv_inner(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
-        self.0.readable.register(cx.waker());
-        let mut state = self.0.lock();
-        if let Some((item, cost)) = state.items.pop_front() {
-            debug_assert!(state.bytes >= cost);
-            state.bytes -= cost;
-            state.capacity.complete(cost, Instant::now());
-            drop(state);
-            self.0.writable.notify_waiters();
+    pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        let budget = ready!(coop::poll_proceed(cx));
+        self.shared.readable.register(cx.waker());
+        if let Some((item, cost)) = self.shared.items.pop() {
+            self.complete(cost);
+            budget.made_progress();
             return Poll::Ready(Some(item));
         }
-        if state.senders == 0 {
+        if self.shared.senders.load(Ordering::Acquire) == 0 {
+            // Last-sender publication precedes its Release decrement.
+            if let Some((item, cost)) = self.shared.items.pop() {
+                self.complete(cost);
+                budget.made_progress();
+                return Poll::Ready(Some(item));
+            }
             Poll::Ready(None)
         } else {
             Poll::Pending
@@ -268,15 +308,11 @@ impl<T> Receiver<T> {
     }
 
     pub fn try_recv(&mut self) -> Result<T, Error> {
-        let mut state = self.0.lock();
-        if let Some((item, cost)) = state.items.pop_front() {
-            state.bytes -= cost;
-            state.capacity.complete(cost, Instant::now());
-            drop(state);
-            self.0.writable.notify_waiters();
+        if let Some((item, cost)) = self.shared.items.pop() {
+            self.complete(cost);
             Ok(item)
         } else {
-            Err(if state.senders == 0 {
+            Err(if self.shared.senders.load(Ordering::Acquire) == 0 {
                 Error::Closed
             } else {
                 Error::Full
@@ -293,12 +329,17 @@ impl<T> Receiver<T> {
         };
         out.push(first);
         let mut count = 1;
+        let mut cost = 0;
         while count < limit {
-            let Ok(item) = self.try_recv() else {
+            let Some((item, bytes)) = self.shared.items.pop() else {
                 break;
             };
             out.push(item);
+            cost += bytes;
             count += 1;
+        }
+        if cost != 0 {
+            self.complete(cost);
         }
         count
     }
@@ -306,14 +347,9 @@ impl<T> Receiver<T> {
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        let mut state = self.0.lock();
-        state.closed = true;
-        let items = std::mem::take(&mut state.items);
-        let removed: usize = items.iter().map(|(_, cost)| cost).sum();
-        state.bytes -= removed;
-        drop(state);
-        drop(items);
-        self.0.writable.notify_waiters();
+        self.shared.closed.store(true, Ordering::Release);
+        self.shared.discard();
+        self.shared.writable.notify_waiters();
     }
 }
 
