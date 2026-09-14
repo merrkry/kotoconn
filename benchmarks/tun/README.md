@@ -6,6 +6,7 @@ Build the candidate and the shared traffic tool, then run from the repository ro
 cargo build --release -p kotoconn-cli -p kotoconn-tun-traffic
 python3 benchmarks/run.py
 python3 benchmarks/run.py --profile full
+python3 benchmarks/check_udp_churn.py
 ```
 
 The runner needs Linux, Python 3.10+, `unshare`, `iproute2`, `taskset`,
@@ -15,11 +16,19 @@ Every invocation creates a new network namespace and a unique child of
 `target/benchmarks/`, or of the supplied `--output` directory. Devices, ports,
 policy rules and child processes belong to that run. Source-address routing
 keeps TCP TIME_WAIT acknowledgments on the same path as client traffic.
-Each warmup and measurement uses a separate reserved server port. Namespace-local
-ephemeral-port and TCP TIME_WAIT settings prevent earlier samples from consuming
-the next sample's port space; see [isolation details](../../e2e/tun_support/README.md#isolation-and-artifacts).
+TCP warmup and measurement use separate reserved server ports. Each pure UDP
+sample reuses its server port across those two phases. UDP has no FIN, so using
+different destinations would retain two association populations and can exhaust
+outbound ephemeral ports. Each sample still starts a fresh daemon. Namespace-local
+ephemeral-port and TCP TIME_WAIT settings limit interference from earlier TCP traffic; see [isolation details](../../e2e/tun_support/README.md#isolation-and-artifacts).
 
 ## Cases
+
+`check_udp_churn.py` runs the actual UDP benchmark phases over IPv4 and IPv6
+with only 64 namespace-local ephemeral ports. Each phase completes 4096 strict
+request/reply exchanges. It catches the port exhaustion caused by retaining
+warmup associations under a different destination, without changing idle
+timeouts or allowing packet loss.
 
 The quick profile covers MTU 1500 and 9000 over IPv4: one and four persistent
 TCP connections, connection churn, 64 sparse connections, paced UDP, and mixed
@@ -51,7 +60,9 @@ this value to locate saturation. Replies are verified by flow and sequence.
 Loss, duplicate replies, reordering and a sample of missing sequence numbers
 are reported. Every flow must still complete an operation. Boundary and
 ordinary request/reply cases require every datagram to return. Zero-length
-UDP is exercised without adding a test header.
+UDP is exercised without adding a test header. UDP churn counts new client
+sockets, not necessarily new proxy associations: Linux may reuse a source port
+and its existing association, including one created during warmup.
 
 Mixed cases use one bulk TCP, one sparse TCP, one churn TCP and one paced UDP
 flow per group of four. Malformed cases inject a named, deterministic corpus

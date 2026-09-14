@@ -62,6 +62,8 @@ jobs:
       - name: Check TUN benchmark pipeline
         run: |
           sudo python3 benchmarks/run.py --binary target/e2e/kotoconn --traffic-binary target/e2e/kotoconn-tun-traffic --mtu 1500 --duration 1 --warmup 0 --repetitions 1 --case tcp-bulk-1 --case udp-paced --case mixed-malformed
+      - name: Check UDP benchmark warmup reuse
+        run: sudo python3 benchmarks/check_udp_churn.py --binary target/e2e/kotoconn --traffic-binary target/e2e/kotoconn-tun-traffic
       - uses: actions/upload-artifact@v4
         # Upload diagnostic logs even if tests fail or the run is cancelled.
         if: always()

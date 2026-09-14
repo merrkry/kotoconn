@@ -15,6 +15,7 @@ from e2e.tun_support.environment import (
     command,
     configure_network,
     enter,
+    reserve_server_port,
     traffic,
 )
 from e2e.tun_support.measurement import (
@@ -181,6 +182,12 @@ def run(args):
                                 cpus=args.daemon_cpus,
                             )
                         sample_spec = {**spec, "seed": args.seed + repetition}
+                        if spec.get("protocol") == "udp":
+                            # UDP has no FIN. Warmup associations retain outbound
+                            # ports until idle expiry; changing the destination
+                            # doubles that population and can exhaust Linux's
+                            # ephemeral range before measurement completes.
+                            sample_spec["port"] = reserve_server_port()
                         if args.warmup:
                             warmup = directory / "warmup"
                             warmup.mkdir()

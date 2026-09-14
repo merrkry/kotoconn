@@ -328,10 +328,21 @@ def resource(pid):
     }
 
 
+def reserve_server_port():
+    port = next(PORTS)
+    if port not in SERVER_PORTS:
+        raise ValueError(
+            f"run exhausted its {len(SERVER_PORTS)} reserved traffic server ports"
+        )
+    return port
+
+
 def traffic(binary, daemon, directory, spec, *, inject=None):
-    # Retained TIME_WAIT sockets from one case must not consume the next case's
-    # tuple space. The daemon and its connection/pool state remain alive.
-    spec = {"port": next(PORTS), **spec}
+    # TCP needs fresh tuple space after TIME_WAIT. UDP warmup and measurement
+    # can explicitly share a server port to reuse their live associations.
+    spec = dict(spec)
+    if "port" not in spec:
+        spec["port"] = reserve_server_port()
     if spec["port"] not in SERVER_PORTS:
         raise ValueError(
             f"run exhausted its {len(SERVER_PORTS)} reserved traffic server ports"

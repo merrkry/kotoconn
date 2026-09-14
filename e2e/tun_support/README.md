@@ -130,8 +130,10 @@ namespace when the caller is not root. Network setup refuses to run unless the
 current network namespace differs from the recorded parent. They change only
 namespace-local addresses, routes, policy rules and IPv4 settings. Source
 routing includes kernel-generated TCP control packets after application exit.
-Traffic invocations use separate server ports in 12000..19999. Clients defer
-source-port allocation until connect, so earlier cases' TIME_WAIT sockets do
+Traffic invocations use server ports in 12000..19999. Benchmark UDP warmup and
+measurement share one port within a sample so live warmup associations do not
+consume a second set of outbound ports. Other invocations use separate server
+ports. TCP clients defer source-port allocation until connect, so earlier cases' TIME_WAIT sockets do
 not exhaust a new case's tuple space. The namespace uses ephemeral ports
 20000..65535 and enables timestamp-protected TCP TIME_WAIT reuse for outbound
 kernel sockets on its local documentation addresses. Raw injection source ports
