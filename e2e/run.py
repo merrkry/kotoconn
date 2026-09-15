@@ -282,7 +282,9 @@ class Scenario:
                 ("kotoconn", "gateway") if self.suite == "nested" else ("kotoconn",)
             ):
                 self.compose("stop", "-t", "8", service)
-                logs = self.compose("logs", "--no-color", "--no-log-prefix", service).stdout
+                logs = self.compose(
+                    "logs", "--no-color", "--no-log-prefix", service
+                ).stdout
                 if not has_event(logs.splitlines(), "daemon_stopped"):
                     raise AssertionError(f"{service} did not shut down cleanly")
                 container = self.compose(
