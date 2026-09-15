@@ -1,5 +1,6 @@
 use crate::{
     Args, Workload, payload,
+    source_ports::PortCycle,
     stats::{Stats, record},
 };
 use anyhow::{Context, Result, ensure};
@@ -73,16 +74,36 @@ fn packet(args: &Args, flow: u64, sequence: u64, size: usize) -> Vec<u8> {
     bytes
 }
 
+async fn connect(
+    args: &Args,
+    ports: Option<PortCycle>,
+    flow: u64,
+    sequence: u64,
+) -> Result<UdpSocket> {
+    let source = SocketAddr::new(args.source, ports.map_or(0, |ports| ports.port(sequence)));
+    let target = SocketAddr::new(args.target, args.port);
+    let socket = UdpSocket::bind(source)
+        .await
+        .with_context(|| format!("bind UDP source={source} flow={flow} sequence={sequence}"))?;
+    socket.connect(target).await.with_context(|| {
+        format!("connect UDP source={source} target={target} flow={flow} sequence={sequence}")
+    })?;
+    Ok(socket)
+}
+
 pub async fn run(args: &Args, flow: u64) -> Result<Stats> {
     if args.rate > 0 {
         return paced(args, flow).await;
     }
+
+    let ports = args
+        .udp_source_ports
+        .map(|ports| ports.partition(args.connections, flow))
+        .transpose()?;
     let mut stats = Stats::new()?;
     stats.connections = 1;
-    let mut socket = UdpSocket::bind(SocketAddr::new(args.source, 0)).await?;
-    socket
-        .connect(SocketAddr::new(args.target, args.port))
-        .await?;
+    let mut socket = connect(args, ports, flow, 0).await?;
+
     let limit = args.mtu - if args.source.is_ipv4() { 28 } else { 48 };
     let sizes = if args.workload == Workload::Boundaries {
         vec![
@@ -100,6 +121,7 @@ pub async fn run(args: &Args, flow: u64) -> Result<Stats> {
     let mut received = vec![0; 65536];
     let started = Instant::now();
     let mut sequence = 0;
+
     while args.more(sequence, started) {
         if args.workload == Workload::Sparse {
             tokio::time::sleep_until(
@@ -107,13 +129,14 @@ pub async fn run(args: &Args, flow: u64) -> Result<Stats> {
             )
             .await;
         }
+
         if args.workload == Workload::Churn && sequence > 0 {
-            socket = UdpSocket::bind(SocketAddr::new(args.source, 0)).await?;
-            socket
-                .connect(SocketAddr::new(args.target, args.port))
-                .await?;
+            // Keep the old socket bound until its successor is ready. Disjoint
+            // per-flow cycles prevent another flow from taking either port.
+            socket = connect(args, ports, flow, sequence).await?;
             stats.connections += 1;
         }
+
         for &size in &sizes {
             let bytes = packet(args, flow, sequence, size);
             let sent = Instant::now();
@@ -130,6 +153,7 @@ pub async fn run(args: &Args, flow: u64) -> Result<Stats> {
                 received[..count] == bytes,
                 "UDP payload differs: flow={flow} sequence={sequence} size={size}"
             );
+
             record(&mut stats.latency, sent.elapsed())?;
             stats.sent_bytes += size as u64;
             stats.received_bytes += size as u64;
@@ -137,8 +161,10 @@ pub async fn run(args: &Args, flow: u64) -> Result<Stats> {
             stats.received_datagrams += 1;
             stats.operations += 1;
         }
+
         sequence += 1;
     }
+
     Ok(stats)
 }
 
@@ -252,6 +278,118 @@ async fn paced(args: &Args, flow: u64) -> Result<Stats> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    // Reserve an OS-selected contiguous range instead of using fixed test ports.
+    // Keep every reservation alive until the clients are ready to bind.
+    async fn reserve_ports(
+        address: std::net::IpAddr,
+    ) -> (crate::source_ports::SourcePorts, Vec<UdpSocket>) {
+        for _ in 0..128 {
+            let first = UdpSocket::bind(SocketAddr::new(address, 0)).await.unwrap();
+            let port = first.local_addr().unwrap().port();
+            let Some(last) = port.checked_add(3) else {
+                continue;
+            };
+            let mut sockets = vec![first];
+            for next in port + 1..=last {
+                match UdpSocket::bind(SocketAddr::new(address, next)).await {
+                    Ok(socket) => sockets.push(socket),
+                    Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => break,
+                    Err(error) => panic!("reserve UDP port: {error}"),
+                }
+            }
+            if sockets.len() == 4 {
+                return (format!("{port}-{last}").parse().unwrap(), sockets);
+            }
+        }
+        panic!("could not reserve four adjacent UDP test ports");
+    }
+
+    #[tokio::test]
+    async fn churn_reuses_source_tuples_across_phases_with_independent_flows() {
+        for address in ["127.0.0.1", "::1"] {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let mut args = Args::try_parse_from([
+                    "traffic",
+                    "--source",
+                    address,
+                    "--target",
+                    address,
+                    "--protocol",
+                    "udp",
+                    "--workload",
+                    "churn",
+                    "--connections",
+                    "2",
+                ])
+                .unwrap();
+                let echo = UdpSocket::bind(SocketAddr::new(args.target, 0))
+                    .await
+                    .unwrap();
+                args.port = echo.local_addr().unwrap().port();
+                let (ports, reservations) = reserve_ports(args.source).await;
+                args.udp_source_ports = Some(ports);
+
+                // Observe the real source tuples, including every wraparound.
+                // Different round counts let flows progress and finish independently.
+                let server = tokio::spawn(async move {
+                    let mut bytes = vec![0; 65536];
+                    let mut seen = [
+                        std::collections::HashSet::new(),
+                        std::collections::HashSet::new(),
+                    ];
+                    for _ in 0..2 * (32 + 49) {
+                        let (size, peer) = echo.recv_from(&mut bytes).await.unwrap();
+                        assert!(size >= 16);
+                        let flow = u64::from_be_bytes(bytes[..8].try_into().unwrap());
+                        let sequence = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
+                        assert_eq!(
+                            peer.port(),
+                            ports.partition(2, flow).unwrap().port(sequence)
+                        );
+                        seen[flow as usize].insert(peer);
+                        assert_eq!(echo.send_to(&bytes[..size], peer).await.unwrap(), size);
+                    }
+                    assert_eq!(seen[0].len(), 2);
+                    assert_eq!(seen[1].len(), 2);
+                    assert!(seen[0].is_disjoint(&seen[1]));
+                });
+
+                drop(reservations);
+                for _ in 0..2 {
+                    let mut other = args.clone();
+                    args.rounds = 32;
+                    other.rounds = 49;
+                    let (a, b) = tokio::try_join!(run(&args, 0), run(&other, 1)).unwrap();
+                    for (stats, rounds) in [(a, 32), (b, 49)] {
+                        assert_eq!(stats.connections, rounds);
+                        assert_eq!(stats.operations, rounds);
+                        assert_eq!(stats.sent_datagrams, rounds);
+                        assert_eq!(stats.received_datagrams, rounds);
+                    }
+                }
+                server.await.unwrap();
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn occupied_source_port_fails_without_falling_back_to_ephemeral() {
+        let args =
+            Args::try_parse_from(["traffic", "--source", "127.0.0.1", "--target", "127.0.0.1"])
+                .unwrap();
+        let (ports, _reservations) = reserve_ports(args.source).await;
+        let error = connect(&args, Some(ports.partition(2, 0).unwrap()), 0, 0)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+        assert!(error.to_string().contains("flow=0 sequence=0"));
+    }
 
     #[tokio::test]
     async fn completed_sender_with_missing_replies_still_finishes_receive_drain() {
