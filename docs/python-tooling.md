@@ -16,9 +16,8 @@ has no runtime dependencies.
 
 Ruff checks formatting, imports, and lint rules. Pyrefly checks types. Both check
 Python files under `e2e`, `benchmarks`, and `tools`; third-party code under
-`external` is outside their configured scope. The Python job in
-`.github/workflows/checks.yml` runs the same checks independently of Rust and
-TypeScript.
+`external` is outside their configured scope. The check job in
+`.github/workflows/checks.yml` runs the same checks alongside Rust and TypeScript.
 
 To apply formatting or import fixes locally:
 

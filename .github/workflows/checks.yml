@@ -19,7 +19,7 @@ env:
 
 jobs:
   check:
-    name: Rust and TypeScript
+    name: Rust, TypeScript and Python
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -42,6 +42,18 @@ jobs:
           cache-dependency-path: pnpm-lock.yaml
       - name: Install TypeScript dependencies
         run: pnpm install --frozen-lockfile
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.12.5"
+          enable-cache: true
+      - name: Install Python dependencies
+        run: uv sync --locked
+      - name: Check Python formatting
+        run: uv run --locked ruff format --check
+      - name: Lint Python
+        run: uv run --locked ruff check
+      - name: Check Python types
+        run: uv run --locked pyrefly check
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
       - name: Lint Rust
@@ -60,24 +72,3 @@ jobs:
       - name: Prepare nested test directories for cache cleanup
         if: always()
         run: mkdir -p target/tests/target target/tests/trybuild
-
-  python:
-    name: Python
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - uses: astral-sh/setup-uv@v7
-        with:
-          version: "0.12.5"
-          enable-cache: true
-      - name: Install Python dependencies
-        run: uv sync --locked
-      - name: Check Python formatting
-        run: uv run --locked ruff format --check
-      - name: Lint Python
-        run: uv run --locked ruff check
-      - name: Check Python types
-        run: uv run --locked pyrefly check
