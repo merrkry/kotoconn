@@ -46,12 +46,17 @@ def metadata(binaries, traffic_binary):
 
 def distribution(histograms):
     # Merge histogram counts, never average per-flow percentiles.
-    buckets = Counter()
+    buckets: Counter[int] = Counter()
     for histogram in histograms:
         for upper, count in histogram["buckets"]:
             buckets[upper] += count
+
     count = sum(buckets.values())
-    result = {"count": count, "buckets": sorted(buckets.items())}
+    result: dict[str, int | list[tuple[int, int]] | None] = {
+        "count": count,
+        "buckets": sorted(buckets.items()),
+    }
+
     for name, quantile in (("p50", 0.5), ("p95", 0.95), ("p99", 0.99)):
         cumulative = 0
         result[name] = None
