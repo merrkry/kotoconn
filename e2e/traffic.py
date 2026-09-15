@@ -26,6 +26,9 @@ def identity(port, source):
 
 class TCP(socketserver.BaseRequestHandler):
     def handle(self):
+        # SAFETY: serve() installs this handler only on TCPServer instances.
+        assert isinstance(self.server, socketserver.TCPServer)
+
         self.request.settimeout(LIMIT)
         self.request.sendall(
             identity(self.server.server_address[1], self.client_address[0])
@@ -37,6 +40,9 @@ class TCP(socketserver.BaseRequestHandler):
 
 class UDP(socketserver.BaseRequestHandler):
     def handle(self):
+        # SAFETY: serve() installs this handler only on UDPServer instances.
+        assert isinstance(self.server, socketserver.UDPServer)
+
         data, sock = self.request
         sock.sendto(
             identity(self.server.server_address[1], self.client_address[0]) + data,
