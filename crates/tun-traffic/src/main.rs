@@ -1,5 +1,6 @@
 //! Socket workloads shared by isolated TUN correctness and performance runners.
 mod payload;
+mod source_ports;
 mod stats;
 mod tcp;
 mod udp;
@@ -59,6 +60,9 @@ struct Args {
     /// Receive and echo up to N datagrams per syscall; one selects ordinary I/O.
     #[arg(long, default_value_t = if cfg!(target_os = "linux") { 32 } else { 1 }, value_parser = clap::value_parser!(u8).range(1..=32))]
     udp_echo_batch: u8,
+    /// Explicit source ports for strict UDP churn, partitioned evenly among flows.
+    #[arg(long)]
+    udp_source_ports: Option<source_ports::SourcePorts>,
     /// Generator workers, independent of the daemon CPU budget.
     #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..=64))]
     worker_threads: u16,
@@ -163,6 +167,14 @@ async fn run(args: Args) -> Result<()> {
         "per-flow rate exceeds one million datagrams/s"
     );
 
+    if let Some(ports) = args.udp_source_ports {
+        ensure!(
+            args.protocol == Protocol::Udp && args.workload == Workload::Churn && args.rate == 0,
+            "udp-source-ports requires strict UDP churn"
+        );
+        ports.validate(args.connections)?;
+    }
+
     let args = Arc::new(args);
     let (stop, stopping) = oneshot::channel();
     let server = tcp::serve(args.clone(), stopping).await?;
@@ -243,4 +255,41 @@ async fn run(args: Args) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn explicit_udp_ports_reject_incompatible_workloads_before_server_start() {
+        for (protocol, workload, rate) in [
+            ("tcp", "churn", "0"),
+            ("udp", "bulk", "0"),
+            ("udp", "mixed", "0"),
+            ("udp", "churn", "1"),
+        ] {
+            let args = Args::try_parse_from([
+                "traffic",
+                "--source",
+                "127.0.0.1",
+                "--target",
+                "127.0.0.1",
+                "--protocol",
+                protocol,
+                "--workload",
+                workload,
+                "--rate",
+                rate,
+                "--udp-source-ports",
+                "50000-50063",
+            ])
+            .unwrap();
+            let error = run(args).await.unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "udp-source-ports requires strict UDP churn"
+            );
+        }
+    }
 }

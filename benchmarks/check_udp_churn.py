@@ -19,7 +19,15 @@ def fixed_work(binary, daemon, directory, spec, **kwargs):
         binary,
         daemon,
         directory,
-        {**spec, "duration_ms": 0, "rounds": 512, "timeout": 5},
+        {
+            **spec,
+            "duration_ms": 0,
+            "rounds": 512,
+            "timeout": 5,
+            # Client binds must not occupy the proxy's 60000..60063 budget.
+            # Eight disjoint eight-port cycles create exactly 64 associations.
+            "udp_source_ports": "50000-50063",
+        },
         **kwargs,
     )
 
@@ -59,6 +67,9 @@ def main():
         measure = json.loads((sample / "measure/result.json").read_text())
         assert warmup["spec"]["port"] == measure["spec"]["port"]
         for phase in (warmup, measure):
+            assert phase["spec"]["udp_source_ports"] == "50000-50063"
+            assert len(phase["flows"]) == 8
+            assert all(flow["connections"] == 512 for flow in phase["flows"])
             assert sum(flow["operations"] for flow in phase["flows"]) == 4096
             assert all(flow["lost_datagrams"] == 0 for flow in phase["flows"])
     print("PASS UDP warmup and measurement reuse across IPv4 and IPv6")

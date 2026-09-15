@@ -47,7 +47,10 @@ ephemeral-port and TCP TIME_WAIT settings limit interference from earlier TCP tr
 ## Cases
 
 `check_udp_churn.py` runs the actual UDP benchmark phases over IPv4 and IPv6
-with only 64 namespace-local ephemeral ports. Each phase completes 4096 strict
+with only 64 namespace-local ephemeral ports for the proxy. Clients cycle through
+64 explicit ports outside that range, partitioned into eight disjoint sets. This
+keeps client binds from consuming the proxy's wildcard-bind budget and visits
+every source tuple during each phase. Each phase completes 4096 strict
 request/reply exchanges. It catches the port exhaustion caused by retaining
 warmup associations under a different destination, without changing idle
 timeouts or allowing packet loss.
@@ -85,6 +88,15 @@ ordinary request/reply cases require every datagram to return. Zero-length
 UDP is exercised without adding a test header. UDP churn counts new client
 sockets, not necessarily new proxy associations: Linux may reuse a source port
 and its existing association, including one created during warmup.
+
+The traffic tool's `--udp-source-ports START-END` selects an inclusive source
+port range for strict UDP churn only. The range must divide evenly among flows,
+with at least two ports per flow. Each flow cycles through its own partition;
+warmup and measurement using the same range revisit the same source tuples.
+Socket replacement binds the next port before releasing the previous one.
+An occupied port fails the workload with its source address, flow and sequence;
+the tool does not retry on another port. Choose a range outside the proxy's
+ephemeral range when testing a restricted proxy port budget.
 
 The Linux echo server receives and sends up to 32 datagrams per syscall and
 requests a 1 MiB socket receive buffer. Batching reduces server work at high
