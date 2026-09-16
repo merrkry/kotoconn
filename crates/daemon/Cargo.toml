@@ -20,6 +20,7 @@ tracing.workspace = true
 [dev-dependencies]
 bytes.workspace = true
 fast-socks5.workspace = true
+rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
 shadowsocks.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

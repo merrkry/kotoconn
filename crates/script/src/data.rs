@@ -167,3 +167,39 @@ pub(crate) struct Shadowsocks2022OutboundConfig {
     pub server: Target,
     pub password: String,
 }
+
+#[derive(FromJs, TS, StructuralConvert)]
+#[convert(from(config::TlsClientConfig), into(config::TlsClientConfig))]
+#[ts(as = "config::TlsClientConfig")]
+pub(crate) struct TlsClientConfig {
+    pub server_name: Option<String>,
+    pub certificate: Option<String>,
+}
+
+#[derive(FromJs, TS, StructuralConvert)]
+#[convert(from(config::TlsServerConfig), into(config::TlsServerConfig))]
+#[ts(as = "config::TlsServerConfig")]
+pub(crate) struct TlsServerConfig {
+    pub certificate: String,
+    pub private_key: String,
+}
+
+#[derive(FromJs, TS, StructuralConvert)]
+#[convert(from(config::AnyTlsInboundConfig), into(config::AnyTlsInboundConfig))]
+#[ts(as = "config::AnyTlsInboundConfig")]
+pub(crate) struct AnyTlsInboundConfig {
+    pub listen: SocketAddr,
+    pub password: String,
+    pub tls: TlsServerConfig,
+    pub padding_scheme: Option<String>,
+}
+
+#[derive(FromJs, TS, StructuralConvert)]
+#[convert(from(config::AnyTlsOutboundConfig), into(config::AnyTlsOutboundConfig))]
+#[ts(as = "config::AnyTlsOutboundConfig")]
+pub(crate) struct AnyTlsOutboundConfig {
+    pub server: Target,
+    pub password: String,
+    pub tls: TlsClientConfig,
+    pub idle_session_timeout: Option<Timeout>,
+}

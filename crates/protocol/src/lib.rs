@@ -65,6 +65,10 @@ pub trait Carrier: Send + Sync {
 
 /// Adapters own protocol state. The runtime supplies independent TCP/UDP lifetimes.
 pub trait Client: Send + Sync {
+    /// Release idle protocol resources during shutdown. Accepted work may still
+    /// open connections; active streams must continue to drain.
+    fn drain(&self) {}
+
     fn capabilities(&self) -> Capabilities;
     fn tcp(&self, target: Target, scope: Scope) -> BoxFuture<'_, Result<BoxStream>>;
     fn udp(&self, target: Target, scope: Scope) -> BoxFuture<'_, Result<Datagram>>;

@@ -92,6 +92,16 @@ impl Network {
         }
 
         let (failed, failure) = tokio::sync::watch::channel(None);
+        let draining = clients.clone();
+        let stop = stopping.clone();
+        scope.spawn(async move {
+            stop.cancelled().await;
+            for client in draining.values() {
+                client.drain();
+            }
+            Ok(())
+        })?;
+
         for (id, server) in bound {
             let failed = failed.clone();
             let stop = stopping.clone();

@@ -1,3 +1,4 @@
+mod anytls;
 mod config;
 mod dialer;
 mod dns;
@@ -7,6 +8,10 @@ mod outbound;
 mod resolve;
 mod route;
 mod target;
+mod tls;
+
+pub use anytls::{AnyTlsInboundConfig, AnyTlsOutboundConfig};
+pub use tls::{TlsClientConfig, TlsServerConfig};
 
 pub use config::Config;
 pub use dialer::{DialerConfig, DialerId};
