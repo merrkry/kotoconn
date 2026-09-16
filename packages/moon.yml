@@ -11,7 +11,7 @@ tasks:
     deps: [install]
     options:
       cache: false
-  format-check:
+  check-format:
     inputs: ["@group(sources)"]
     command: pnpm exec oxfmt --check packages package.json pnpm-workspace.yaml tsconfig.json .oxfmtrc.json .oxlintrc.json
     deps: [install]
@@ -22,7 +22,7 @@ tasks:
   build:
     inputs: ["@group(sources)"]
     command: pnpm --filter @kotoconn/api run build
-    deps: [install, rust:bindings]
+    deps: [install, rust:generate-bindings]
     outputs: [/packages/api/dist]
   typecheck:
     inputs: ["@group(sources)"]
@@ -31,10 +31,10 @@ tasks:
   test:
     inputs: ["@group(sources)"]
     command: pnpm --filter @kotoconn/bindings exec tsc -p tests/tsconfig.json
-    deps: [install, rust:test-bindings]
+    deps: [install, rust:generate-test-bindings]
   check:
     inputs: ["@group(sources)"]
-    deps: [format-check, lint, typecheck, test]
+    deps: [check-format, lint, typecheck, test]
 fileGroups:
   sources:
     - /packages/**/*

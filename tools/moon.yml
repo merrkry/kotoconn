@@ -11,7 +11,7 @@ tasks:
     deps: [sync]
     options:
       cache: false
-  format-check:
+  check-format:
     inputs: ["@group(sources)"]
     command: uv run --locked ruff format --check
     deps: [sync]
@@ -25,6 +25,6 @@ tasks:
     deps: [sync]
   check:
     inputs: ["@group(sources)"]
-    deps: [format-check, lint, typecheck]
+    deps: [check-format, lint, typecheck]
 fileGroups:
   sources: [/e2e/**/*.py, /benchmarks/**/*.py, /tools/**/*.py, /pyproject.toml, /uv.lock, /.python-version]

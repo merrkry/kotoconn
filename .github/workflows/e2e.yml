@@ -47,10 +47,10 @@ jobs:
         env:
           TUN_PROFILE: ${{ inputs.tun_profile || 'quick' }}
         run: |
-          mise exec -- moon run docker:test docker:isolation
-          mise exec -- moon run docker:tun -- --profile "$TUN_PROFILE"
+          mise exec -- moon run docker:test docker:test-isolation
+          mise exec -- moon run docker:test-tun -- --profile "$TUN_PROFILE"
       - name: Check release benchmark pipeline and UDP warmup reuse
-        run: mise exec -- moon run benchmark:smoke benchmark:udp-churn
+        run: mise exec -- moon run benchmark:test-smoke benchmark:test-udp-churn
       - uses: actions/upload-artifact@v4
         if: always()
         with:

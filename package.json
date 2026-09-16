@@ -5,12 +5,12 @@
   "scripts": {
     "build": "moon run typescript:build",
     "format": "moon run typescript:format",
-    "format:check": "moon run typescript:format-check",
+    "check-format": "moon run typescript:check-format",
     "lint": "moon run typescript:lint",
     "typecheck": "moon run typescript:typecheck",
     "test": "moon run typescript:test",
     "check": "moon run typescript:check",
-    "bindings": "moon run rust:bindings"
+    "generate-bindings": "moon run rust:generate-bindings"
   },
   "devDependencies": {
     "oxfmt": "^0.66.0",

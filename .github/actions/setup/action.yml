@@ -34,7 +34,6 @@ runs:
           target/release
           target/*-unknown-linux-gnu
           target/tests
-          external/smoltcp/target
           ~/.cache/zig
           ~/.cache/cargo-zigbuild
           .moon/cache/hashes

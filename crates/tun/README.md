@@ -3,7 +3,7 @@
 The [example policy](../../packages/api/examples/tun.ts) creates `kototun0` and routes TCP and UDP through a direct outbound. Run it with access to `/dev/net/tun` and `CAP_NET_ADMIN`:
 
 ```sh
-mise exec -- moon run rust:linux-debug
+mise exec -- moon run rust:build-linux-debug
 sudo target/tun/debug/kotoconn run --config packages/api/examples/tun.ts
 ```
 
@@ -32,7 +32,7 @@ Run the protocol tests with:
 mise exec -- uv run --locked python tools/rust.py test --locked -p kotoconn-tun
 ```
 
-For Linux E2E tests, [build the container binaries and runtime image](../../e2e/tun_support/README.md#real-network-e2e), then run `mise exec -- moon run docker:tun`.
+For Linux E2E tests, [build the container binaries and runtime image](../../e2e/tun_support/README.md#real-network-e2e), then run `mise exec -- moon run docker:test-tun`.
 The runner exercises the real CLI against Linux TCP/UDP sockets, injects malformed
 IP packets, and checks graceful and forced shutdown. It needs Docker and
 `/dev/net/tun`. Each invocation owns a container with a private network and a
@@ -65,11 +65,5 @@ The ordinary Interface and ring-buffer APIs remain available. Runtime scheduling
 allocation policy, pools and worker ownership stay in Kotoconn. See
 [TUN buffering](../../docs/tun-buffering.md) for their implementation.
 
-The fork is excluded from the parent Cargo workspace. Run its tests separately:
-
-```sh
-mise exec -- moon run rust:fork-test
-```
-
-Git branch and submodule operations are documented in
-[external sources](../../external/README.md).
+Fork development and internal testing belong in the smoltcp repository. See
+[external sources](../../external/README.md) for branch and gitlink operations.

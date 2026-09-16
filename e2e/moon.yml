@@ -1,28 +1,28 @@
 language: python
 tasks:
-  app:
+  build-app:
     command: uv run --locked python tools/docker.py app --tag kotoconn-e2e:local
-    deps: [rust:linux-debug]
+    deps: [rust:build-linux-debug]
     options:
       cache: false
-  runtime:
+  build-runtime:
     command: uv run --locked python tools/docker.py test-runtime --tag kotoconn-tun:local
     options:
       cache: false
   build:
-    deps: [app, runtime]
+    deps: [build-app, build-runtime]
   test:
     command: uv run --locked python e2e/run.py
     deps: [build]
     options:
       cache: false
-  tun:
+  test-tun:
     command: uv run --locked python e2e/tun.py
-    deps: [rust:linux-debug, runtime]
+    deps: [rust:build-linux-debug, build-runtime]
     options:
       cache: false
-  isolation:
+  test-isolation:
     command: uv run --locked python e2e/tun_support/check_isolation.py
-    deps: [rust:linux-debug, runtime]
+    deps: [rust:build-linux-debug, build-runtime]
     options:
       cache: false
