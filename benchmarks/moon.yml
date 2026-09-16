@@ -7,14 +7,14 @@ tasks:
       cache: false
       mutex: benchmark
   test-smoke:
-    command: uv run --locked python benchmarks/run.py --mtu 1500 --duration 1 --warmup 0 --repetitions 1 --case tcp-bulk-1 --case udp-paced --case mixed-malformed
-    deps: [rust:build-linux-release, docker:build-runtime]
+    command: uv run --locked python benchmarks/run.py --binary target/tun/debug/kotoconn --traffic-binary target/tun/debug/kotoconn-tun-traffic --mtu 1500 --duration 1 --warmup 0 --repetitions 1 --case tcp-bulk-1 --case udp-paced --case mixed-malformed
+    deps: [rust:build-linux-debug, docker:build-runtime]
     options:
       cache: false
       mutex: benchmark
   test-udp-churn:
-    command: uv run --locked python benchmarks/check_udp_churn.py
-    deps: [rust:build-linux-release, docker:build-runtime]
+    command: uv run --locked python benchmarks/check_udp_churn.py --binary target/tun/debug/kotoconn --traffic-binary target/tun/debug/kotoconn-tun-traffic
+    deps: [rust:build-linux-debug, docker:build-runtime]
     options:
       cache: false
       mutex: benchmark
