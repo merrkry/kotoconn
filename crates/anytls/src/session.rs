@@ -6,7 +6,7 @@ use anyhow::{Result, bail, ensure};
 use anytls::core::{Command, Engine, Frame, PaddingFactory, ProtocolAction, State};
 use bytes::Bytes;
 use futures_util::StreamExt;
-use kotoconn_protocol::{BoxStream, Scope};
+use kotoconn_protocol::{BoxStream, Scope, WorkGuard};
 use std::{collections::HashMap, io, sync::Arc};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
@@ -15,11 +15,13 @@ use tokio::{
 use tokio_util::{codec::FramedRead, sync::CancellationToken};
 
 const MAX_STREAMS: usize = 128;
+
 const RECEIVE_BYTES: usize = 4 * 1024 * 1024;
 
 pub(crate) enum Message {
     Open {
         address: Bytes,
+        work: WorkGuard,
         complete: oneshot::Sender<Result<LogicalStream>>,
     },
     Data {
@@ -36,18 +38,43 @@ pub(crate) enum Message {
     },
 }
 
+pub(crate) struct Dropped {
+    pub sid: u32,
+    pub _work: Option<WorkGuard>,
+}
+
 pub(crate) struct Handle {
     pub sender: mpsc::Sender<Message>,
     pub closed: CancellationToken,
+    scope: Scope,
 }
 
 impl Handle {
-    pub async fn open(&self, address: Bytes) -> Result<BoxStream> {
+    pub async fn open(&self, address: Bytes, work: WorkGuard) -> Result<BoxStream> {
+        // Before publication there is no logical stream whose Drop can return
+        // this reserved session to the pool. Cancel it if enqueue is cancelled.
+        struct Opening(Option<Scope>);
+
+        impl Drop for Opening {
+            fn drop(&mut self) {
+                if let Some(scope) = &self.0 {
+                    scope.close();
+                }
+            }
+        }
+
+        let mut opening = Opening(Some(self.scope.clone()));
         let (complete, receive) = oneshot::channel();
         self.sender
-            .send(Message::Open { address, complete })
+            .send(Message::Open {
+                address,
+                work,
+                complete,
+            })
             .await
             .map_err(|_| anyhow::anyhow!("AnyTLS session closed"))?;
+        opening.0 = None;
+
         let mut stream = receive.await??;
         stream.wait_handshake().await?;
         Ok(Box::pin(stream))
@@ -71,6 +98,7 @@ struct Write {
 }
 
 type Incoming = Box<dyn Fn(BoxStream) -> Result<()> + Send + Sync>;
+
 type Idle = Box<dyn Fn() + Send + Sync>;
 
 pub(crate) struct Session {
@@ -83,11 +111,12 @@ pub(crate) struct Session {
     started: bool,
     messages: mpsc::Receiver<Message>,
     sender: mpsc::Sender<Message>,
-    dropped: mpsc::UnboundedReceiver<u32>,
-    drop_sender: mpsc::UnboundedSender<u32>,
+    dropped: mpsc::UnboundedReceiver<Dropped>,
+    drop_sender: mpsc::UnboundedSender<Dropped>,
     writes: mpsc::Sender<Write>,
     incoming: Option<Incoming>,
     idle: Option<Idle>,
+    stopping: Option<CancellationToken>,
 }
 
 impl Session {
@@ -97,6 +126,7 @@ impl Session {
         padding: watch::Sender<PaddingFactory>,
         incoming: Option<Incoming>,
         idle: Option<Idle>,
+        stopping: Option<CancellationToken>,
     ) -> Result<Arc<Handle>>
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -110,6 +140,7 @@ impl Session {
         let handle = Arc::new(Handle {
             sender: sender.clone(),
             closed: closed.clone(),
+            scope: scope.clone(),
         });
         let mut session = Self {
             client,
@@ -126,7 +157,9 @@ impl Session {
             writes,
             incoming,
             idle,
+            stopping,
         };
+
         let (reader, mut writer) = tokio::io::split(io);
         let guard = closed.drop_guard();
         scope.spawn(async move {
@@ -135,12 +168,13 @@ impl Session {
                 let mut packet = 1u32;
                 while let Some(write) = pending.recv().await {
                     if write.bytes.is_empty() {
-                        writer.flush().await?;
+                        tokio::time::timeout(crate::WRITE_TIMEOUT, writer.flush()).await??;
                         if let Some(complete) = write.complete {
                             let _ = complete.send(Ok(()));
                         }
                         continue;
                     }
+
                     let padding = client.then(|| state.padding());
                     let result = tokio::time::timeout(
                         crate::WRITE_TIMEOUT,
@@ -148,6 +182,7 @@ impl Session {
                     )
                     .await?;
                     packet = packet.saturating_add(1);
+
                     if let Some(complete) = write.complete {
                         let _ = complete.send(
                             result
@@ -160,6 +195,7 @@ impl Session {
                 }
                 Ok::<(), anyhow::Error>(())
             };
+
             tokio::select! {
                 result = session.run(FramedRead::new(reader, wire::Frames)) => result,
                 result = writing => result,
@@ -172,19 +208,29 @@ impl Session {
         &mut self,
         mut reader: FramedRead<R, wire::Frames>,
     ) -> Result<()> {
+        let stopping = self.stopping.clone().unwrap_or_default();
+        let mut draining = false;
         loop {
+            if draining && self.entries.is_empty() {
+                return Ok(());
+            }
+
             tokio::select! {
+                _ = stopping.cancelled(), if !draining => draining = true,
                 frame = reader.next() => {
                     let frame = frame.ok_or_else(|| anyhow::anyhow!("AnyTLS peer disconnected"))??;
                     self.received(frame).await?;
                 }
                 Some(message) = self.messages.recv() => self.message(message).await?,
-                Some(sid) = self.dropped.recv() => self.close(sid, None).await?,
+                Some(dropped) = self.dropped.recv() => {
+                    self.close(dropped.sid, None).await?;
+                    drop(dropped);
+                }
             }
         }
     }
 
-    fn stream(&mut self, sid: u32) -> LogicalStream {
+    fn stream(&mut self, sid: u32, work: Option<WorkGuard>) -> LogicalStream {
         debug_assert!(!self.entries.contains_key(&sid));
         let (incoming, receive) = mpsc::unbounded_channel();
         let status = Arc::new(Status::default());
@@ -194,6 +240,7 @@ impl Session {
             self.sender.clone(),
             self.drop_sender.clone(),
             status.clone(),
+            work,
         );
         self.entries.insert(sid, Entry { incoming, status });
         stream
@@ -208,6 +255,7 @@ impl Session {
         for frame in frames {
             bytes.extend_from_slice(&frame.to_bytes()?);
         }
+
         self.writes
             .send(Write {
                 bytes: bytes.into(),
@@ -226,7 +274,11 @@ impl Session {
 
     async fn message(&mut self, message: Message) -> Result<()> {
         match message {
-            Message::Open { address, complete } => {
+            Message::Open {
+                address,
+                work,
+                complete,
+            } => {
                 ensure!(
                     self.client && self.entries.is_empty(),
                     "AnyTLS session is busy"
@@ -236,8 +288,9 @@ impl Session {
                     .checked_add(1)
                     .ok_or_else(|| anyhow::anyhow!("AnyTLS stream IDs exhausted"))?;
                 let sid = self.next_sid;
-                let stream = self.stream(sid);
+                let stream = self.stream(sid, Some(work));
                 let mut frames = Vec::new();
+
                 if !self.started {
                     for action in Engine::on_session_start(
                         &self.state,
@@ -250,9 +303,11 @@ impl Session {
                     }
                     self.started = true;
                 }
+
                 frames.push(Frame::new(Command::Syn, sid));
                 frames.push(Frame::with_data(Command::Psh, sid, address));
                 self.flush_frames(&frames).await?;
+
                 // A cancelled opener drops its stream, queuing normal cleanup.
                 let _ = complete.send(Ok(stream));
             }
@@ -337,6 +392,7 @@ impl Session {
                     } else {
                         false
                     };
+
                     if full {
                         self.close(
                             sid,
@@ -363,7 +419,8 @@ impl Session {
                         .await?;
                         continue;
                     }
-                    let stream = self.stream(sid);
+
+                    let stream = self.stream(sid, None);
                     self.send(&[Frame::new(Command::SynAck, sid)], None).await?;
                     if let Some(incoming) = &self.incoming {
                         incoming(Box::pin(stream))?;
@@ -400,5 +457,36 @@ impl Drop for Session {
         for entry in self.entries.values() {
             entry.status.close(Some("AnyTLS session closed".into()));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelling_an_open_before_publication_releases_its_reserved_session() {
+        let scope = Scope::new();
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .send(Message::Data {
+                sid: 1,
+                bytes: Bytes::new(),
+            })
+            .await
+            .unwrap();
+        let handle = Handle {
+            sender,
+            closed: CancellationToken::new(),
+            scope: scope.clone(),
+        };
+        let caller = Scope::new();
+        let mut opening = Box::pin(handle.open(Bytes::new(), caller.track().unwrap()));
+        assert!(futures_util::poll!(&mut opening).is_pending());
+
+        drop(opening);
+        assert!(scope.is_closed());
+        caller.wait().await;
+        drop(receiver);
     }
 }

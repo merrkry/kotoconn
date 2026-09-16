@@ -19,6 +19,7 @@ pub struct OutboundConfig {
 #[derive(Debug, Clone, PartialEq, Eq, ts_rs::TS)]
 #[ts(type = "{ readonly __brand: unique symbol }")]
 pub enum OutboundImpl {
+    AnyTls(crate::AnyTlsOutboundConfig),
     Shadowsocks2022(Shadowsocks2022OutboundConfig),
     Http(HttpOutboundConfig),
     Direct(DirectOutboundConfig),

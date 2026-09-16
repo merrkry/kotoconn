@@ -7,6 +7,7 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 futures-util.workspace = true
+kotoconn-anytls.workspace = true
 kotoconn-config.workspace = true
 kotoconn-http.workspace = true
 kotoconn-protocol.workspace = true

@@ -6,7 +6,7 @@ pub struct AnyTlsOutboundConfig {
     pub server: Target,
     pub password: String,
     pub tls: TlsClientConfig,
-    #[ts(type = "Timeout | undefined")]
+    #[ts(optional, type = "Timeout")]
     pub idle_session_timeout: Option<Duration>,
 }
 
@@ -16,5 +16,6 @@ pub struct AnyTlsInboundConfig {
     pub listen: SocketAddr,
     pub password: String,
     pub tls: TlsServerConfig,
+    #[ts(optional)]
     pub padding_scheme: Option<String>,
 }

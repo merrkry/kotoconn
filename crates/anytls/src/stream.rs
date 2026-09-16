@@ -1,7 +1,7 @@
-use crate::session::Message;
+use crate::session::{Dropped, Message};
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
-use kotoconn_protocol::Stream;
+use kotoconn_protocol::{Stream, WorkGuard};
 use std::{
     io,
     pin::Pin,
@@ -55,7 +55,8 @@ pub(crate) struct LogicalStream {
     incoming: mpsc::UnboundedReceiver<Received>,
     pending: Option<Received>,
     outgoing: PollSender<Message>,
-    dropped: mpsc::UnboundedSender<u32>,
+    dropped: mpsc::UnboundedSender<Dropped>,
+    work: Option<WorkGuard>,
     status: Arc<Status>,
     closed: Pin<Box<WaitForCancellationFutureOwned>>,
     flushing: Option<BoxFuture<'static, io::Result<()>>>,
@@ -66,8 +67,8 @@ impl LogicalStream {
     pub async fn wait_handshake(&mut self) -> io::Result<()> {
         tokio::select! {
             biased;
-            _ = self.status.closed.cancelled() => Err(self.status.error()),
             _ = self.status.accepted.cancelled() => Ok(()),
+            _ = self.status.closed.cancelled() => Err(self.status.error()),
         }
     }
 
@@ -75,8 +76,9 @@ impl LogicalStream {
         sid: u32,
         incoming: mpsc::UnboundedReceiver<Received>,
         outgoing: mpsc::Sender<Message>,
-        dropped: mpsc::UnboundedSender<u32>,
+        dropped: mpsc::UnboundedSender<Dropped>,
         status: Arc<Status>,
+        work: Option<WorkGuard>,
     ) -> Self {
         Self {
             sid,
@@ -84,6 +86,7 @@ impl LogicalStream {
             pending: None,
             outgoing: PollSender::new(outgoing),
             dropped,
+            work,
             closed: Box::pin(status.closed.clone().cancelled_owned()),
             status,
             flushing: None,
@@ -113,7 +116,10 @@ impl Drop for LogicalStream {
     fn drop(&mut self) {
         // Only one handle exists per SID; the drop channel contains at most one
         // entry per admitted stream, independently of data-channel backpressure.
-        let _ = self.dropped.send(self.sid);
+        let _ = self.dropped.send(Dropped {
+            sid: self.sid,
+            _work: self.work.take(),
+        });
     }
 }
 

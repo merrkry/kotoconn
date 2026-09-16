@@ -31,6 +31,7 @@ pub struct InboundConfig {
 #[derive(Debug, Clone, PartialEq, Eq, ts_rs::TS)]
 #[ts(type = "{ readonly __brand: unique symbol }")]
 pub enum InboundImpl {
+    AnyTls(crate::AnyTlsInboundConfig),
     Shadowsocks2022(Shadowsocks2022InboundConfig),
     Socks5(Socks5InboundConfig),
     Http(HttpInboundConfig),

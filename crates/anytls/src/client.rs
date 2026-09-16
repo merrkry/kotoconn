@@ -2,7 +2,7 @@ use crate::{
     session::{Handle, Session},
     tls, udp, wire,
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use anytls::core::PaddingFactory;
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
@@ -13,6 +13,7 @@ use rustls::pki_types::ServerName;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::{sync::watch, time::Instant};
 use tokio_rustls::TlsConnector;
+use tokio_util::sync::CancellationToken;
 
 struct Slot {
     handle: Arc<Handle>,
@@ -30,6 +31,7 @@ impl Drop for Slot {
 struct Pool {
     sessions: BTreeMap<u64, Slot>,
     sequence: u64,
+    draining: bool,
 }
 
 pub struct Client {
@@ -42,6 +44,7 @@ pub struct Client {
     pool: Arc<Mutex<Pool>>,
     scope: Scope,
     idle_timeout: Duration,
+    cleanup_stop: CancellationToken,
 }
 
 impl Client {
@@ -50,6 +53,7 @@ impl Client {
         carrier: Arc<dyn Carrier>,
         resolver: Arc<dyn Resolver>,
     ) -> Result<Self> {
+        tokio::runtime::Handle::try_current().context("AnyTLS client requires a Tokio runtime")?;
         let (connector, name) = tls::client(&options.tls, &options.server)?;
         let idle_timeout = options
             .idle_session_timeout
@@ -62,10 +66,15 @@ impl Client {
         let pool = Arc::new(Mutex::new(Pool::default()));
         let scope = carrier.scope().child();
         let cleaning = Arc::downgrade(&pool);
+        let cleanup_stop = CancellationToken::new();
+        let stopped = cleanup_stop.clone();
         scope.spawn(async move {
             let mut interval = tokio::time::interval(idle_timeout.min(Duration::from_secs(30)));
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = stopped.cancelled() => return Ok(()),
+                    _ = interval.tick() => {}
+                }
                 let Some(pool) = cleaning.upgrade() else {
                     return Ok(());
                 };
@@ -90,10 +99,11 @@ impl Client {
             pool,
             scope,
             idle_timeout,
+            cleanup_stop,
         })
     }
 
-    async fn connect(&self, address: Bytes) -> Result<BoxStream> {
+    async fn connect(&self, address: Bytes, work: WorkGuard) -> Result<BoxStream> {
         self.carrier.capabilities().require(Capabilities::TCP)?;
         let reusable = {
             let mut pool = self.pool.lock();
@@ -116,13 +126,14 @@ impl Client {
             Some(session) => session,
             None => self.new_session().await?,
         };
-        session.open(address).await
+        session.open(address, work).await
     }
 
     async fn open(&self, address: Bytes, scope: Scope) -> Result<BoxStream> {
+        let work = scope.track()?;
         let stream = scope
             .run(async {
-                tokio::time::timeout(crate::HANDSHAKE_TIMEOUT, self.connect(address)).await?
+                tokio::time::timeout(crate::HANDSHAKE_TIMEOUT, self.connect(address, work)).await?
             })
             .await?;
         stream_task(scope, async move { Ok(stream) })
@@ -159,13 +170,23 @@ impl Client {
         };
         let idle_pool = Arc::downgrade(&self.pool);
         let idle = Box::new(move || {
-            if let Some(pool) = idle_pool.upgrade()
-                && let Some(slot) = pool.lock().sessions.get_mut(&sequence)
-            {
-                slot.idle_since = Some(Instant::now());
+            if let Some(pool) = idle_pool.upgrade() {
+                let mut pool = pool.lock();
+                if pool.draining {
+                    pool.sessions.remove(&sequence);
+                } else if let Some(slot) = pool.sessions.get_mut(&sequence) {
+                    slot.idle_since = Some(Instant::now());
+                }
             }
         });
-        let handle = Session::start(tls, &session_scope, self.padding.clone(), None, Some(idle))?;
+        let handle = Session::start(
+            tls,
+            &session_scope,
+            self.padding.clone(),
+            None,
+            Some(idle),
+            None,
+        )?;
         self.pool.lock().sessions.insert(
             sequence,
             Slot {
@@ -186,6 +207,13 @@ impl Drop for Client {
 }
 
 impl p::Client for Client {
+    fn drain(&self) {
+        let mut pool = self.pool.lock();
+        pool.draining = true;
+        pool.sessions.retain(|_, slot| slot.idle_since.is_none());
+        self.cleanup_stop.cancel();
+    }
+
     fn capabilities(&self) -> Capabilities {
         let tcp = self.carrier.capabilities().tcp;
         Capabilities { tcp, udp: tcp }

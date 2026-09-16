@@ -47,13 +47,17 @@ impl p::Server for Server {
                         let padding = padding.clone();
                         let context = connection_context.clone();
                         async move {
-                            let tls = tokio::time::timeout(crate::HANDSHAKE_TIMEOUT, async {
+                            let handshake = tokio::time::timeout(crate::HANDSHAKE_TIMEOUT, async {
                                 let mut tls = acceptor.accept(stream).await?;
                                 wire::authenticate(&mut tls, &password).await?;
                                 Ok::<_, anyhow::Error>(tls)
-                            })
-                            .await??;
+                            });
+                            let tls = tokio::select! {
+                                _ = context.stopping.cancelled() => return Ok(()),
+                                result = handshake => result??,
+                            };
                             let streams = scope.clone();
+                            let stopping = context.stopping.clone();
                             let (padding, _) = watch::channel(padding);
                             let session = Session::start(
                                 tls,
@@ -68,11 +72,14 @@ impl p::Server for Server {
                                     let stopping = context.stopping.clone();
                                     let work_scope = scope.clone();
                                     scope.spawn(async move {
-                                        let destination = tokio::time::timeout(
+                                        let request = tokio::time::timeout(
                                             crate::HANDSHAKE_TIMEOUT,
                                             wire::read_target(&mut stream),
-                                        )
-                                        .await??;
+                                        );
+                                        let destination = tokio::select! {
+                                            _ = stopping.cancelled() => return Ok(()),
+                                            result = request => result??,
+                                        };
                                         if udp::is_sentinel(&destination) {
                                             let destination = tokio::time::timeout(
                                                 crate::HANDSHAKE_TIMEOUT,
@@ -91,6 +98,7 @@ impl p::Server for Server {
                                     })
                                 })),
                                 None,
+                                Some(stopping),
                             )?;
                             session.closed.cancelled().await;
                             scope.close();

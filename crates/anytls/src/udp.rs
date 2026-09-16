@@ -106,6 +106,8 @@ async fn write_packet(
         wire::address(&packet.target)?
     };
     if !connected {
+        // SAFETY: fast-socks5 serializes every address with an initial family byte.
+        debug_assert!(!bytes.is_empty());
         bytes[0] = match bytes[0] {
             1 => 0,
             4 => 1,
