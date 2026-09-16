@@ -4,6 +4,7 @@ members = [
     "crates/config",
     "crates/daemon",
     "crates/http",
+    "crates/hysteria2",
     "crates/inbounds",
     "crates/outbounds",
     "crates/protocol",
@@ -25,11 +26,14 @@ publish = false
 [workspace.dependencies]
 anyhow = "1.0.104"
 bytes = "1.12.1"
+blake2 = "0.11.0"
 clap = "4.6.6"
 derive_more = "2.1.1"
 duplicate = "2.0.1"
 fast-socks5 = "1.0.0"
 futures-util = "0.3.34"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
 
 hickory-proto = { version = "0.26.3", default-features = false }
 http = "1.5.0"
@@ -37,6 +41,7 @@ httparse = "1.10.1"
 kotoconn-config = { path = "crates/config" }
 kotoconn-daemon = { path = "crates/daemon" }
 kotoconn-http = { path = "crates/http" }
+kotoconn-hysteria2 = { path = "crates/hysteria2" }
 kotoconn-inbounds = { path = "crates/inbounds" }
 kotoconn-outbounds = { path = "crates/outbounds" }
 kotoconn-protocol = { path = "crates/protocol" }
@@ -47,12 +52,18 @@ kotoconn-tun = { path = "crates/tun" }
 kotoconn-typescript = { path = "crates/typescript" }
 oxc = { version = "0.149.0", default-features = false }
 rand = "0.9.5"
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+quinn-proto = { version = "0.11.18", default-features = false }
+rcgen = "0.14.10"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+webpki-roots = "1.0"
 rquickjs = "0.13.0"
 rustix = "1.1.4"
 serde_json = "1.0.151"
 shadowsocks = { version = "1.25.0", default-features = false }
 shadowsocks-service = { version = "1.25.0", default-features = false }
 smoltcp = { version = "0.14.0", default-features = false }
+subtle = "2.6.1"
 structural-convert = "0.13"
 tempfile = "3.27.0"
 thiserror = "2.0.20"

@@ -30,6 +30,8 @@ pub(crate) fn declarations() -> String {
         DnsResult::decl(&cfg),
         InboundImpl::decl(&cfg),
         OutboundImpl::decl(&cfg),
+        Hysteria2InboundConfig::decl(&cfg),
+        Hysteria2OutboundConfig::decl(&cfg),
         HttpInboundConfig::decl(&cfg),
         Socks5InboundConfig::decl(&cfg),
         Shadowsocks2022InboundConfig::decl(&cfg),

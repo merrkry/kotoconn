@@ -87,13 +87,13 @@ def tcp(port, target, source):
         assert stream.recv(1) == b"", "missing EOF after completed transfer"
 
 
-def udp(port, target, source):
+def udp(port, target, source, payload_size=8192):
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.settimeout(LIMIT)
         sock.connect(("entry", port))
         # sing-box's direct/SOCKS chain drops empty datagrams even without
         # Kotoconn. The Rust protocol tests cover zero-length payloads.
-        for payload in (b"x", bytes(range(256)) * 32):
+        for payload in (b"x", bytes(range(256)) * (payload_size // 256)):
             sock.send(payload)
             actual = sock.recv(65536)
             assert actual == identity(target, source) + payload, (
@@ -101,9 +101,13 @@ def udp(port, target, source):
             )
 
 
-def check(transport, rewrite, egress):
+def check(transport, rewrite, egress, udp_payload_size=8192):
     source = socket.gethostbyname(egress)
-    operation = tcp if transport == "tcp" else udp
+
+    def udp_operation(port, target, source):
+        return udp(port, target, source, udp_payload_size)
+
+    operation = tcp if transport == "tcp" else udp_operation
     # Separate connections/associations exercise concurrency and multiple targets.
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         futures = [
@@ -125,6 +129,7 @@ if __name__ == "__main__":
     parser.add_argument("mode", choices=("serve", "ready", "tcp", "udp", "reject"))
     parser.add_argument("--egress", default="kotoconn")
     parser.add_argument("--rewrite", action="store_true")
+    parser.add_argument("--udp-payload-size", type=int, default=8192)
     args = parser.parse_args()
     if args.mode == "serve":
         serve()
@@ -143,4 +148,4 @@ if __name__ == "__main__":
                     pass
         print("PASS policy rejection and handler exception")
     else:
-        check(args.mode, args.rewrite, args.egress)
+        check(args.mode, args.rewrite, args.egress, args.udp_payload_size)
