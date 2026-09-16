@@ -1,7 +1,8 @@
 services:
   echo:
-    image: docker.io/library/python:3.13.7-slim-bookworm@sha256:781449467ffb6f04218f09b1ecdcdc7d22b289ee5da9ec498b024e24ad7a6db7
-    command: [python, -u, /tests/traffic.py, serve]
+    image: kotoconn-tun:local
+    entrypoint: [python3]
+    command: [-u, /tests/traffic.py, serve]
     volumes:
       - ./traffic.py:/tests/traffic.py:ro
     healthcheck:

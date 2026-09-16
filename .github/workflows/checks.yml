@@ -2,8 +2,7 @@ name: Checks
 
 on:
   push:
-    branches:
-      - master
+    branches: [master]
   pull_request:
   workflow_dispatch:
 
@@ -13,9 +12,6 @@ permissions:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-
-env:
-  CARGO_TERM_COLOR: always
 
 jobs:
   check:
@@ -27,48 +23,7 @@ jobs:
         with:
           submodules: recursive
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup
         with:
-          toolchain: 1.98.1
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - uses: pnpm/action-setup@v6
-        with:
-          version: 11.25.0
-      - uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-          cache: pnpm
-          cache-dependency-path: pnpm-lock.yaml
-      - name: Install TypeScript dependencies
-        run: pnpm install --frozen-lockfile
-      - uses: astral-sh/setup-uv@v7
-        with:
-          version: "0.12.5"
-          enable-cache: true
-      - name: Install Python dependencies
-        run: uv sync --locked
-      - name: Check Python formatting
-        run: uv run --locked ruff format --check
-      - name: Lint Python
-        run: uv run --locked ruff check
-      - name: Check Python types
-        run: uv run --locked pyrefly check
-      - name: Check Rust formatting
-        run: cargo fmt --all -- --check
-      - name: Lint Rust
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Test smoltcp fork
-        run: |
-          cargo fmt --manifest-path external/smoltcp/Cargo.toml -- --check
-          cargo test --manifest-path external/smoltcp/Cargo.toml --lib --no-default-features --features std,medium-ip,proto-ipv4,proto-ipv6,socket-tcp,socket-tcp-cubic,assembler-max-segment-count-32,segmentation-offload
-      - name: Test Rust
-        run: cargo test --workspace --locked
-      # TypeScript checks generate bindings with Cargo and reuse the build above.
-      - name: Check TypeScript
-        run: pnpm run check
-      # rust-cache probes both directories without awaiting missing-path errors.
-      # Remove after https://github.com/Swatinem/rust-cache/pull/387 is released.
-      - name: Prepare nested test directories for cache cleanup
-        if: always()
-        run: mkdir -p target/tests/target target/tests/trybuild
+          cache-scope: checks
+      - run: mise exec -- moon run workspace:check

@@ -1,0 +1,11 @@
+tasks:
+  check:
+    deps: [rust:check, typescript:check, python:check]
+  build:
+    deps: [rust:build, typescript:build]
+  e2e:
+    deps: [docker:test, docker:tun, docker:isolation]
+  ci:
+    deps: [workspace:check, workspace:e2e, benchmark:smoke, benchmark:udp-churn]
+    options:
+      runDepsInParallel: false

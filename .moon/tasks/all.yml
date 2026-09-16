@@ -1,0 +1,11 @@
+# mise owns executable versions; moon owns task dependencies and outputs.
+implicitInputs:
+  - $KOTOCONN_BUILD_HOST
+  - /mise.toml
+  - /.moon/workspace.yml
+  - /.moon/tasks/**/*.yml
+  - /uv.lock
+  - /pyproject.toml
+  - /.python-version
+taskOptions:
+  runFromWorkspaceRoot: true

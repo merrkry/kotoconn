@@ -44,6 +44,8 @@ Before editing `external/smoltcp`, follow the [stable fork branch workflow](exte
 
 Use static checks; start a dev server or preview only when explicitly asked.
 
+- Run tools through `mise exec --`, or activate mise in the shell. See [build orchestration](docs/build.md) when changing tasks, tool versions, caches, containers or CI.
 - TypeScript: run `pnpm run format` and `pnpm run check` before finishing.
-- Rust: run `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` separately. Keep Rust checks out of `package.json`.
+- Rust: run `moon run rust:format`, `moon run rust:lint`, and `moon run rust:test` separately. Compilation, linting and tests use cargo-zigbuild through the moon tasks. Keep Rust checks out of `package.json`.
+- Python: run `moon run python:check`.
 - Generated binding declarations are ignored by Git. `pnpm run check` regenerates them before compilation; use `pnpm run bindings` to refresh editor types.

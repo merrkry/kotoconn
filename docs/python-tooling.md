@@ -1,30 +1,24 @@
 # Python tooling
 
-Install uv 0.12.5, then run these commands from the repository root:
+[Install the workspace tools](build.md), then run:
 
 ```sh
-uv sync --locked
-uv run --locked ruff format --check
-uv run --locked ruff check
-uv run --locked pyrefly check
+mise exec -- moon run python:check
+mise exec -- moon run python:format
 ```
 
-uv uses Python 3.14 from `.python-version` and installs the development tools
-from `uv.lock` into `.venv`. It downloads Python if a compatible interpreter is
-not available. The tooling project is not a distributable Python package and
-has no runtime dependencies.
+mise installs uv. uv installs the managed interpreter pinned in `.python-version`
+and the development tools locked in `uv.lock` into `.venv`. The tooling project
+is not a distributable Python package and has no runtime dependencies.
 
-Ruff checks formatting, imports, and lint rules. Pyrefly checks types. Both check
-Python files under `e2e`, `benchmarks`, and `tools`; third-party code under
-`external` is outside their configured scope. The check job in
-`.github/workflows/checks.yml` runs the same checks alongside Rust and TypeScript.
+Ruff checks formatting, imports and lint rules. Pyrefly checks types. Both cover
+`e2e`, `benchmarks` and `tools`; third-party code under `external` is outside their
+scope. `python:sync` reconciles the environment before checks, even with a warm
+moon cache.
 
-To apply formatting or import fixes locally:
+For direct runner invocations or import fixes, use the same environment:
 
 ```sh
-uv run --locked ruff format
-uv run --locked ruff check --fix
+mise exec -- uv run --locked python e2e/run.py --help
+mise exec -- uv run --locked ruff check --fix
 ```
-
-Existing Python runner commands remain available. Use `uv run --locked python`
-in place of `python3` to run them with the managed interpreter.

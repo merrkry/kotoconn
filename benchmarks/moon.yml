@@ -1,0 +1,20 @@
+language: python
+tasks:
+  run:
+    command: uv run --locked python benchmarks/run.py
+    deps: [rust:linux-release, docker:runtime]
+    options:
+      cache: false
+      mutex: benchmark
+  smoke:
+    command: uv run --locked python benchmarks/run.py --mtu 1500 --duration 1 --warmup 0 --repetitions 1 --case tcp-bulk-1 --case udp-paced --case mixed-malformed
+    deps: [rust:linux-release, docker:runtime]
+    options:
+      cache: false
+      mutex: benchmark
+  udp-churn:
+    command: uv run --locked python benchmarks/check_udp_churn.py
+    deps: [rust:linux-release, docker:runtime]
+    options:
+      cache: false
+      mutex: benchmark

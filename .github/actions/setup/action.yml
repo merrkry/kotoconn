@@ -1,0 +1,50 @@
+name: Build tools and caches
+description: Install pinned tools and restore dependency and task caches.
+inputs:
+  cache-scope:
+    description: Separate compiler artifacts for check and release workloads.
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: jdx/mise-action@v4
+      with:
+        version: 2026.9.9
+    - name: Locate dependency stores
+      id: stores
+      shell: bash
+      run: |
+        echo "pnpm=$(mise exec -- pnpm store path)" >> "$GITHUB_OUTPUT"
+        echo "uv=$(mise exec -- uv cache dir)" >> "$GITHUB_OUTPUT"
+        echo "cargo=${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_OUTPUT"
+    - uses: actions/cache@v5
+      with:
+        path: |
+          ${{ steps.stores.outputs.pnpm }}
+          ${{ steps.stores.outputs.uv }}
+          ${{ steps.stores.outputs.cargo }}/registry
+          ${{ steps.stores.outputs.cargo }}/git
+        key: deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml') }}-${{ hashFiles('Cargo.lock', 'pnpm-lock.yaml', 'uv.lock') }}
+        restore-keys: |
+          deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml') }}-
+    - uses: actions/cache@v5
+      with:
+        path: |
+          target/debug
+          target/release
+          target/*-unknown-linux-gnu
+          target/tests
+          external/smoltcp/target
+          ~/.cache/zig
+          ~/.cache/cargo-zigbuild
+          .moon/cache/hashes
+          .moon/cache/outputs
+        key: build-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-scope }}-${{ hashFiles('mise.toml', '.python-version') }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+        restore-keys: |
+          build-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-scope }}-${{ hashFiles('mise.toml', '.python-version') }}-${{ hashFiles('Cargo.lock') }}-
+          build-${{ runner.os }}-${{ runner.arch }}-${{ inputs.cache-scope }}-${{ hashFiles('mise.toml', '.python-version') }}-
+    - name: Configure compiler output
+      shell: bash
+      run: |
+        echo 'CARGO_TERM_COLOR=always' >> "$GITHUB_ENV"
+        echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"

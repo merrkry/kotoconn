@@ -6,16 +6,16 @@ dialers and TypeScript policies. Rust tests cover protocol edge cases and intern
 lifecycle contracts. Kotoconn readiness and shutdown checks parse the CLI's JSON
 `fields.event` values; sing-box readiness uses its startup log message.
 
-Requirements: Python 3.10+, Docker Engine and Docker Compose v2 or later. No
-Python packages are needed. Run from the repository root:
+[Install the workspace tools](../docs/build.md) and provide Docker Engine and
+Docker Compose v2 or later. Run from the repository root. Moon prepares the
+binaries and images before launching the suite:
 
 ```sh
-docker build -f e2e/Dockerfile -t kotoconn-e2e:local .
-python3 e2e/run.py
-python3 e2e/run.py socks5 nested
+mise exec -- moon run docker:test
+mise exec -- moon run docker:test -- socks5 nested
 ```
 
-Use `python3 e2e/run.py --help` for available suites and execution options.
+Use `mise exec -- moon run docker:test -- --help` for available suites and execution options.
 
 Runs are isolated and may execute concurrently. Build the image first, or give
 concurrent builds distinct image tags.
@@ -32,13 +32,12 @@ container with a private network. They repeat single and concurrent TCP/UDP work
 including short connections, sparse activity, sustained transfers, mixed
 malformed input, half-close and device cleanup.
 
-First [build the TUN binaries and runtime image](tun_support/README.md#real-network-e2e).
-Then run:
+See the [TUN setup guide](tun_support/README.md#real-network-e2e), then run:
 
 ```sh
-python3 e2e/tun.py
-python3 e2e/tun.py --profile stress
-python3 e2e/tun_support/check_isolation.py
+mise exec -- moon run docker:tun
+mise exec -- moon run docker:tun -- --profile stress
+mise exec -- moon run docker:isolation
 ```
 
 This suite needs Docker and `/dev/net/tun`. Every invocation creates a new

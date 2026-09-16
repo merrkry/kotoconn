@@ -1,0 +1,78 @@
+language: rust
+fileGroups:
+  sources:
+    - /Cargo.toml
+    - /Cargo.lock
+    - /crates/**/*
+    - /external/smoltcp/**/*
+    - '!/external/smoltcp/target/**'
+    - /tools/rust.py
+    - $RUSTFLAGS
+    - $CARGO_ENCODED_RUSTFLAGS
+    - $CFLAGS
+    - $CXXFLAGS
+    - $CC
+    - $CXX
+    - $AR
+tasks:
+  format:
+    inputs: ["@group(sources)"]
+    command: cargo fmt --all
+    options:
+      cache: false
+  format-check:
+    inputs: ["@group(sources)"]
+    command: cargo fmt --all -- --check
+  lint:
+    inputs: ["@group(sources)"]
+    command: uv run --locked python tools/rust.py clippy --workspace --all-targets --locked -- -D warnings
+    options:
+      mutex: cargo
+  test:
+    inputs: ["@group(sources)"]
+    command: uv run --locked python tools/rust.py test --workspace --locked
+    options:
+      mutex: cargo
+  fork-format:
+    inputs: ["@group(sources)"]
+    command: cargo fmt --manifest-path external/smoltcp/Cargo.toml -- --check
+  fork-test:
+    inputs: ["@group(sources)"]
+    command: uv run --locked python tools/rust.py test --manifest-path external/smoltcp/Cargo.toml --lib --no-default-features --features std,medium-ip,proto-ipv4,proto-ipv6,socket-tcp,socket-tcp-cubic,assembler-max-segment-count-32,segmentation-offload
+    options:
+      # The fork does not commit a dependency lockfile. Let Cargo reconcile it.
+      cache: false
+      mutex: cargo
+  check:
+    inputs: ["@group(sources)"]
+    deps: [format-check, lint, test, fork-format, fork-test]
+  build:
+    inputs: ["@group(sources)"]
+    command: uv run --locked python tools/rust.py zigbuild --workspace --locked
+    options:
+      cache: false
+      mutex: cargo
+  bindings:
+    inputs: ["@group(sources)"]
+    command: uv run --locked python tools/rust.py run --locked --quiet -p kotoconn-script --bin generate-types
+    outputs: [/packages/bindings/src/generated.d.ts]
+    options:
+      mutex: cargo
+  test-bindings:
+    inputs: ["@group(sources)"]
+    command: uv run --locked python tools/rust.py run --locked --quiet -p kotoconn-script --example generate-test-types
+    outputs: [/packages/bindings/tests/generated.d.ts]
+    options:
+      mutex: cargo
+  linux-debug:
+    inputs: ["@group(sources)"]
+    command: uv run --locked python tools/rust.py stage debug
+    outputs: [/target/tun/debug/kotoconn, /target/tun/debug/kotoconn-tun-traffic]
+    options:
+      mutex: cargo
+  linux-release:
+    inputs: ["@group(sources)"]
+    command: uv run --locked python tools/rust.py stage release
+    outputs: [/target/tun/release/kotoconn, /target/tun/release/kotoconn-tun-traffic]
+    options:
+      mutex: cargo

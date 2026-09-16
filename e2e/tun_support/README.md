@@ -64,32 +64,21 @@ proxy. Linux sockets provide its real transport peer. The optional sing-box
 
 ## Real-network E2E
 
-Build the binaries in Docker and copy them out without starting the image.
-This uses the same Debian runtime as CI, independently of the host toolchain:
+[Install the workspace tools](../../docs/build.md), then run from the repository root.
+Moon builds the Linux binaries and runtime image before launching tests:
 
 ```sh
-docker build -f e2e/Dockerfile -t kotoconn-e2e:local .
-mkdir -p target/tun/debug
-(
-    tun_build=$(docker create kotoconn-e2e:local)
-    trap 'docker rm -f "$tun_build"' EXIT
-    docker cp "$tun_build:/usr/local/bin/kotoconn" target/tun/debug/kotoconn
-    docker cp "$tun_build:/usr/local/bin/kotoconn-tun-traffic" target/tun/debug/kotoconn-tun-traffic
-)
-docker build -f e2e/tun.Dockerfile -t kotoconn-tun:local .
+mise exec -- moon run docker:tun
+mise exec -- moon run docker:tun -- --profile stress
+mise exec -- moon run docker:tun -- --case mixed-malformed --mtu 9000 --family 6 --repeat 8 --seed 23
+mise exec -- moon run docker:tun -- --case generic-relay
+mise exec -- moon run docker:isolation
 ```
 
-Rebuild and copy the binaries after code changes. The TUN E2E runners default
-to `target/tun/debug/`, separate from host Cargo artifacts. Use `--binary` and
-`--traffic-binary` to select other binaries compatible with Debian Bookworm.
-
-```sh
-python3 e2e/tun.py
-python3 e2e/tun.py --profile stress
-python3 e2e/tun.py --case mixed-malformed --mtu 9000 --family 6 --repeat 8 --seed 23
-python3 e2e/tun.py --case generic-relay
-python3 e2e/tun_support/check_isolation.py
-```
+The TUN runners default to `target/tun/debug/`, populated by `rust:linux-debug`.
+Use `--binary` and `--traffic-binary` to select other binaries compatible with
+Debian Bookworm. To prepare artifacts without running tests, use
+`mise exec -- moon run rust:linux-debug docker:runtime`.
 
 For optimized-code verification, follow the [release build instructions](../../benchmarks/tun/README.md)
 and pass `--binary target/tun/release/kotoconn

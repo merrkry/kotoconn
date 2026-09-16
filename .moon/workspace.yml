@@ -1,0 +1,18 @@
+projects:
+  workspace: .
+  rust: crates
+  typescript: packages
+  python: tools
+  docker: e2e
+  benchmark: benchmarks
+vcs:
+  defaultBranch: master
+  provider: github
+# Walk submodule source files too, including uncommitted fork changes.
+hasher:
+  walkStrategy: glob
+  ignorePatterns:
+    - '**/target/**'
+    - '**/node_modules/**'
+    - '**/.git/**'
+    - '.moon/cache/**'
