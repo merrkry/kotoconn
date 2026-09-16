@@ -20,7 +20,7 @@ server-name verification remain enabled.
 
 ```ts
 const implementation = k.hysteria2_outbound({
-  server: k.domain_target("proxy.example", 443),
+  server: k.domain("proxy.example", 443),
   password: "replace-with-your-password",
   server_name: undefined,
   ca_certificate: undefined,
@@ -67,8 +67,9 @@ Authentication failures and ordinary HTTP/3 requests receive an empty 404
 response. HTTP/3 control processing continues after authentication. Unknown or
 malformed Hysteria datagrams are discarded. The adapter bounds field lengths,
 concurrent streams, association counts, and reassembly memory. Reassembly holds
-at most 64 incomplete packets and 256 KiB per connection and discards incomplete
-packets after ten seconds. UDP payloads larger than 65,507 bytes are discarded.
+at most 64 incomplete packets and 256 KiB of payload per connection. Each
+received datagram removes incomplete packets older than ten seconds. UDP
+payloads larger than 65,507 bytes are discarded.
 
 The carrier abstraction does not expose a path MTU, so QUIC uses its 1,200-byte
 baseline without MTU discovery. Handshake and stream setup have ten-second I/O
@@ -76,3 +77,20 @@ deadlines; QUIC uses a thirty-second idle timeout and ten-second keepalives.
 
 This adapter does not provide port hopping, Gecko, ACME, ECH, client certificates,
 a reverse-proxy masquerade, or configurable BBR profiles.
+
+## Verification
+
+Rust tests cover TCP half-close and server-first traffic, empty and large UDP
+payloads, concurrent associations, nested carriers, certificate and password
+rejection, authentication before proxy admission, continued HTTP/3 service,
+and cancellation during setup and shutdown.
+
+The `hysteria2` and `hysteria2-salamander` E2E suites test both directions against
+the official Hysteria 2.12.3 image pinned by digest. They cover TCP, fragmented
+UDP, concurrency, and CLI shutdown. Official Hysteria uses 4 KiB UDP buffers,
+so interop uses 2 KiB payloads; Rust tests cover 8 KiB datagrams through the
+proxy and 60,000-byte reassembly. The official update check is disabled.
+
+```sh
+mise exec -- moon run docker:test -- hysteria2 hysteria2-salamander
+```

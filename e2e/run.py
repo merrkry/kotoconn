@@ -12,13 +12,15 @@ import time
 import uuid
 from pathlib import Path
 
+import hysteria2
 from lifecycle import has_event
 
 LOGGER = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent
 KEY = "AAECAwQFBgcICQoLDA0ODw=="
-SUITES = ("http", "socks5", "shadowsocks2022", "nested", "typescript")
+PROTOCOLS = ("http", "socks5", "shadowsocks2022") + hysteria2.SUITES
+SUITES = PROTOCOLS + ("nested", "typescript")
 
 
 def sing_protocol(kind, server=None):
@@ -50,7 +52,7 @@ def sing_config(inbounds, outbound):
     }
 
 
-def policy(inbound, chain, rewrite=False):
+def policy(inbound, chain, rewrite=False, obfuscated=False):
     source = """import { kotoconn as k } from '@kotoconn/bindings';
 import { destination } from './routing.ts';
 const resolver = k.resolve_handler(async name => await k.lookup(name));
@@ -68,15 +70,21 @@ const listenPort: number = await Promise.resolve(1080);
             config = f"{{server: k.ip_target(address{index}, {port})"
             if kind == "shadowsocks2022":
                 config += f", password: '{KEY}'"
+            config += hysteria2.policy_options(
+                kind, outbound=True, obfuscated=obfuscated
+            )
             config += "}"
         source += f"const d{index} = k.dialer({{dialer: {previous}, outbound: {{resolve_handler: resolver, implementation: k.{kind}_outbound({config})}}}});\n"
         previous = f"d{index}"
+    extra = hysteria2.policy_options(inbound, obfuscated=obfuscated)
+    if inbound == "shadowsocks2022":
+        extra += f", password: '{KEY}'"
     source += f"""const routing = k.routing_handler(async flow => {{
     {"if (flow.dest.port === 9002) return k.reject();" if rewrite else ""}
     const target = await destination(flow.dest);
     return flow.protocol === 'udp' ? k.route_udp({previous}) : k.route({previous}, target);
 }});
-k.inbound({{implementation: k.{inbound}_inbound({{listen: {{address: k.ip('0.0.0.0'), port: listenPort}}{", password: '" + KEY + "'" if inbound == "shadowsocks2022" else ""}}}), routing_handler: routing, udp_idle_timeout: k.timeout(30000)}});
+k.inbound({{implementation: k.{inbound}_inbound({{listen: {{address: k.ip('0.0.0.0'), port: listenPort}}{extra}}}), routing_handler: routing, udp_idle_timeout: k.timeout(30000)}});
 """
     # The TypeScript suite changes the TCP destination. UDP cannot rewrite targets.
     routing = """import { kotoconn as k } from '@kotoconn/bindings';
@@ -90,9 +98,9 @@ export async function destination(target: {ip: ReturnType<typeof k.ip>, port: nu
     return source, routing
 
 
-def write_policy(directory, inbound, chain, rewrite=False):
+def write_policy(directory, inbound, chain, rewrite=False, obfuscated=False):
     directory.mkdir(parents=True, exist_ok=True)
-    main, routing = policy(inbound, chain, rewrite)
+    main, routing = policy(inbound, chain, rewrite, obfuscated)
     (directory / "main.ts").write_text(main)
     (directory / "routing.ts").write_text(routing)
 
@@ -113,6 +121,8 @@ class Scenario:
             "-f",
             str(ROOT / "compose.yaml"),
         ]
+        if suite in hysteria2.SUITES:
+            self.command += ["-f", str(hysteria2.override(self.directory, direction))]
         if suite == "nested":
             override = self.directory / "compose.json"
             override.write_text(
@@ -147,6 +157,10 @@ class Scenario:
                 if service in ("kotoconn", "gateway")
                 else "sing-box started" in logs
             )
+            if self.suite in hysteria2.SUITES and service == (
+                "peer" if self.direction == "client" else "entry"
+            ):
+                ready = hysteria2.ready(logs, self.direction)
             if ready:
                 return
             status = self.compose("ps", "--all", "--format", "json", service).stdout
@@ -169,7 +183,16 @@ class Scenario:
         raise TimeoutError(f"{self.name}: {service} did not become ready")
 
     def configure(self, target):
-        kind = self.suite if self.suite in SUITES[:3] else "socks5"
+        kind = (
+            "hysteria2"
+            if self.suite in hysteria2.SUITES
+            else self.suite
+            if self.suite in PROTOCOLS
+            else "socks5"
+        )
+        obfuscated = self.suite == "hysteria2-salamander"
+        if self.suite in hysteria2.SUITES:
+            hysteria2.configure(self.directory, target, obfuscated)
         inbound = kind if self.direction == "server" else "socks5"
         if self.suite == "nested":
             chain = [("shadowsocks2022", "gateway"), ("socks5", "127.0.0.1", 1081)]
@@ -181,8 +204,14 @@ class Scenario:
         else:
             chain = [(kind, "peer")]
         write_policy(
-            self.directory / "kotoconn", inbound, chain, self.suite == "typescript"
+            self.directory / "kotoconn",
+            inbound,
+            chain,
+            self.suite == "typescript",
+            obfuscated,
         )
+        if self.suite in hysteria2.SUITES and self.direction == "server":
+            return  # The official client uses hysteria-client.json.
         entry = sing_config(
             [
                 {
@@ -196,13 +225,15 @@ class Scenario:
             ],
             sing_protocol(inbound, "kotoconn"),
         )
+        (self.directory / "entry.json").write_text(json.dumps(entry, indent=2))
+        if self.suite in hysteria2.SUITES:
+            return  # The official server uses hysteria-server.json.
         peer_inbound = sing_protocol(kind)
         if self.suite == "nested":
             # Only the gateway can reach this loopback listener. Ignoring the
             # lower Shadowsocks dialer must fail instead of silently going direct.
             peer_inbound.update(listen="127.0.0.1", listen_port=1081)
         peer = sing_config([peer_inbound], {"type": "direct"})
-        (self.directory / "entry.json").write_text(json.dumps(entry, indent=2))
         (self.directory / "peer.json").write_text(json.dumps(peer, indent=2))
 
     def run(self):
@@ -247,6 +278,9 @@ class Scenario:
                     if self.direction == "client"
                     else "kotoconn",
                 ]
+                if self.suite in hysteria2.SUITES and transport == "udp":
+                    # Official Hysteria uses 4 KiB UDP buffers, including headers.
+                    command += ["--udp-payload-size", "2048"]
                 if self.suite == "typescript" and transport == "tcp":
                     command.append("--rewrite")
                 result = self.compose(*command, timeout=90)
@@ -374,7 +408,7 @@ def main():
     scenarios = [
         Scenario(args, suite, direction)
         for suite in (args.suites or SUITES)
-        for direction in (("client", "server") if suite in SUITES[:3] else ("both",))
+        for direction in (("client", "server") if suite in PROTOCOLS else ("both",))
     ]
     failures = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
