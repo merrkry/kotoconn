@@ -280,74 +280,76 @@ async fn http_admission_preserves_pipelined_bytes_and_rejects_bad_headers() -> R
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sessions_split_by_destination_and_close_without_killing_association() -> Result<()> {
-    tokio::time::timeout(LIMIT, async {
-        let daemon = daemon().await?;
-        let scope = Scope::new();
-        let (_, a) = echoes(&scope).await?;
-        let (_, b) = echoes(&scope).await?;
-        let client = Clients::new(
-            outbound("socks5", address(&daemon, "socks5")),
-            Arc::new(System::new(scope.clone())),
-            Arc::new(SystemResolver),
-        )?;
-        let mut association = client.udp(a.clone()).await?;
+    for kind in ["socks5", "hysteria2"] {
+        tokio::time::timeout(LIMIT, async {
+            let daemon = daemon().await?;
+            let scope = Scope::new();
+            let (_, a) = echoes(&scope).await?;
+            let (_, b) = echoes(&scope).await?;
+            let client = Clients::new(
+                outbound(kind, address(&daemon, kind)),
+                Arc::new(System::new(scope.clone())),
+                Arc::new(SystemResolver),
+            )?;
+            let mut association = client.udp(a.clone()).await?;
 
-        for destination in [&a, &b, &a] {
+            for destination in [&a, &b, &a] {
+                association
+                    .tx
+                    .send(Packet {
+                        target: destination.clone(),
+                        payload: vec![1].into(),
+                    })
+                    .await?;
+                assert_eq!(association.rx.recv().await.unwrap().target, *destination);
+            }
+
+            let sessions = daemon.sessions().await?;
+            let a_session = sessions.iter().find(|s| s.destination == a).unwrap();
+            let b_session = sessions.iter().find(|s| s.destination == b).unwrap();
+            assert_eq!(sessions.len(), 2);
+            a_session.close();
+            a_session.wait().await;
+
             association
                 .tx
                 .send(Packet {
-                    target: destination.clone(),
-                    payload: vec![1].into(),
+                    target: b.clone(),
+                    payload: vec![2].into(),
                 })
                 .await?;
-            assert_eq!(association.rx.recv().await.unwrap().target, *destination);
-        }
+            assert_eq!(association.rx.recv().await.unwrap().payload, vec![2]);
+            assert!(
+                daemon
+                    .sessions()
+                    .await?
+                    .iter()
+                    .any(|s| s.id == b_session.id)
+            );
+            association
+                .tx
+                .send(Packet {
+                    target: a.clone(),
+                    payload: vec![3].into(),
+                })
+                .await?;
+            assert_eq!(association.rx.recv().await.unwrap().payload, vec![3]);
+            assert!(
+                daemon
+                    .sessions()
+                    .await?
+                    .iter()
+                    .any(|s| s.destination == a && s.id != a_session.id)
+            );
 
-        let sessions = daemon.sessions().await?;
-        let a_session = sessions.iter().find(|s| s.destination == a).unwrap();
-        let b_session = sessions.iter().find(|s| s.destination == b).unwrap();
-        assert_eq!(sessions.len(), 2);
-        a_session.close();
-        a_session.wait().await;
-
-        association
-            .tx
-            .send(Packet {
-                target: b.clone(),
-                payload: vec![2].into(),
-            })
-            .await?;
-        assert_eq!(association.rx.recv().await.unwrap().payload, vec![2]);
-        assert!(
-            daemon
-                .sessions()
-                .await?
-                .iter()
-                .any(|s| s.id == b_session.id)
-        );
-        association
-            .tx
-            .send(Packet {
-                target: a.clone(),
-                payload: vec![3].into(),
-            })
-            .await?;
-        assert_eq!(association.rx.recv().await.unwrap().payload, vec![3]);
-        assert!(
-            daemon
-                .sessions()
-                .await?
-                .iter()
-                .any(|s| s.destination == a && s.id != a_session.id)
-        );
-
-        drop(association);
-        scope.close();
-        scope.wait().await;
-        daemon.shutdown().await?;
-        Ok::<_, anyhow::Error>(())
-    })
-    .await??;
+            drop(association);
+            scope.close();
+            scope.wait().await;
+            daemon.shutdown().await?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+    }
     Ok(())
 }
 
@@ -760,6 +762,74 @@ async fn hysteria_rejects_bad_credentials_certificates_and_tcp_only_carriers() -
         scope.close();
         scope.wait().await;
         assert_eq!(daemon.shutdown().await?, kotoconn_daemon::Shutdown::Drained);
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hysteria_cancelled_setup_releases_the_carrier_without_an_idle_deadline() -> Result<()> {
+    struct PendingCarrier {
+        scope: Scope,
+        started: tokio::sync::mpsc::Sender<()>,
+    }
+    impl Carrier for PendingCarrier {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::BOTH
+        }
+        fn scope(&self) -> &Scope {
+            &self.scope
+        }
+        fn tcp_scoped(
+            &self,
+            _: Target,
+            _: Scope,
+        ) -> futures_util::future::BoxFuture<'_, Result<BoxStream>> {
+            Box::pin(async { anyhow::bail!("unexpected TCP carrier request") })
+        }
+        fn udp_scoped(
+            &self,
+            _: Target,
+            _: Scope,
+        ) -> futures_util::future::BoxFuture<'_, Result<Datagram>> {
+            Box::pin(async move {
+                self.started.send(()).await?;
+                std::future::pending().await
+            })
+        }
+    }
+    tokio::time::timeout(LIMIT, async {
+        let root = Scope::new();
+        let (started, mut ready) = tokio::sync::mpsc::channel(1);
+        let server = target("127.0.0.1:1".parse()?);
+        let OutboundImpl::Hysteria2(options) = outbound("hysteria2", server.clone()) else {
+            unreachable!()
+        };
+        let client = Arc::new(kotoconn_outbounds::hysteria2::Client::new(
+            Endpoint {
+                address: server.clone(),
+                resolver: Arc::new(SystemResolver),
+            },
+            Arc::new(PendingCarrier {
+                scope: root.clone(),
+                started,
+            }),
+            &options,
+        )?);
+        let caller = Scope::new();
+        let task_client = client.clone();
+        let task_scope = caller.clone();
+        let task =
+            tokio::spawn(
+                async move { Client::tcp(task_client.as_ref(), server, task_scope).await },
+            );
+        ready.recv().await.unwrap();
+        caller.close();
+        assert!(task.await?.is_err());
+        root.wait().await;
+        drop(client);
+        root.close();
         Ok::<_, anyhow::Error>(())
     })
     .await??;

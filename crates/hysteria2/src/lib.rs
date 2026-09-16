@@ -11,3 +11,6 @@ mod wire;
 
 pub use client::Client;
 pub use server::Server;
+
+#[cfg(test)]
+mod tests;

@@ -183,7 +183,7 @@ async fn manage(
     let mut session: Option<Arc<Session>> = None;
     let (released, mut releases) = mpsc::channel(1);
     loop {
-        let reply = tokio::select! {
+        let mut reply = tokio::select! {
             biased;
             reply = requests.recv() => {
                 let Some(reply) = reply else { return Ok(()); };
@@ -215,8 +215,11 @@ async fn manage(
             session = None;
         }
         if session.is_none() {
-            match tokio::time::timeout(tls::IO_TIMEOUT, connect(&settings, scope.child()))
-                .await
+            let connected = tokio::select! {
+                _ = reply.closed() => return Ok(()),
+                result = tokio::time::timeout(tls::IO_TIMEOUT, connect(&settings, scope.child())) => result,
+            };
+            match connected
                 .map_err(anyhow::Error::from)
                 .and_then(|result| result)
             {

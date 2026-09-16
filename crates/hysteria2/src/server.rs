@@ -44,13 +44,16 @@ impl p::Server for Server {
             let socket = Arc::new(tokio::net::UdpSocket::bind(address).await?);
             let local_addr = socket.local_addr()?;
             let socket = Salamander::wrap(Arc::new(NativeSocket(socket)), self.obfs.as_deref());
+            let endpoint_scope = context.scope.child();
+            let lifetime = Arc::new(CloseScope(endpoint_scope.clone()));
             let endpoint = quinn::Endpoint::new_with_abstract_socket(
                 Default::default(),
                 Some(self.tls.clone()),
                 socket,
-                Arc::new(ScopedRuntime(context.scope.clone())),
+                Arc::new(ScopedRuntime(endpoint_scope)),
             )?;
             let password = self.password.clone();
+
             Ok(BoundServer {
                 local_addr,
                 run: Box::pin(async move {
@@ -69,11 +72,20 @@ impl p::Server for Server {
                                 let scope = context.scope.clone();
                                 let password = password.clone();
                                 let endpoint = endpoint.clone();
+                                let lifetime = lifetime.clone();
+
                                 scope.spawn(async move {
                                     let _scope = CloseScope(context.scope.clone());
                                     let _endpoint = endpoint;
-                                    let connection = tokio::time::timeout(tls::IO_TIMEOUT, incoming).await??;
+                                    let _lifetime = lifetime;
+
+                                    let connection = tokio::select! {
+                                        biased;
+                                        _ = context.stopping.cancelled() => return Ok(()),
+                                        result = tokio::time::timeout(tls::IO_TIMEOUT, incoming) => result??,
+                                    };
                                     let _close = CloseConnection(connection.clone());
+
                                     serve(connection, context, password).await
                                 })?;
                             }
@@ -97,6 +109,7 @@ async fn serve(
         .max_field_section_size(16384)
         .build::<_, Bytes>(adapter)
         .await?;
+
     let tcp_scope = context.scope.child();
     let udp_context = context.clone();
     let udp_connection = connection.clone();
@@ -130,6 +143,7 @@ async fn serve(
                             && request.uri().host() == Some("hysteria")
                             && request.uri().path() == "/auth"
                             && request.headers().get("Hysteria-Auth").is_some_and(|value| credentials_match(value.as_bytes(), password.as_bytes()));
+
                         let reply = if valid {
                             authenticated.store(true, Ordering::Release);
                             http::Response::builder().status(233)
@@ -141,6 +155,7 @@ async fn serve(
                             // Ordinary web-server behavior for probes and bad credentials.
                             http::Response::builder().status(404).header("content-length", "0").body(())?
                         };
+
                         response.send_response(reply).await?;
                         response.finish().await?;
                         Ok::<_, anyhow::Error>(())
@@ -152,6 +167,7 @@ async fn serve(
                 let handler = context.handler.clone();
                 let scope = tcp_scope.child();
                 let connection_scope = scope.clone();
+
                 scope.spawn(async move {
                     let _close = CloseScope(connection_scope.clone());
                     let target = tokio::time::timeout(tls::IO_TIMEOUT, async {
@@ -159,6 +175,7 @@ async fn serve(
                         wire::response(&mut stream).await?;
                         Ok::<_, anyhow::Error>(target)
                     }).await??;
+
                     handler.tcp(target, Box::pin(stream), connection_scope).await
                 })?;
             }
