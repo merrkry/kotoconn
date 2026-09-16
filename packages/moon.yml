@@ -1,0 +1,50 @@
+language: typescript
+tasks:
+  install:
+    inputs: ["@group(sources)"]
+    command: pnpm install --frozen-lockfile
+    options:
+      cache: false
+  format:
+    inputs: ["@group(sources)"]
+    command: pnpm exec oxfmt packages package.json pnpm-workspace.yaml tsconfig.json .oxfmtrc.json .oxlintrc.json
+    deps: [install]
+    options:
+      cache: false
+  check-format:
+    inputs: ["@group(sources)"]
+    command: pnpm exec oxfmt --check packages package.json pnpm-workspace.yaml tsconfig.json .oxfmtrc.json .oxlintrc.json
+    deps: [install]
+  lint:
+    inputs: ["@group(sources)"]
+    command: pnpm exec oxlint packages
+    deps: [install]
+  build:
+    inputs: ["@group(sources)"]
+    command: pnpm --filter @kotoconn/api run build
+    deps: [install, rust:generate-bindings]
+    outputs: [/packages/api/dist]
+  typecheck:
+    inputs: ["@group(sources)"]
+    command: pnpm -r run typecheck
+    deps: [build]
+  test:
+    inputs: ["@group(sources)"]
+    command: pnpm --filter @kotoconn/bindings exec tsc -p tests/tsconfig.json
+    deps: [install, rust:generate-test-bindings]
+  check:
+    inputs: ["@group(sources)"]
+    deps: [check-format, lint, typecheck, test]
+fileGroups:
+  sources:
+    - /packages/**/*
+    - "!/packages/**/dist/**"
+    - "!/packages/**/node_modules/**"
+    - "!/packages/bindings/src/generated.d.ts"
+    - "!/packages/bindings/tests/generated.d.ts"
+    - /package.json
+    - /pnpm-lock.yaml
+    - /pnpm-workspace.yaml
+    - /tsconfig.json
+    - /.oxfmtrc.json
+    - /.oxlintrc.json

@@ -517,7 +517,7 @@ def add_arguments(parser, *, release=False):
     parser.add_argument(
         "--container-image",
         default="kotoconn-tun:local",
-        help="runtime image built with e2e/tun.Dockerfile",
+        help="runtime image built with moon run docker:build-runtime",
     )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(

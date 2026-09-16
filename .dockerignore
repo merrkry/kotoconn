@@ -1,9 +1,9 @@
-.git
-node_modules
-**/node_modules
-target
-**/target
-**/.git
-
-.venv
-.ruff_cache
+# Runtime images need only these inputs. Keep compiler caches out of the context.
+**
+!e2e/
+!e2e/Dockerfile
+!.python-version
+!target/
+!target/tun/
+!target/tun/debug/
+!target/tun/debug/kotoconn

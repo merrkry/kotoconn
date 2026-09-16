@@ -6,3 +6,5 @@ dist/
 /packages/bindings/tests/generated.d.ts
 /.venv/
 .ruff_cache/
+/.moon/cache/
+/.cache/

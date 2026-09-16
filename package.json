@@ -3,14 +3,14 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "bindings": "pnpm --filter @kotoconn/bindings run generate",
-    "build": "pnpm -r run build",
-    "format": "oxfmt packages package.json pnpm-workspace.yaml tsconfig.json .oxfmtrc.json .oxlintrc.json",
-    "format:check": "oxfmt --check packages package.json pnpm-workspace.yaml tsconfig.json .oxfmtrc.json .oxlintrc.json",
-    "lint": "oxlint packages",
-    "typecheck": "pnpm run bindings && pnpm -r run typecheck",
-    "test": "pnpm -r --if-present run test",
-    "check": "pnpm run format:check && pnpm run lint && pnpm run build && pnpm -r run typecheck && pnpm run test"
+    "build": "moon run typescript:build",
+    "format": "moon run typescript:format",
+    "check-format": "moon run typescript:check-format",
+    "lint": "moon run typescript:lint",
+    "typecheck": "moon run typescript:typecheck",
+    "test": "moon run typescript:test",
+    "check": "moon run typescript:check",
+    "generate-bindings": "moon run rust:generate-bindings"
   },
   "devDependencies": {
     "oxfmt": "^0.66.0",

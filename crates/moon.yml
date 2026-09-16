@@ -1,0 +1,67 @@
+language: rust
+fileGroups:
+  sources:
+    - /Cargo.toml
+    - /Cargo.lock
+    - /crates/**/*
+    - /external/smoltcp/**/*
+    - /tools/rust.py
+    - $RUSTFLAGS
+    - $CARGO_ENCODED_RUSTFLAGS
+    - $CFLAGS
+    - $CXXFLAGS
+    - $CC
+    - $CXX
+    - $AR
+tasks:
+  format:
+    inputs: ["@group(sources)"]
+    command: cargo fmt --all
+    options:
+      cache: false
+  check-format:
+    inputs: ["@group(sources)"]
+    command: cargo fmt --all -- --check
+  lint:
+    inputs: ["@group(sources)"]
+    command: uv run --locked python tools/rust.py clippy --workspace --all-targets --locked -- -D warnings
+    options:
+      mutex: cargo
+  test:
+    inputs: ["@group(sources)"]
+    command: uv run --locked python tools/rust.py test --workspace --locked
+    options:
+      mutex: cargo
+  check:
+    inputs: ["@group(sources)"]
+    deps: [check-format, lint, test]
+  build:
+    inputs: ["@group(sources)"]
+    command: uv run --locked python tools/rust.py zigbuild --workspace --locked
+    options:
+      cache: false
+      mutex: cargo
+  generate-bindings:
+    inputs: ["@group(sources)"]
+    command: uv run --locked python tools/rust.py run --locked --quiet -p kotoconn-script --bin generate-types
+    outputs: [/packages/bindings/src/generated.d.ts]
+    options:
+      mutex: cargo
+  generate-test-bindings:
+    inputs: ["@group(sources)"]
+    command: uv run --locked python tools/rust.py run --locked --quiet -p kotoconn-script --example generate-test-types
+    outputs: [/packages/bindings/tests/generated.d.ts]
+    options:
+      mutex: cargo
+  build-linux-debug:
+    inputs: ["@group(sources)"]
+    command: uv run --locked python tools/rust.py stage debug
+    outputs: [/target/tun/debug/kotoconn, /target/tun/debug/kotoconn-tun-traffic]
+    options:
+      mutex: cargo
+  build-linux-release:
+    inputs: ["@group(sources)"]
+    command: uv run --locked python tools/rust.py stage release
+    outputs: [/target/tun/release/kotoconn, /target/tun/release/kotoconn-tun-traffic]
+    options:
+      mutex: cargo
