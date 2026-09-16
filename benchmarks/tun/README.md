@@ -158,8 +158,8 @@ value because allocators and payload pools can retain free memory.
 ## Comparisons
 
 ```sh
-python3 benchmarks/run.py --sing-box /path/to/sing-box-1.15
-python3 benchmarks/run.py --case udp-paced --udp-rate 20000 --repetitions 5
+mise exec -- moon run benchmark:run -- --sing-box /path/to/sing-box-1.15
+mise exec -- moon run benchmark:run -- --case udp-paced --udp-rate 20000 --repetitions 5
 ```
 
 The only reference is sing-box 1.15 with its go TUN stack. The runner checks
@@ -190,7 +190,7 @@ sets when comparing concurrent workspaces, or run performance comparisons
 sequentially. The generator uses four Tokio worker threads by default;
 `--traffic-workers N` changes this independently of the daemon. It inherits the
 runner's CPU affinity, recorded in metadata. For example, on a machine with six
-available CPUs, run `taskset -c 2-5 python3 benchmarks/run.py --daemon-cpus 0,1`
+available CPUs, run `taskset -c 2-5 mise exec -- moon run benchmark:run -- --daemon-cpus 0,1`
 to give the generator four CPUs separate from the daemon. Extra threads without
 CPU time do not establish generator capacity. Small CI samples validate the
 measurement pipeline; they are not performance baselines.
