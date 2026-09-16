@@ -24,6 +24,9 @@ use tokio_util::{codec::FramedRead, sync::CancellationToken};
 
 const LIMIT: Duration = Duration::from_secs(10);
 
+#[path = "interop_tests.rs"]
+mod interop;
+
 struct Network {
     scope: Scope,
     connections: AtomicUsize,
@@ -65,9 +68,14 @@ struct Echo(mpsc::UnboundedSender<Target>);
 impl Handler for Echo {
     fn tcp(&self, target: Target, mut stream: BoxStream, _: Scope) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
+            let finish = target.port() == 2;
             self.0.send(target)?;
             stream.write_all(b"ready").await?;
             stream.flush().await?;
+            if finish {
+                stream.shutdown().await?;
+                return Ok(());
+            }
             let (mut reader, mut writer) = tokio::io::split(stream);
             tokio::io::copy(&mut reader, &mut writer).await?;
             Ok(())
@@ -89,12 +97,14 @@ struct Fixture {
     network: Arc<Network>,
     options: AnyTlsOutboundConfig,
     targets: mpsc::UnboundedReceiver<Target>,
+    private_key: String,
 }
 
 impl Fixture {
     async fn new(padding: Option<&str>) -> Result<Self> {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
         let certificate = cert.cert.pem();
+        let private_key = cert.signing_key.serialize_pem();
         let scope = Scope::new();
         let (targets, receive) = mpsc::unbounded_channel();
         let server = Server::new(&AnyTlsInboundConfig {
@@ -102,7 +112,7 @@ impl Fixture {
             password: "secret".into(),
             tls: TlsServerConfig {
                 certificate: certificate.clone(),
-                private_key: cert.signing_key.serialize_pem(),
+                private_key: private_key.clone(),
             },
             padding_scheme: padding.map(str::to_owned),
         })?;
@@ -139,6 +149,7 @@ impl Fixture {
             network,
             options,
             targets: receive,
+            private_key,
         })
     }
 
@@ -387,4 +398,172 @@ fn rejects_invalid_tls_and_unbounded_padding_configuration() {
         })
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn peer_fin_preserves_queued_bytes_and_closes_both_directions() -> Result<()> {
+    tokio::time::timeout(LIMIT, async {
+        let fixture = Fixture::new(None).await?;
+        let client = fixture.client()?;
+        for _ in 0..16 {
+            let mut stream = p::Client::tcp(
+                &client,
+                target("127.0.0.1:2".parse()?),
+                fixture.scope.child(),
+            )
+            .await?;
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await?;
+            assert_eq!(response, b"ready");
+            assert!(stream.write_all(b"after FIN").await.is_err());
+        }
+        assert_eq!(fixture.network.connections.load(Ordering::Relaxed), 1);
+        drop(client);
+        fixture.close().await;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await?
+}
+
+#[tokio::test]
+async fn cancellation_waits_for_release_and_leaves_other_streams_usable() -> Result<()> {
+    tokio::time::timeout(LIMIT, async {
+        let fixture = Fixture::new(None).await?;
+        let client = fixture.client()?;
+        let cancelled = fixture.scope.child();
+        let mut first =
+            p::Client::tcp(&client, target("127.0.0.1:80".parse()?), cancelled.clone()).await?;
+        let mut second = p::Client::tcp(
+            &client,
+            target("127.0.0.1:80".parse()?),
+            fixture.scope.child(),
+        )
+        .await?;
+        first.read_exact(&mut [0; 5]).await?;
+        second.read_exact(&mut [0; 5]).await?;
+        cancelled.close();
+        cancelled.wait().await;
+        assert!(first.read_exact(&mut [0]).await.is_err());
+
+        second.write_all(b"still alive").await?;
+        let mut reply = [0; 11];
+        second.read_exact(&mut reply).await?;
+        assert_eq!(&reply, b"still alive");
+        let mut reused = p::Client::tcp(
+            &client,
+            target("127.0.0.1:80".parse()?),
+            fixture.scope.child(),
+        )
+        .await?;
+        reused.read_exact(&mut [0; 5]).await?;
+        assert_eq!(fixture.network.connections.load(Ordering::Relaxed), 2);
+        drop(client);
+        fixture.close().await;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await?
+}
+
+#[tokio::test]
+async fn received_fin_is_not_echoed_and_heartbeats_continue() -> Result<()> {
+    tokio::time::timeout(LIMIT, async {
+        let fixture = Fixture::new(None).await?;
+        let tls = fixture.raw().await?;
+        let (reader, mut writer) = tokio::io::split(tls);
+        let mut frames = FramedRead::new(reader, wire::Frames);
+        let settings = format!(
+            "v=2\nclient=kotoconn-test\npadding-md5={}",
+            PaddingFactory::default().md5()
+        );
+        writer
+            .write_all(&Frame::with_data(Command::Settings, 0, settings.into()).to_bytes()?)
+            .await?;
+        for sid in [1, 2] {
+            for frame in [
+                Frame::new(Command::Syn, sid),
+                Frame::with_data(
+                    Command::Psh,
+                    sid,
+                    wire::address(&target("127.0.0.1:80".parse()?))?.into(),
+                ),
+            ] {
+                writer.write_all(&frame.to_bytes()?).await?;
+            }
+            writer.flush().await?;
+            loop {
+                let frame = frames.next().await.unwrap()?;
+                if frame.cmd == Command::Psh {
+                    assert_eq!(frame.sid, sid);
+                    assert_eq!(&frame.data[..], b"ready");
+                    break;
+                }
+            }
+            writer
+                .write_all(&Frame::new(Command::Fin, sid).to_bytes()?)
+                .await?;
+            writer
+                .write_all(&Frame::new(Command::HeartRequest, 0).to_bytes()?)
+                .await?;
+            writer.flush().await?;
+            // The heartbeat is a protocol barrier after FIN, without a delay.
+            assert_eq!(frames.next().await.unwrap()?.cmd, Command::HeartResponse);
+        }
+        fixture.close().await;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await?
+}
+
+#[tokio::test]
+async fn closing_one_multiplexed_stream_preserves_the_other() -> Result<()> {
+    tokio::time::timeout(LIMIT, async {
+        let fixture = Fixture::new(None).await?;
+        let tls = fixture.raw().await?;
+        let (reader, mut writer) = tokio::io::split(tls);
+        let mut frames = FramedRead::new(reader, wire::Frames);
+        let settings = format!(
+            "v=2\nclient=kotoconn-test\npadding-md5={}",
+            PaddingFactory::default().md5()
+        );
+        writer
+            .write_all(&Frame::with_data(Command::Settings, 0, settings.into()).to_bytes()?)
+            .await?;
+        for sid in [1, 2] {
+            for frame in [
+                Frame::new(Command::Syn, sid),
+                Frame::with_data(
+                    Command::Psh,
+                    sid,
+                    wire::address(&target("127.0.0.1:80".parse()?))?.into(),
+                ),
+            ] {
+                writer.write_all(&frame.to_bytes()?).await?;
+            }
+        }
+        writer.flush().await?;
+        let mut greeted = std::collections::HashSet::new();
+        while greeted.len() < 2 {
+            let frame = frames.next().await.unwrap()?;
+            if frame.cmd == Command::Psh {
+                assert_eq!(&frame.data[..], b"ready");
+                greeted.insert(frame.sid);
+            }
+        }
+        assert_eq!(greeted, std::collections::HashSet::from([1, 2]));
+
+        writer
+            .write_all(&Frame::new(Command::Fin, 1).to_bytes()?)
+            .await?;
+        writer
+            .write_all(&Frame::with_data(Command::Psh, 2, Bytes::from_static(b"alive")).to_bytes()?)
+            .await?;
+        writer.flush().await?;
+        let reply = frames.next().await.unwrap()?;
+        assert_eq!(reply.sid, 2);
+        assert_eq!(reply.cmd, Command::Psh);
+        assert_eq!(&reply.data[..], b"alive");
+        fixture.close().await;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await?
 }

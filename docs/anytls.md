@@ -23,6 +23,8 @@ requests open separate TLS sessions. Each session assigns increasing stream IDs.
 The default idle timeout is 60 seconds; `idle_session_timeout` can override it.
 Sessions never share state across configured clients. Dropping a logical stream
 releases its session; closing the carrier cancels all dependent sessions.
+During daemon shutdown, clients release idle sessions and stop pooling connections;
+inbounds close idle sessions and let admitted streams finish.
 
 TLS options are separate from protocol options. Client `tls.server_name` defaults
 to the configured server domain or IP; IP names omit SNI. Certificates and names
@@ -35,10 +37,32 @@ Inbound acknowledgement admits the stream to Kotoconn before routing, as specifi
 by ADR 0005. FIN closes both directions; it cannot represent TCP half-close.
 TLS/authentication/target setup has a 15-second network deadline, and stalled TLS
 writes have a 30-second deadline. The inbound allows at most 128 logical streams
-per TLS session. A stream that fills its bounded receive queue is closed, leaving
-other streams usable. The adapter rejects v1 clients, matching the dependency's
-minimum supported protocol version. HTTP fallback and TLS fingerprint impersonation
+per TLS session, with a shared 4 MiB receive budget including message overhead.
+A stream that exhausts receive capacity is closed. The adapter requires v2 peers,
+matching the dependency's minimum supported protocol version, and bounds the wait
+for SYNACK by the handshake deadline. HTTP fallback and TLS fingerprint impersonation
 are not implemented.
+
+See [the TypeScript outbound example](../packages/api/examples/anytls.ts). An inbound
+uses `k.anytls_inbound({ listen, password, tls: { certificate, private_key } })`.
+
+## Verification
+
+`moon run rust:test` includes adapter and daemon tests. The optional interoperability
+tests run the unmodified official Go session library pinned in
+`crates/anytls/tests/reference/go.mod`, with sing's UoT codec. They cover both
+directions, session reuse, padding updates across TLS connections, SYNACK failure,
+server-first TCP, and connected/datagram UDP with empty and large payloads.
+
+With Go 1.24 or newer available through mise, run from the repository root:
+
+```sh
+mise exec -- go -C crates/anytls/tests/reference build -o "$PWD/target/anytls-go-peer" .
+KOTOCONN_ANYTLS_GO="$PWD/target/anytls-go-peer" mise exec -- uv run --locked python tools/rust.py test -p kotoconn-anytls interop -- --ignored
+```
+
+The helper binds an ephemeral loopback port and prints readiness after binding.
+Tests generate certificates locally and terminate their child processes on exit.
 
 References: [AnyTLS protocol](https://github.com/anytls/anytls-go/blob/main/docs/protocol.md),
 [sing-box UoT](https://sing-box.sagernet.org/configuration/shared/udp-over-tcp/),
