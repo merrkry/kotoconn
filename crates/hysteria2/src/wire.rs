@@ -196,6 +196,7 @@ struct Pending {
     fragments: Vec<Option<Bytes>>,
     bytes: usize,
     received: usize,
+    created: tokio::time::Instant,
 }
 
 /// Bounded per connection. Incomplete packets are evicted under pressure, with no
@@ -217,6 +218,17 @@ impl Reassembly {
     }
 
     pub fn receive(&mut self, part: Fragment) -> Result<Option<(u32, Packet)>> {
+        // Fragment retention is an external-network deadline. Packet IDs can wrap,
+        // so an old incomplete packet must not survive indefinitely across reuse.
+        let now = tokio::time::Instant::now();
+        while let Some(key) = self.order.front().copied() {
+            if self.pending.get(&key).is_some_and(|value| {
+                now.duration_since(value.created) < std::time::Duration::from_secs(10)
+            }) {
+                break;
+            }
+            self.remove(&key);
+        }
         if part.count == 1 {
             return Ok(Some((
                 part.session,
@@ -250,6 +262,7 @@ impl Reassembly {
                 fragments: vec![None; part.count as usize],
                 bytes: 0,
                 received: 0,
+                created: now,
             }
         });
         // SAFETY: decode checked index < count, and an existing entry's count was checked above.

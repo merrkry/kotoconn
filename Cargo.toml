@@ -63,6 +63,7 @@ serde_json = "1.0.151"
 shadowsocks = { version = "1.25.0", default-features = false }
 shadowsocks-service = { version = "1.25.0", default-features = false }
 smoltcp = { version = "0.14.0", default-features = false }
+subtle = "2.6.1"
 structural-convert = "0.13"
 tempfile = "3.27.0"
 thiserror = "2.0.20"

@@ -18,6 +18,7 @@ tokio-util = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 
 [dev-dependencies]
+rcgen.workspace = true
 bytes.workspace = true
 fast-socks5.workspace = true
 shadowsocks.workspace = true
