@@ -5,6 +5,7 @@ members = [
     "crates/daemon",
     "crates/http",
     "crates/inbounds",
+    "crates/naive",
     "crates/outbounds",
     "crates/protocol",
     "crates/script",
@@ -24,12 +25,15 @@ publish = false
 
 [workspace.dependencies]
 anyhow = "1.0.104"
+base64 = "0.22.1"
 bytes = "1.12.1"
 clap = "4.6.6"
+cronet = "=0.2.0"
 derive_more = "2.1.1"
 duplicate = "2.0.1"
 fast-socks5 = "1.0.0"
 futures-util = "0.3.34"
+h2 = "0.4.19"
 
 hickory-proto = { version = "0.26.3", default-features = false }
 http = "1.5.0"
@@ -38,6 +42,7 @@ kotoconn-config = { path = "crates/config" }
 kotoconn-daemon = { path = "crates/daemon" }
 kotoconn-http = { path = "crates/http" }
 kotoconn-inbounds = { path = "crates/inbounds" }
+kotoconn-naive = { path = "crates/naive" }
 kotoconn-outbounds = { path = "crates/outbounds" }
 kotoconn-protocol = { path = "crates/protocol" }
 kotoconn-script = { path = "crates/script" }
@@ -47,6 +52,7 @@ kotoconn-tun = { path = "crates/tun" }
 kotoconn-typescript = { path = "crates/typescript" }
 oxc = { version = "0.149.0", default-features = false }
 rand = "0.9.5"
+rcgen = "0.14.10"
 rquickjs = "0.13.0"
 rustix = "1.1.4"
 serde_json = "1.0.151"
@@ -54,9 +60,11 @@ shadowsocks = { version = "1.25.0", default-features = false }
 shadowsocks-service = { version = "1.25.0", default-features = false }
 smoltcp = { version = "0.14.0", default-features = false }
 structural-convert = "0.13"
+subtle = "2.6.1"
 tempfile = "3.27.0"
 thiserror = "2.0.20"
 tokio = "1.53.1"
+tokio-rustls = "0.26.5"
 tokio-util = "0.7.19"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"

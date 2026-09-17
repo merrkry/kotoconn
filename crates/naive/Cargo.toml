@@ -1,0 +1,28 @@
+[package]
+name = "kotoconn-naive"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+h2.workspace = true
+http.workspace = true
+kotoconn-config.workspace = true
+kotoconn-protocol.workspace = true
+rand.workspace = true
+subtle.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync"] }
+tokio-rustls.workspace = true
+tokio-util = { workspace = true, features = ["codec", "io", "io-util", "rt"] }
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cronet.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
