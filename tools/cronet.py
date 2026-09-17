@@ -61,6 +61,8 @@ def library(target: str) -> Path | None:
     directory.mkdir(parents=True, exist_ok=True)
     destination = directory / "libcronet.so"
     if destination.is_file() and digest(destination) == expected:
+        # Repair caches created with NamedTemporaryFile's owner-only mode.
+        destination.chmod(0o644)
         return destination
 
     url = (
@@ -83,6 +85,8 @@ def library(target: str) -> Path | None:
             output.close()
             if digest(temporary) != expected:
                 raise ValueError(f"SHA-256 mismatch for {url}")
+            # Containers may load this file as a different UID without DAC_OVERRIDE.
+            temporary.chmod(0o644)
             temporary.replace(destination)
         finally:
             temporary.unlink(missing_ok=True)

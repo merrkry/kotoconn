@@ -44,8 +44,9 @@ and checks its SHA-256 before invoking Cargo. Downloads live under
 `target/cronet`; Chromium is never compiled. The launcher supplies
 `CRONET_LIB_DIR` for linking and `LD_LIBRARY_PATH` for tests and Cargo runs.
 Linux builds require glibc and a target listed in [tools/cronet.py](../tools/cronet.py).
-Staged Linux artifacts include `libcronet.so`. Install it in the runtime's
-library search path together with the executable. The test image does this
+Staged Linux artifacts include `libcronet.so` with mode `0644`, so containers
+can load it under a different UID without extra capabilities. Install it in the
+runtime's library search path together with the executable. The test image does this
 under `/usr/local/lib`. To update Cronet, change the release and asset digests
 together, then run the Naive interoperability tests.
 

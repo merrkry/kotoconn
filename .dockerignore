@@ -7,3 +7,4 @@
 !target/tun/
 !target/tun/debug/
 !target/tun/debug/kotoconn
+!target/tun/debug/libcronet.so

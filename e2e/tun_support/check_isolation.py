@@ -73,6 +73,45 @@ def snapshot():
     }
 
 
+def check_runtime_access(args, directory):
+    binary = args.binary.resolve(strict=True)
+    command = [
+        "docker",
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--user",
+        "65534:65534",
+        "--mount",
+        f"type=bind,source={binary},target=/inputs/kotoconn,readonly",
+    ]
+    native = binary.with_name("libcronet.so")
+    if native.is_file():
+        command += [
+            "--mount",
+            f"type=bind,source={native},target=/inputs/libcronet.so,readonly",
+            "--env",
+            "LD_LIBRARY_PATH=/inputs",
+        ]
+
+    # Rootless containers map their root to the artifact owner and would hide
+    # owner-only library permissions. Test loading under another UID explicitly.
+    command += [
+        "--entrypoint",
+        "/inputs/kotoconn",
+        args.container_image,
+        "--version",
+    ]
+    with (directory / "runtime-access.log").open("w") as log:
+        subprocess.run(
+            command, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=30
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -89,6 +128,8 @@ def main():
     base.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix="parallel-", dir=base))
     directory.chmod(0o755)
+    check_runtime_access(args, directory)
+
     before = snapshot()
     (directory / "parent-before.json").write_text(json.dumps(before, indent=2))
     parent = os.readlink("/proc/self/ns/net")
