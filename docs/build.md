@@ -39,6 +39,17 @@ For individual Rust commands, use `uv run --locked python tools/rust.py <command
 to retain Zig target selection. Network tests require Docker and `/dev/net/tun`;
 use their launchers to keep test networking isolated.
 
+On Linux, the Rust launcher fetches the pinned SagerNet Cronet shared library
+and checks its SHA-256 before invoking Cargo. Downloads live under
+`target/cronet`; Chromium is never compiled. The launcher supplies
+`CRONET_LIB_DIR` for linking and `LD_LIBRARY_PATH` for tests and Cargo runs.
+Linux builds require glibc and a target listed in [tools/cronet.py](../tools/cronet.py).
+Staged Linux artifacts include `libcronet.so` with mode `0644`, so containers
+can load it under a different UID without extra capabilities. Install it in the
+runtime's library search path together with the executable. The test image does this
+under `/usr/local/lib`. To update Cronet, change the release and asset digests
+together, then run the Naive interoperability tests.
+
 When debugging stale artifacts, use `moon run --force <target>` to bypass moon's
 cache. Remove `target` as well when you need a clean Cargo build. Keep installation,
 container and measurement tasks uncached: their state lives outside moon's artifacts.

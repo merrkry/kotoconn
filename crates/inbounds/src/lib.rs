@@ -4,6 +4,7 @@ mod direct;
 use anyhow::Result;
 use kotoconn_config::InboundImpl;
 pub use kotoconn_http as http;
+pub use kotoconn_naive as naive;
 use kotoconn_protocol::{Server, ServerContext};
 pub use kotoconn_shadowsocks2022 as shadowsocks2022;
 pub use kotoconn_socks5 as socks5;
@@ -24,6 +25,7 @@ pub struct BoundInbound {
 pub async fn bind(config: InboundImpl, context: ServerContext) -> Result<BoundInbound> {
     let (address, server): (SocketAddr, Arc<dyn Server>) = match config {
         InboundImpl::Http(options) => (options.listen, Arc::new(http::Server)),
+        InboundImpl::Naive(options) => (options.listen, Arc::new(naive::Server::new(&options)?)),
         InboundImpl::Socks5(options) => (options.listen, Arc::new(socks5::Server)),
         InboundImpl::Shadowsocks2022(options) => (
             options.listen,

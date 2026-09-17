@@ -9,6 +9,7 @@ anyhow.workspace = true
 futures-util.workspace = true
 kotoconn-config.workspace = true
 kotoconn-http.workspace = true
+kotoconn-naive.workspace = true
 kotoconn-protocol.workspace = true
 kotoconn-shadowsocks2022.workspace = true
 kotoconn-socks5.workspace = true

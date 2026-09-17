@@ -19,5 +19,5 @@ select = ["E4", "E7", "E9", "F", "I"]
 
 [tool.pyrefly]
 project-includes = ["e2e/**/*.py", "benchmarks/**/*.py", "tools/**/*.py"]
-search-path = [".", "e2e", "benchmarks"]
+search-path = [".", "e2e", "benchmarks", "tools"]
 python-version = "3.14"

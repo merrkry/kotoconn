@@ -137,6 +137,14 @@ api! {
             Ok(config::OutboundImpl::Http(options.into()).into())
         }
 
+        fn naive_inbound(self, options: NaiveInboundConfig) -> InboundImpl {
+            Ok(config::InboundImpl::Naive(options.into()).into())
+        }
+
+        fn naive_outbound(self, options: NaiveOutboundConfig) -> OutboundImpl {
+            Ok(config::OutboundImpl::Naive(options.into()).into())
+        }
+
         fn shadowsocks2022_outbound(self, options: Shadowsocks2022OutboundConfig) -> OutboundImpl {
             Ok(config::OutboundImpl::Shadowsocks2022(options.into()).into())
         }
