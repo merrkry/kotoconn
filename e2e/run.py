@@ -18,7 +18,8 @@ LOGGER = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent
 KEY = "AAECAwQFBgcICQoLDA0ODw=="
-SUITES = ("http", "socks5", "shadowsocks2022", "nested", "typescript")
+PROTOCOLS = ("http", "socks5", "shadowsocks2022", "naive")
+SUITES = (*PROTOCOLS, "naive-nested", "naive-quic", "nested", "typescript")
 
 
 def sing_protocol(kind, server=None):
@@ -32,10 +33,21 @@ def sing_protocol(kind, server=None):
     else:
         result.update(listen="0.0.0.0", listen_port=1080)
         # Replies include 8 KiB datagrams, larger than a Docker bridge MTU.
-        if kind != "http":
+        if kind not in ("http", "naive"):
             result["udp_fragment"] = True
     if kind == "shadowsocks2022":
         result.update(method="2022-blake3-aes-128-gcm", password=KEY)
+    if kind == "naive":
+        result["tls"] = {
+            "enabled": True,
+            "certificate_path": "/config/cert.pem",
+        }
+        if server:
+            result.update(username="user", password="naive-test-password")
+            result["tls"]["server_name"] = "proxy.test"
+        else:
+            result["users"] = [{"username": "user", "password": "naive-test-password"}]
+            result["tls"]["key_path"] = "/config/key.pem"
     return result
 
 
@@ -50,12 +62,16 @@ def sing_config(inbounds, outbound):
     }
 
 
-def policy(inbound, chain, rewrite=False):
+def policy(inbound, chain, rewrite=False, naive=None, quic=False):
     source = """import { kotoconn as k } from '@kotoconn/bindings';
 import { destination } from './routing.ts';
 const resolver = k.resolve_handler(async name => await k.lookup(name));
 const listenPort: number = await Promise.resolve(1080);
 """
+    if naive is not None:
+        shared = {key: value for key, value in naive.items() if key != "private_key"}
+        source += f"const naive = {json.dumps(shared)};\n"
+
     previous = "null"
     for index, hop in enumerate(chain):
         kind, server = hop[:2]
@@ -68,15 +84,25 @@ const listenPort: number = await Promise.resolve(1080);
             config = f"{{server: k.ip_target(address{index}, {port})"
             if kind == "shadowsocks2022":
                 config += f", password: '{KEY}'"
+            if kind == "naive":
+                config += (
+                    f", ...naive, server_name: 'proxy.test', quic: {str(quic).lower()}"
+                )
             config += "}"
         source += f"const d{index} = k.dialer({{dialer: {previous}, outbound: {{resolve_handler: resolver, implementation: k.{kind}_outbound({config})}}}});\n"
         previous = f"d{index}"
+
+    extra = ""
+    if inbound == "shadowsocks2022":
+        extra = f", password: '{KEY}'"
+    elif inbound == "naive" and naive is not None:
+        extra = f", ...naive, private_key: {json.dumps(naive['private_key'])}"
     source += f"""const routing = k.routing_handler(async flow => {{
     {"if (flow.dest.port === 9002) return k.reject();" if rewrite else ""}
     const target = await destination(flow.dest);
     return flow.protocol === 'udp' ? k.route_udp({previous}) : k.route({previous}, target);
 }});
-k.inbound({{implementation: k.{inbound}_inbound({{listen: {{address: k.ip('0.0.0.0'), port: listenPort}}{", password: '" + KEY + "'" if inbound == "shadowsocks2022" else ""}}}), routing_handler: routing, udp_idle_timeout: k.timeout(30000)}});
+k.inbound({{implementation: k.{inbound}_inbound({{listen: {{address: k.ip('0.0.0.0'), port: listenPort}}{extra}}}), routing_handler: routing, udp_idle_timeout: k.timeout(30000)}});
 """
     # The TypeScript suite changes the TCP destination. UDP cannot rewrite targets.
     routing = """import { kotoconn as k } from '@kotoconn/bindings';
@@ -90,9 +116,9 @@ export async function destination(target: {ip: ReturnType<typeof k.ip>, port: nu
     return source, routing
 
 
-def write_policy(directory, inbound, chain, rewrite=False):
+def write_policy(directory, inbound, chain, rewrite=False, naive=None, quic=False):
     directory.mkdir(parents=True, exist_ok=True)
-    main, routing = policy(inbound, chain, rewrite)
+    main, routing = policy(inbound, chain, rewrite, naive, quic)
     (directory / "main.ts").write_text(main)
     (directory / "routing.ts").write_text(routing)
 
@@ -100,6 +126,7 @@ def write_policy(directory, inbound, chain, rewrite=False):
 class Scenario:
     def __init__(self, args, suite, direction):
         self.suite, self.direction = suite, direction
+        self.nested = suite in ("nested", "naive-nested", "naive-quic")
         self.engine = shlex.split(args.engine)
         self.name = f"{suite}-{direction}"
         self.directory = args.output / self.name
@@ -113,7 +140,7 @@ class Scenario:
             "-f",
             str(ROOT / "compose.yaml"),
         ]
-        if suite == "nested":
+        if self.nested:
             override = self.directory / "compose.json"
             override.write_text(
                 json.dumps({"services": {"peer": {"network_mode": "service:gateway"}}})
@@ -169,19 +196,67 @@ class Scenario:
         raise TimeoutError(f"{self.name}: {service} did not become ready")
 
     def configure(self, target):
-        kind = self.suite if self.suite in SUITES[:3] else "socks5"
+        naive = None
+        if self.suite.startswith("naive"):
+            self.compose(
+                "exec",
+                "-T",
+                "echo",
+                "openssl",
+                "req",
+                "-x509",
+                "-newkey",
+                "ec",
+                "-pkeyopt",
+                "ec_paramgen_curve:P-256",
+                "-noenc",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=proxy.test",
+                "-addext",
+                "subjectAltName=DNS:proxy.test",
+                "-out",
+                "/tmp/cert.pem",
+                "-keyout",
+                "/tmp/key.pem",
+            )
+            for name in ("cert.pem", "key.pem"):
+                value = self.compose("exec", "-T", "echo", "cat", f"/tmp/{name}").stdout
+                (self.directory / name).write_text(value)
+            naive = {
+                "username": "user",
+                "password": "naive-test-password",
+                "certificate": (self.directory / "cert.pem").read_text(),
+                "private_key": (self.directory / "key.pem").read_text(),
+            }
+        if naive is not None:
+            kind = "naive"
+        elif self.suite in PROTOCOLS:
+            kind = self.suite
+        else:
+            kind = "socks5"
+
         inbound = kind if self.direction == "server" else "socks5"
         if self.suite == "nested":
             chain = [("shadowsocks2022", "gateway"), ("socks5", "127.0.0.1", 1081)]
             write_policy(
                 self.directory / "gateway", "shadowsocks2022", [("direct", "")]
             )
+        elif self.nested:
+            chain = [("socks5", "gateway"), ("naive", "127.0.0.1", 1081)]
+            write_policy(self.directory / "gateway", "socks5", [("direct", "")])
         elif self.direction == "server" or self.suite == "typescript":
             chain = [("direct", "")]
         else:
             chain = [(kind, "peer")]
         write_policy(
-            self.directory / "kotoconn", inbound, chain, self.suite == "typescript"
+            self.directory / "kotoconn",
+            inbound,
+            chain,
+            self.suite == "typescript",
+            naive,
+            self.suite == "naive-quic",
         )
         entry = sing_config(
             [
@@ -197,10 +272,13 @@ class Scenario:
             sing_protocol(inbound, "kotoconn"),
         )
         peer_inbound = sing_protocol(kind)
-        if self.suite == "nested":
+        if self.nested:
             # Only the gateway can reach this loopback listener. Ignoring the
-            # lower Shadowsocks dialer must fail instead of silently going direct.
+            # configured lower carrier must fail instead of silently going direct.
             peer_inbound.update(listen="127.0.0.1", listen_port=1081)
+        if self.suite == "naive-quic":
+            # UDP-only listener makes an accidental HTTP/2 fallback fail.
+            peer_inbound["network"] = "udp"
         peer = sing_config([peer_inbound], {"type": "direct"})
         (self.directory / "entry.json").write_text(json.dumps(entry, indent=2))
         (self.directory / "peer.json").write_text(json.dumps(peer, indent=2))
@@ -219,19 +297,17 @@ class Scenario:
             ).stdout.strip()
             self.configure(target)
             services = (
-                (["gateway"] if self.suite == "nested" else [])
-                + (
-                    ["peer"]
-                    if self.direction == "client" or self.suite == "nested"
-                    else []
-                )
+                (["gateway"] if self.nested else [])
+                + (["peer"] if self.direction == "client" or self.nested else [])
                 + ["kotoconn", "entry"]
             )
             for service in services:
                 self.compose("up", "-d", service)
                 self.ready(service)
             for transport in ("tcp", "udp"):
-                if transport == "udp" and self.suite == "http":
+                if transport == "udp" and (
+                    self.suite == "http" or self.suite.startswith("naive")
+                ):
                     continue  # HTTP CONNECT has no UDP support.
                 command = [
                     "exec",
@@ -242,7 +318,7 @@ class Scenario:
                     transport,
                     "--egress",
                     "gateway"
-                    if self.suite == "nested"
+                    if self.nested
                     else "peer"
                     if self.direction == "client"
                     else "kotoconn",
@@ -278,9 +354,7 @@ class Scenario:
                             )
             self.compose("stop", "-t", "8", "entry")
             # Exercise actual CLI signal handling and successful process exit.
-            for service in (
-                ("kotoconn", "gateway") if self.suite == "nested" else ("kotoconn",)
-            ):
+            for service in ("kotoconn", "gateway") if self.nested else ("kotoconn",):
                 self.compose("stop", "-t", "8", service)
                 logs = self.compose(
                     "logs", "--no-color", "--no-log-prefix", service
@@ -374,7 +448,7 @@ def main():
     scenarios = [
         Scenario(args, suite, direction)
         for suite in (args.suites or SUITES)
-        for direction in (("client", "server") if suite in SUITES[:3] else ("both",))
+        for direction in (("client", "server") if suite in PROTOCOLS else ("both",))
     ]
     failures = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
