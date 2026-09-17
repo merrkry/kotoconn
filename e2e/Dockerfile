@@ -3,6 +3,8 @@ FROM docker.io/library/debian:bookworm-slim@sha256:5ae3c39ebd15e229dcedd5cee596b
 # Rust compilation is a moon dependency. This image only packages its outputs.
 FROM runtime AS app
 COPY target/tun/debug/kotoconn /usr/local/bin/kotoconn
+COPY target/tun/debug/libcronet.so /usr/local/lib/libcronet.so
+RUN ldconfig
 ENTRYPOINT ["kotoconn"]
 CMD ["--log-format", "json", "run", "--config", "/config/main.ts", "--shutdown-timeout", "3"]
 

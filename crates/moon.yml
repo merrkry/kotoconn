@@ -6,6 +6,7 @@ fileGroups:
     - /crates/**/*
     - /external/smoltcp/**/*
     - /tools/rust.py
+    - /tools/cronet.py
     - $RUSTFLAGS
     - $CARGO_ENCODED_RUSTFLAGS
     - $CFLAGS
@@ -56,12 +57,12 @@ tasks:
   build-linux-debug:
     inputs: ["@group(sources)"]
     command: uv run --locked python tools/rust.py stage debug
-    outputs: [/target/tun/debug/kotoconn, /target/tun/debug/kotoconn-tun-traffic]
+    outputs: [/target/tun/debug/kotoconn, /target/tun/debug/kotoconn-tun-traffic, /target/tun/debug/libcronet.so]
     options:
       mutex: cargo
   build-linux-release:
     inputs: ["@group(sources)"]
     command: uv run --locked python tools/rust.py stage release
-    outputs: [/target/tun/release/kotoconn, /target/tun/release/kotoconn-tun-traffic]
+    outputs: [/target/tun/release/kotoconn, /target/tun/release/kotoconn-tun-traffic, /target/tun/release/libcronet.so]
     options:
       mutex: cargo
