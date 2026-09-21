@@ -4,6 +4,7 @@ use crate::{
     stream, tls, udp, wire,
 };
 use anyhow::{Result, ensure};
+use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use kotoconn_config::Hysteria2OutboundConfig;
 use kotoconn_protocol::{
@@ -274,14 +275,8 @@ async fn connect(settings: &Settings, scope: Scope) -> Result<Session> {
         .header("Hysteria-CC-RX", "0")
         .header("Hysteria-Padding", wire::padding())
         .body(())?;
-    let mut auth = sender.send_request(request).await?;
-    auth.finish().await?;
-    let response = auth.recv_response().await?;
-    ensure!(
-        response.status().as_u16() == 233,
-        "Hysteria authentication failed: {}",
-        response.status()
-    );
+    let auth = sender.send_request(request).await?;
+    let response = authentication_response(auth).await?;
     let udp_enabled = response
         .headers()
         .get("Hysteria-UDP")
@@ -311,4 +306,26 @@ async fn connect(settings: &Settings, scope: Scope) -> Result<Session> {
         _close_connection: close_connection,
         _close_scope: close_scope,
     })
+}
+
+pub(crate) async fn authentication_response(
+    mut auth: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+) -> Result<http::Response<()>> {
+    match auth.finish().await {
+        Ok(()) => {}
+        // RFC 9114 section 4.1 permits an early response followed by
+        // STOP_SENDING(H3_NO_ERROR). h3 can observe it while writing GREASE
+        // during finish. The response still determines authentication success.
+        Err(h3::error::StreamError::RemoteTerminate { code, .. })
+            if code == h3::error::Code::H3_NO_ERROR => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let response = auth.recv_response().await?;
+    ensure!(
+        response.status().as_u16() == 233,
+        "Hysteria authentication failed: {}",
+        response.status()
+    );
+    Ok(response)
 }

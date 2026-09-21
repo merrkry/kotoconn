@@ -144,3 +144,82 @@ async fn http3_authentication_gates_proxying_and_stalled_streams_do_not_block_ad
     .await??;
     Ok(())
 }
+
+#[tokio::test]
+async fn early_auth_response_accepts_only_success_with_a_clean_request_stop() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
+        for (status, code, accepted) in [
+            (233, h3::error::Code::H3_NO_ERROR, true),
+            (404, h3::error::Code::H3_NO_ERROR, false),
+            (233, h3::error::Code::H3_REQUEST_REJECTED, false),
+        ] {
+            let scope = Scope::new();
+            let server = quinn::Endpoint::server(
+                tls::server(&Hysteria2InboundConfig {
+                    listen: "127.0.0.1:0".parse()?,
+                    password: "secret".into(),
+                    certificate: certificate.cert.pem(),
+                    private_key: certificate.signing_key.serialize_pem(),
+                    obfs_password: None,
+                })?,
+                "127.0.0.1:0".parse()?,
+            )?;
+            let address = server.local_addr()?;
+            let accepting = server.clone();
+            scope.spawn(async move {
+                let connection = accepting.accept().await.unwrap().await?;
+                let mut http = h3::server::builder()
+                    .build::<_, Bytes>(h3_quinn::Connection::new(connection.clone()))
+                    .await?;
+                let (_, mut response) = http.accept().await?.unwrap().resolve_request().await?;
+                response.stop_sending(code);
+                response
+                    .send_response(http::Response::builder().status(status).body(())?)
+                    .await?;
+                response.finish().await?;
+                connection.closed().await;
+                Ok(())
+            })?;
+
+            let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse()?)?;
+            endpoint.set_default_client_config(tls::client(&Hysteria2OutboundConfig {
+                server: p::target(address),
+                password: "secret".into(),
+                server_name: Some("localhost".into()),
+                ca_certificate: Some(certificate.cert.pem()),
+                obfs_password: None,
+            })?);
+            let connection = endpoint.connect(address, "localhost")?.await?;
+            let (mut driver, mut sender) =
+                h3::client::new(h3_quinn::Connection::new(connection.clone())).await?;
+            scope.spawn(async move {
+                let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+                Ok(())
+            })?;
+            let auth = sender
+                .send_request(http::Request::post("https://hysteria/auth").body(())?)
+                .await?;
+
+            // Observe receipt of STOP_SENDING before finishing the request.
+            // This forces the race without relying on a delay or packet timing.
+            while connection.stats().frame_rx.stop_sending == 0 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                crate::client::authentication_response(auth).await.is_ok(),
+                accepted
+            );
+
+            connection.close(0u32.into(), b"");
+            scope.close();
+            scope.wait().await;
+            server.close(0u32.into(), b"");
+            endpoint.close(0u32.into(), b"");
+            server.wait_idle().await;
+            endpoint.wait_idle().await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await?
+}
