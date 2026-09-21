@@ -28,3 +28,7 @@ pub use target::Target;
 
 pub use inbound::{HttpInboundConfig, Shadowsocks2022InboundConfig, Socks5InboundConfig};
 pub use outbound::{HttpOutboundConfig, Shadowsocks2022OutboundConfig};
+
+pub use inbound::Hysteria2InboundConfig;
+
+pub use outbound::Hysteria2OutboundConfig;

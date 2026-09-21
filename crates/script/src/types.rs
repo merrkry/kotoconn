@@ -30,6 +30,8 @@ pub(crate) fn declarations() -> String {
         DnsResult::decl(&cfg),
         InboundImpl::decl(&cfg),
         OutboundImpl::decl(&cfg),
+        Hysteria2InboundConfig::decl(&cfg),
+        Hysteria2OutboundConfig::decl(&cfg),
         TlsClientConfig::decl(&cfg),
         TlsServerConfig::decl(&cfg),
         AnyTlsInboundConfig::decl(&cfg),

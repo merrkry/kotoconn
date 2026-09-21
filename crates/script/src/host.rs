@@ -121,6 +121,14 @@ api! {
             Ok(config::DnsHandlerResult::Drop.into())
         }
 
+        fn hysteria2_inbound(self, options: Hysteria2InboundConfig) -> InboundImpl {
+            Ok(config::InboundImpl::Hysteria2(options.into()).into())
+        }
+
+        fn hysteria2_outbound(self, options: Hysteria2OutboundConfig) -> OutboundImpl {
+            Ok(config::OutboundImpl::Hysteria2(options.into()).into())
+        }
+
         fn http_inbound(self, options: HttpInboundConfig) -> InboundImpl {
             Ok(config::InboundImpl::Http(options.into()).into())
         }

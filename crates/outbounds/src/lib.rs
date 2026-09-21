@@ -9,6 +9,7 @@ use futures_util::future::BoxFuture;
 pub use kotoconn_anytls as anytls;
 use kotoconn_config::{OutboundImpl, TransportProtocol};
 pub use kotoconn_http as http;
+pub use kotoconn_hysteria2 as hysteria2;
 use kotoconn_protocol::*;
 pub use kotoconn_shadowsocks2022 as shadowsocks2022;
 pub use kotoconn_socks5 as socks5;
@@ -35,6 +36,14 @@ impl Clients {
         let scope = carrier.scope().child();
 
         let protocol: Arc<dyn Client> = match config {
+            OutboundImpl::Hysteria2(options) => Arc::new(hysteria2::Client::new(
+                Endpoint {
+                    address: options.server.clone(),
+                    resolver,
+                },
+                carrier,
+                &options,
+            )?),
             OutboundImpl::AnyTls(options) => {
                 Arc::new(anytls::Client::new(&options, carrier, resolver)?)
             }

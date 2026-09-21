@@ -169,6 +169,38 @@ pub(crate) struct Shadowsocks2022OutboundConfig {
 }
 
 #[derive(FromJs, TS, StructuralConvert)]
+#[convert(
+    from(config::Hysteria2InboundConfig),
+    into(config::Hysteria2InboundConfig)
+)]
+#[ts(as = "config::Hysteria2InboundConfig")]
+pub(crate) struct Hysteria2InboundConfig {
+    pub listen: SocketAddr,
+    pub password: String,
+    /// PEM certificate chain, leaf first.
+    pub certificate: String,
+    /// PEM private key matching the leaf certificate.
+    pub private_key: String,
+    pub obfs_password: Option<String>,
+}
+
+#[derive(FromJs, TS, StructuralConvert)]
+#[convert(
+    from(config::Hysteria2OutboundConfig),
+    into(config::Hysteria2OutboundConfig)
+)]
+#[ts(as = "config::Hysteria2OutboundConfig")]
+pub(crate) struct Hysteria2OutboundConfig {
+    pub server: Target,
+    pub password: String,
+    /// TLS server name; defaults to the configured server's domain or IP.
+    pub server_name: Option<String>,
+    /// Additional trusted PEM CA certificates. Public roots remain enabled.
+    pub ca_certificate: Option<String>,
+    pub obfs_password: Option<String>,
+}
+
+#[derive(FromJs, TS, StructuralConvert)]
 #[convert(from(config::TlsClientConfig), into(config::TlsClientConfig))]
 #[ts(as = "config::TlsClientConfig")]
 pub(crate) struct TlsClientConfig {
