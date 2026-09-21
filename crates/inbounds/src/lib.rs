@@ -2,6 +2,7 @@
 mod direct;
 
 use anyhow::Result;
+pub use kotoconn_anytls as anytls;
 use kotoconn_config::InboundImpl;
 pub use kotoconn_http as http;
 pub use kotoconn_hysteria2 as hysteria2;
@@ -27,6 +28,7 @@ pub async fn bind(config: InboundImpl, context: ServerContext) -> Result<BoundIn
         InboundImpl::Hysteria2(options) => {
             (options.listen, Arc::new(hysteria2::Server::new(&options)?))
         }
+        InboundImpl::AnyTls(options) => (options.listen, Arc::new(anytls::Server::new(&options)?)),
         InboundImpl::Http(options) => (options.listen, Arc::new(http::Server)),
         InboundImpl::Socks5(options) => (options.listen, Arc::new(socks5::Server)),
         InboundImpl::Shadowsocks2022(options) => (

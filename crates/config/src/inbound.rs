@@ -34,6 +34,7 @@ pub struct InboundConfig {
 #[ts(type = "{ readonly __brand: unique symbol }")]
 pub enum InboundImpl {
     Hysteria2(Hysteria2InboundConfig),
+    AnyTls(crate::AnyTlsInboundConfig),
     Shadowsocks2022(Shadowsocks2022InboundConfig),
     Socks5(Socks5InboundConfig),
     Http(HttpInboundConfig),

@@ -133,6 +133,14 @@ api! {
             Ok(config::InboundImpl::Http(options.into()).into())
         }
 
+        fn anytls_inbound(self, options: AnyTlsInboundConfig) -> InboundImpl {
+            Ok(config::InboundImpl::AnyTls(options.into()).into())
+        }
+
+        fn anytls_outbound(self, options: AnyTlsOutboundConfig) -> OutboundImpl {
+            Ok(config::OutboundImpl::AnyTls(options.into()).into())
+        }
+
         fn socks5_inbound(self, options: Socks5InboundConfig) -> InboundImpl {
             Ok(config::InboundImpl::Socks5(options.into()).into())
         }

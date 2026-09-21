@@ -6,6 +6,7 @@ mod udp_batch;
 
 use anyhow::Result;
 use futures_util::future::BoxFuture;
+pub use kotoconn_anytls as anytls;
 use kotoconn_config::{OutboundImpl, TransportProtocol};
 pub use kotoconn_http as http;
 pub use kotoconn_hysteria2 as hysteria2;
@@ -23,6 +24,10 @@ pub struct Clients {
 }
 
 impl Clients {
+    pub fn drain(&self) {
+        self.protocol.drain();
+    }
+
     pub fn new(
         config: OutboundImpl,
         carrier: Arc<dyn Carrier>,
@@ -39,6 +44,9 @@ impl Clients {
                 carrier,
                 &options,
             )?),
+            OutboundImpl::AnyTls(options) => {
+                Arc::new(anytls::Client::new(&options, carrier, resolver)?)
+            }
             OutboundImpl::Http(options) => Arc::new(http::Client {
                 endpoint: Endpoint {
                     address: options.server,

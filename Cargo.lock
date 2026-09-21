@@ -115,6 +115,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "anytls"
+version = "0.3.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "056f1fd60d65c00e5a8c84da9211a4aa5d6b8961dc44754eebe316061a30cd6f"
+dependencies = [
+ "bytes",
+ "log",
+ "md5",
+ "parking_lot",
+ "percent-encoding",
+ "rand 0.10.2",
+]
+
+[[package]]
 name = "arc-swap"
 version = "1.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -526,6 +540,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "const-oid"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
+
+[[package]]
 name = "constant_time_eq"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -755,6 +775,7 @@ dependencies = [
  "block-buffer",
  "crypto-common",
  "ctutils",
+ "const-oid",
 ]
 
 [[package]]
@@ -1541,6 +1562,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "kotoconn-anytls"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "anytls",
+ "bytes",
+ "fast-socks5",
+ "futures-util",
+ "kotoconn-config",
+ "kotoconn-protocol",
+ "parking_lot",
+ "rcgen",
+ "rustls",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
+ "webpki-roots",
+]
+
+[[package]]
 name = "kotoconn-cli"
 version = "0.1.0"
 dependencies = [
@@ -1629,6 +1674,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures-util",
+ "kotoconn-anytls",
  "kotoconn-config",
  "kotoconn-http",
  "kotoconn-hysteria2",
@@ -1647,6 +1693,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures-util",
+ "kotoconn-anytls",
  "kotoconn-config",
  "kotoconn-http",
  "kotoconn-hysteria2",
@@ -1811,6 +1858,9 @@ name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "lru-slab"
@@ -1838,6 +1888,12 @@ checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
 dependencies = [
  "regex-automata",
 ]
+
+[[package]]
+name = "md5"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ebb8d8732c6a6df3d8f032a82911cfc747e00efb95cc46e8d0acd5b5b88570c"
 
 [[package]]
 name = "memchr"
@@ -3189,6 +3245,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha2"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
 name = "shadowsocks"
 version = "1.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3678,6 +3745,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-rustls"
+version = "0.26.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0c85f2c3ef0b1cd58b36682f4b17aaa995f0e5db534d85692b4903abce21f67"
+dependencies = [
+ "rustls",
+ "tokio",
+]
+
+[[package]]
 name = "tokio-stream"
 version = "0.1.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3715,6 +3792,7 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "futures-util",
+ "libc",
  "pin-project-lite",
  "tokio",
 ]

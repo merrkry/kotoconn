@@ -22,6 +22,7 @@ pub struct OutboundConfig {
 #[ts(type = "{ readonly __brand: unique symbol }")]
 pub enum OutboundImpl {
     Hysteria2(Hysteria2OutboundConfig),
+    AnyTls(crate::AnyTlsOutboundConfig),
     Shadowsocks2022(Shadowsocks2022OutboundConfig),
     Http(HttpOutboundConfig),
     Direct(DirectOutboundConfig),
