@@ -33,6 +33,11 @@ deploy an appropriate frontend when that behavior is needed. HTTP/1 and inbound
 HTTP/3 are not supported. Ordinary authenticated HTTP/2 CONNECT clients can
 omit the padding header and exchange unframed bytes.
 
+Inbound TLS and HTTP/2 setup share a 15-second network deadline. Stopping the
+listener cancels incomplete handshakes while admitted tunnels drain. HTTP/2
+receive windows are 8 MiB per stream and 32 MiB per connection; capacity returns
+as the application consumes data.
+
 See [build setup](../../docs/build.md) for the native library and
 [the ADR](../../docs/adr/0010-naiveproxy-cronet-carriers.md) for ownership and
 carrier behavior. Protocol references are the
