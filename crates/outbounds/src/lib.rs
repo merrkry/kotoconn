@@ -10,6 +10,7 @@ pub use kotoconn_anytls as anytls;
 use kotoconn_config::{OutboundImpl, TransportProtocol};
 pub use kotoconn_http as http;
 pub use kotoconn_hysteria2 as hysteria2;
+pub use kotoconn_naive as naive;
 use kotoconn_protocol::*;
 pub use kotoconn_shadowsocks2022 as shadowsocks2022;
 pub use kotoconn_socks5 as socks5;
@@ -34,6 +35,7 @@ impl Clients {
         resolver: Arc<dyn Resolver>,
     ) -> Result<Self> {
         let scope = carrier.scope().child();
+        let tcp = scope.child();
 
         let protocol: Arc<dyn Client> = match config {
             OutboundImpl::Hysteria2(options) => Arc::new(hysteria2::Client::new(
@@ -46,6 +48,20 @@ impl Clients {
             )?),
             OutboundImpl::AnyTls(options) => {
                 Arc::new(anytls::Client::new(&options, carrier, resolver)?)
+            }
+            #[cfg(target_os = "linux")]
+            OutboundImpl::Naive(options) => Arc::new(naive::Client::new(
+                options.clone(),
+                Endpoint {
+                    address: options.server,
+                    resolver,
+                },
+                carrier,
+                tcp.clone(),
+            )?),
+            #[cfg(not(target_os = "linux"))]
+            OutboundImpl::Naive(_) => {
+                anyhow::bail!("Naive outbound requires the Linux SagerNet Cronet runtime")
             }
             OutboundImpl::Http(options) => Arc::new(http::Client {
                 endpoint: Endpoint {
@@ -73,7 +89,7 @@ impl Clients {
         };
 
         Ok(Self {
-            tcp: scope.child(),
+            tcp,
             udp: scope.child(),
             scope,
             protocol,

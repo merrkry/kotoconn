@@ -5,6 +5,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import cronet
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -22,8 +24,8 @@ def zig_target(target):
     return target + ".2.28" if target.endswith("-linux-gnu") else target
 
 
-def run(args):
-    subprocess.run(args, cwd=ROOT, check=True)
+def run(args, env=None):
+    subprocess.run(args, cwd=ROOT, env=env, check=True)
 
 
 def main():
@@ -56,7 +58,7 @@ def main():
         ]
         if options.profile == "release":
             command.append("--release")
-        run(command)
+        run(command, env=cronet.environment(target))
 
         destination = ROOT / "target/tun" / options.profile
         destination.mkdir(parents=True, exist_ok=True)
@@ -65,8 +67,14 @@ def main():
                 ROOT / "target" / target / options.profile / binary,
                 destination / binary,
             )
+        native = cronet.library(target)
+        if native is not None:
+            shutil.copy2(native, destination / native.name)
     else:
-        run(["cargo-zigbuild", args.command, "--target", zig_target(target), *extra])
+        run(
+            ["cargo-zigbuild", args.command, "--target", zig_target(target), *extra],
+            env=cronet.environment(target),
+        )
 
 
 if __name__ == "__main__":

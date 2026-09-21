@@ -26,7 +26,9 @@ pub use route::{RouteDecision, RoutingHandlerId};
 pub use std::net::IpAddr;
 pub use target::Target;
 
+pub use inbound::NaiveInboundConfig;
 pub use inbound::{HttpInboundConfig, Shadowsocks2022InboundConfig, Socks5InboundConfig};
+pub use outbound::NaiveOutboundConfig;
 pub use outbound::{HttpOutboundConfig, Shadowsocks2022OutboundConfig};
 
 pub use inbound::Hysteria2InboundConfig;

@@ -23,6 +23,7 @@ pub(crate) struct Network {
     pub clients: Arc<HashMap<DialerId, Arc<Clients>>>,
     pub sessions: sessions::Sessions,
     scope: Scope,
+    outbound_scope: Scope,
     force: CancellationToken,
     failure: tokio::sync::watch::Receiver<Option<String>>,
     _registry: AbortOnDropHandle<()>,
@@ -45,7 +46,10 @@ impl Network {
         force: CancellationToken,
     ) -> Result<Self> {
         let scope = Scope::new();
-        let clients = Arc::new(build_clients(&policy, scope.clone())?);
+        // Idle protocol pools outlive individual sessions. Connection attempts
+        // still register with their inbound caller through Carrier::tcp_scoped.
+        let outbound_scope = Scope::new();
+        let clients = Arc::new(build_clients(&policy, outbound_scope.clone())?);
 
         let (sessions, registry) = sessions::Sessions::new();
         let mut bound = Vec::new();
@@ -106,6 +110,7 @@ impl Network {
             let failed = failed.clone();
             let stop = stopping.clone();
             let control = scope.clone();
+            let outbound = outbound_scope.clone();
             let span = tracing::info_span!("inbound", inbound_id = id.0.get());
             span.in_scope(|| {
                 scope.spawn(async move {
@@ -115,6 +120,7 @@ impl Network {
                         failed.send_replace(Some(format!("{error:#}")));
                         stop.cancel();
                         control.close();
+                        outbound.close();
                     }
                     result
                 })
@@ -122,11 +128,15 @@ impl Network {
         }
 
         let close = scope.clone();
+        let outbound = outbound_scope.clone();
         let force_signal = force.clone();
         // This supervisor is not part of the sessions it waits for.
         let registry = AbortOnDropHandle::new(tokio::spawn(async move {
             tokio::select! {
-                _ = force_signal.cancelled() => close.close(),
+                _ = force_signal.cancelled() => {
+                    close.close();
+                    outbound.close();
+                },
                 _ = registry => {},
             }
         }));
@@ -136,6 +146,7 @@ impl Network {
             clients,
             sessions,
             scope,
+            outbound_scope,
             force,
             failure,
             _registry: registry,
@@ -144,6 +155,9 @@ impl Network {
 
     pub async fn wait(&self) -> Result<Shutdown, Error> {
         self.scope.wait().await;
+        self.outbound_scope.close();
+        self.outbound_scope.wait().await;
+
         match self.failure.borrow().as_ref() {
             Some(error) => Err(Error::Network(error.clone())),
             None if self.force.is_cancelled() => Ok(Shutdown::TimedOut),
@@ -155,6 +169,7 @@ impl Network {
 impl Drop for Network {
     fn drop(&mut self) {
         self.scope.close();
+        self.outbound_scope.close();
     }
 }
 

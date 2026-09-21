@@ -235,3 +235,26 @@ pub(crate) struct AnyTlsOutboundConfig {
     pub tls: TlsClientConfig,
     pub idle_session_timeout: Option<Timeout>,
 }
+
+#[derive(FromJs, TS, StructuralConvert)]
+#[convert(from(config::NaiveOutboundConfig), into(config::NaiveOutboundConfig))]
+#[ts(as = "config::NaiveOutboundConfig")]
+pub(crate) struct NaiveOutboundConfig {
+    pub server: Target,
+    pub username: String,
+    pub password: String,
+    pub server_name: Option<String>,
+    pub certificate: Option<String>,
+    pub quic: Option<bool>,
+}
+
+#[derive(FromJs, TS, StructuralConvert)]
+#[convert(from(config::NaiveInboundConfig), into(config::NaiveInboundConfig))]
+#[ts(as = "config::NaiveInboundConfig")]
+pub(crate) struct NaiveInboundConfig {
+    pub listen: SocketAddr,
+    pub username: String,
+    pub password: String,
+    pub certificate: String,
+    pub private_key: String,
+}

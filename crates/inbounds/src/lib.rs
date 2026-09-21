@@ -6,6 +6,7 @@ pub use kotoconn_anytls as anytls;
 use kotoconn_config::InboundImpl;
 pub use kotoconn_http as http;
 pub use kotoconn_hysteria2 as hysteria2;
+pub use kotoconn_naive as naive;
 use kotoconn_protocol::{Server, ServerContext};
 pub use kotoconn_shadowsocks2022 as shadowsocks2022;
 pub use kotoconn_socks5 as socks5;
@@ -30,6 +31,7 @@ pub async fn bind(config: InboundImpl, context: ServerContext) -> Result<BoundIn
         }
         InboundImpl::AnyTls(options) => (options.listen, Arc::new(anytls::Server::new(&options)?)),
         InboundImpl::Http(options) => (options.listen, Arc::new(http::Server)),
+        InboundImpl::Naive(options) => (options.listen, Arc::new(naive::Server::new(&options)?)),
         InboundImpl::Socks5(options) => (options.listen, Arc::new(socks5::Server)),
         InboundImpl::Shadowsocks2022(options) => (
             options.listen,

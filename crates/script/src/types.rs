@@ -40,6 +40,8 @@ pub(crate) fn declarations() -> String {
         Socks5InboundConfig::decl(&cfg),
         Shadowsocks2022InboundConfig::decl(&cfg),
         HttpOutboundConfig::decl(&cfg),
+        NaiveInboundConfig::decl(&cfg),
+        NaiveOutboundConfig::decl(&cfg),
         Shadowsocks2022OutboundConfig::decl(&cfg),
         Flow::decl(&cfg),
         TransportProtocol::decl(&cfg),

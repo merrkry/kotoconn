@@ -18,9 +18,10 @@ tokio-util = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 
 [dev-dependencies]
-rcgen.workspace = true
 bytes.workspace = true
 fast-socks5.workspace = true
+rcgen.workspace = true
+serde_json.workspace = true
 shadowsocks.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

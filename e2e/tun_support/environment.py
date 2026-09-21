@@ -136,6 +136,15 @@ def enter(args, script, category, *, sysctls=None):
         binary = binary.resolve(strict=True)
         target = f"/inputs/{option}"
         argv += ["--mount", f"type=bind,source={binary},target={target},readonly"]
+        if option == "binary":
+            native = binary.with_name("libcronet.so")
+            if native.is_file():
+                argv += [
+                    "--mount",
+                    f"type=bind,source={native},target=/inputs/libcronet.so,readonly",
+                    "--env",
+                    "LD_LIBRARY_PATH=/inputs",
+                ]
         overrides += ["--" + option.replace("_", "-"), target]
     argv += [
         "--entrypoint",
