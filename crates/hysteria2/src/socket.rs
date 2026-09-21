@@ -130,6 +130,8 @@ impl AsyncUdpSocket for CarrierSocket {
 pub struct Salamander {
     inner: Arc<dyn AsyncUdpSocket>,
     password: Vec<u8>,
+    send_buffer: Mutex<Vec<u8>>,
+    receive_buffer: Mutex<Vec<u8>>,
 }
 
 impl Salamander {
@@ -138,6 +140,8 @@ impl Salamander {
             Some(password) => Arc::new(Self {
                 inner,
                 password: password.as_bytes().to_vec(),
+                send_buffer: Mutex::new(Vec::new()),
+                receive_buffer: Mutex::new(Vec::new()),
             }),
             None => inner,
         }
@@ -162,7 +166,12 @@ impl AsyncUdpSocket for Salamander {
     fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
         debug_assert!(transmit.segment_size.is_none());
         let salt: [u8; 8] = rand::random();
-        let mut bytes = Vec::with_capacity(transmit.contents.len() + 8);
+        let mut bytes = self
+            .send_buffer
+            .lock()
+            .map_err(|_| io::Error::other("Salamander send buffer poisoned"))?;
+        bytes.clear();
+        bytes.reserve(transmit.contents.len() + 8);
         bytes.extend_from_slice(&salt);
         bytes.extend_from_slice(transmit.contents);
         self.mask(&salt, &mut bytes[8..]);
@@ -184,7 +193,11 @@ impl AsyncUdpSocket for Salamander {
         }
         // GRO is disabled at the wrapper boundary. A larger scratch buffer keeps
         // the salt from truncating a maximum-sized QUIC datagram.
-        let mut buffer = vec![0; bufs[0].len() + 8];
+        let mut buffer = self
+            .receive_buffer
+            .lock()
+            .map_err(|_| io::Error::other("Salamander receive buffer poisoned"))?;
+        buffer.resize(bufs[0].len() + 8, 0);
         let mut metadata = [RecvMeta::default()];
         for _ in 0..32 {
             let count = ready!(self.inner.poll_recv(
@@ -233,6 +246,8 @@ mod tests {
                 "127.0.0.1:443".parse().unwrap(),
             )),
             password: b"password".to_vec(),
+            send_buffer: Mutex::new(Vec::new()),
+            receive_buffer: Mutex::new(Vec::new()),
         };
         let mut payload = [0; 32];
         socket.mask(b"12345678", &mut payload);
@@ -244,6 +259,61 @@ mod tests {
                 207, 10, 97, 201, 97, 20, 120, 18, 38, 105, 109, 106, 208
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn salamander_reuses_receive_storage_across_packets_and_pending_polls() {
+        let scope = kotoconn_protocol::Scope::new();
+        let (transport, mut peer) = kotoconn_protocol::packet_pair(scope);
+        let address = "127.0.0.1:443".parse().unwrap();
+        let socket = Salamander {
+            inner: Arc::new(CarrierSocket::new(transport, address)),
+            password: b"password".to_vec(),
+            send_buffer: Mutex::new(Vec::new()),
+            receive_buffer: Mutex::new(Vec::new()),
+        };
+        let mut output = [0; 1200];
+        let mut meta = [RecvMeta::default()];
+        let mut receive = Box::pin(std::future::poll_fn(|cx| {
+            socket.poll_recv(cx, &mut [IoSliceMut::new(&mut output)], &mut meta)
+        }));
+        assert!(futures_util::poll!(&mut receive).is_pending());
+        let allocation = socket.receive_buffer.lock().unwrap().as_ptr() as usize;
+        assert!(futures_util::poll!(&mut receive).is_pending());
+        assert_eq!(
+            socket.receive_buffer.lock().unwrap().as_ptr() as usize,
+            allocation
+        );
+        drop(receive);
+
+        for length in [1200, 0, 64, 1200] {
+            let payload = vec![42; length];
+            socket
+                .try_send(&Transmit {
+                    destination: address,
+                    ecn: None,
+                    contents: &payload,
+                    segment_size: None,
+                    src_ip: None,
+                })
+                .unwrap();
+            let encoded = peer.rx.recv().await.unwrap();
+            assert_eq!(encoded.payload.len(), length + 8);
+            peer.tx.send(encoded).await.unwrap();
+
+            let count = std::future::poll_fn(|cx| {
+                socket.poll_recv(cx, &mut [IoSliceMut::new(&mut output)], &mut meta)
+            })
+            .await
+            .unwrap();
+            assert_eq!(count, 1);
+            assert_eq!(meta[0].len, length);
+            assert_eq!(&output[..length], payload);
+            assert_eq!(
+                socket.receive_buffer.lock().unwrap().as_ptr() as usize,
+                allocation
+            );
+        }
     }
 }
 

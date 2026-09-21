@@ -5,7 +5,7 @@ use crate::{
 use anyhow::{Result, ensure};
 use kotoconn_protocol::{Datagram, Packet, Scope, ServerContext, packet_pair, queue};
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -26,6 +26,52 @@ struct Association {
     tx: queue::Sender<Packet>,
     close: CloseScope,
     active: Instant,
+}
+
+/// One activity entry per association avoids scanning every association for each packet.
+#[derive(Default)]
+struct ServerAssociations {
+    entries: HashMap<u32, Association>,
+    activity: BTreeSet<(Instant, u32)>,
+}
+
+impl ServerAssociations {
+    fn insert(&mut self, id: u32, association: Association) {
+        self.remove(id);
+        self.activity.insert((association.active, id));
+        self.entries.insert(id, association);
+    }
+
+    fn remove(&mut self, id: u32) {
+        if let Some(association) = self.entries.remove(&id) {
+            let removed = self.activity.remove(&(association.active, id));
+            debug_assert!(removed);
+        }
+    }
+
+    fn touch(&mut self, id: u32) {
+        // SAFETY: Only the owner task touches an association after finding it in entries.
+        let association = self.entries.get_mut(&id).expect("active UDP association");
+        let removed = self.activity.remove(&(association.active, id));
+        debug_assert!(removed);
+        association.active = Instant::now();
+        self.activity.insert((association.active, id));
+    }
+
+    fn next_expiry(&self, retention: Duration) -> Option<Instant> {
+        self.activity.first().map(|(active, _)| *active + retention)
+    }
+
+    fn expire(&mut self, retention: Duration) {
+        let now = Instant::now();
+        while let Some(&(active, id)) = self.activity.first() {
+            if active + retention > now {
+                break;
+            }
+            self.remove(id);
+        }
+        debug_assert_eq!(self.entries.len(), self.activity.len());
+    }
 }
 
 struct Reply {
@@ -88,13 +134,18 @@ pub async fn client(
                 let (user, mut driver) = packet_pair(scope.clone());
                 let tx = driver.tx.clone();
                 let connection = connection.clone();
-                scope.spawn(async move {
+                if let Err(error) = scope.spawn(async move {
                     let mut counter = 0;
                     while let Some(packet) = driver.rx.recv().await {
                         send(&connection, id, &mut counter, &packet)?;
                     }
                     Ok(())
-                })?;
+                }) {
+                    // A caller can close after the admission check. Its failed
+                    // registration must not end the shared QUIC connection.
+                    let _ = registration.reply.send(Err(error));
+                    continue;
+                }
 
                 associations.insert(id, Association {
                     tx,
@@ -166,7 +217,7 @@ pub async fn server(
     context: ServerContext,
     authenticated: Arc<AtomicBool>,
 ) -> Result<()> {
-    let mut associations = HashMap::<u32, Association>::new();
+    let mut associations = ServerAssociations::default();
     let (responses, mut replies) = queue::channel(queue::INITIAL_BYTES, |reply: &Reply| {
         reply.packet.payload.len()
     });
@@ -177,10 +228,7 @@ pub async fn server(
     // retain their own idle clocks in the daemon.
     let retention = context.udp_idle_timeout.max(Duration::from_secs(1));
     loop {
-        let expiry = associations
-            .values()
-            .map(|value| value.active + retention)
-            .min();
+        let expiry = associations.next_expiry(retention);
         let expire = async {
             match expiry {
                 Some(at) => tokio::time::sleep_until(at).await,
@@ -191,7 +239,7 @@ pub async fn server(
         tokio::select! {
             _ = context.stopping.cancelled() => return Ok(()),
             _ = expire => {
-                associations.retain(|_, value| value.active + retention > Instant::now() && !value.close.0.is_closed());
+                associations.expire(retention);
             }
             received = connection.read_datagram() => {
                 let bytes = received?;
@@ -205,20 +253,20 @@ pub async fn server(
                     continue;
                 };
 
-                if associations.get(&id).is_some_and(|value| value.close.0.is_closed()) {
-                    associations.remove(&id);
+                if associations.entries.get(&id).is_some_and(|value| value.close.0.is_closed()) {
+                    associations.remove(id);
                 }
-                if !associations.contains_key(&id) {
-                    if associations.len() >= 4096 {
+                if !associations.entries.contains_key(&id) {
+                    if associations.entries.len() >= 4096 {
                         continue;
                     }
                     associations.insert(id, associate(&context, id, responses.clone())?);
                 }
 
                 // SAFETY: The single owner inserted or found this ID immediately above.
-                let association = associations.get_mut(&id).expect("UDP association");
+                let association = associations.entries.get(&id).expect("UDP association");
                 if association.tx.try_send(packet).is_ok() {
-                    association.active = Instant::now();
+                    associations.touch(id);
                 }
             }
             reply = replies.recv() => {
@@ -231,9 +279,9 @@ pub async fn server(
                     continue;
                 }
 
-                if let Some(association) = associations.get_mut(&reply.session) {
+                if associations.entries.contains_key(&reply.session) {
                     send(&connection, reply.session, &mut counter, &reply.packet)?;
-                    association.active = Instant::now();
+                    associations.touch(reply.session);
                 }
             }
         }
@@ -248,4 +296,55 @@ pub async fn register(
     let (reply, receive) = oneshot::channel();
     registrations.send(Registration { scope, reply }).await?;
     receive.await?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn association() -> (Association, Scope) {
+        let scope = Scope::new();
+        let (tx, _) = queue::channel(1024, |packet: &Packet| packet.payload.len());
+        (
+            Association {
+                tx,
+                close: CloseScope(scope.clone()),
+                active: Instant::now(),
+            },
+            scope,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expiry_tracks_refreshes_replacements_and_equal_deadlines() {
+        let retention = Duration::from_secs(10);
+        let mut associations = ServerAssociations::default();
+        let (first, first_scope) = association();
+        let (second, second_scope) = association();
+        associations.insert(1, first);
+        associations.insert(2, second);
+        let original = associations.next_expiry(retention).unwrap();
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        associations.touch(1);
+        assert_eq!(associations.next_expiry(retention), Some(original));
+        tokio::time::advance(Duration::from_secs(5)).await;
+        associations.expire(retention);
+        assert!(second_scope.is_closed());
+        assert!(!first_scope.is_closed());
+        assert_eq!(associations.entries.len(), 1);
+
+        let (replacement, replacement_scope) = association();
+        associations.insert(1, replacement);
+        assert!(first_scope.is_closed());
+        assert_eq!(associations.activity.len(), 1);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        associations.expire(retention);
+        assert!(!replacement_scope.is_closed());
+        tokio::time::advance(Duration::from_secs(5)).await;
+        associations.expire(retention);
+        assert!(replacement_scope.is_closed());
+        assert!(associations.next_expiry(retention).is_none());
+        assert!(associations.entries.is_empty());
+    }
 }
