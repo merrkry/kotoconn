@@ -6,6 +6,7 @@ the repository root, run all integration checks or select protocol suites:
 ```sh
 mise exec -- moon run workspace:test-e2e
 mise exec -- moon run docker:test -- socks5 nested
+mise exec -- moon run docker:test -- hysteria2 hysteria2-salamander
 ```
 
 For Linux TUN changes, see [TUN verification](tun_support/README.md). For
@@ -18,3 +19,6 @@ regressions in Rust tests; use e2e for interoperability and kernel integration.
 Keep the artifact directory printed by a failed run. If cleanup was interrupted,
 use its recorded Compose project name to remove only that run's resources.
 Give concurrent builds distinct image tags when testing different revisions.
+
+The Hysteria suites use the official 2.12.3 image with BBR in both directions.
+Their test-only TLS material is documented in [hysteria2](hysteria2/README.md).
