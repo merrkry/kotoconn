@@ -6,8 +6,10 @@ mod udp_batch;
 
 use anyhow::Result;
 use futures_util::future::BoxFuture;
+pub use kotoconn_anytls as anytls;
 use kotoconn_config::{OutboundImpl, TransportProtocol};
 pub use kotoconn_http as http;
+pub use kotoconn_hysteria2 as hysteria2;
 pub use kotoconn_naive as naive;
 use kotoconn_protocol::*;
 pub use kotoconn_shadowsocks2022 as shadowsocks2022;
@@ -23,6 +25,10 @@ pub struct Clients {
 }
 
 impl Clients {
+    pub fn drain(&self) {
+        self.protocol.drain();
+    }
+
     pub fn new(
         config: OutboundImpl,
         carrier: Arc<dyn Carrier>,
@@ -32,6 +38,17 @@ impl Clients {
         let tcp = scope.child();
 
         let protocol: Arc<dyn Client> = match config {
+            OutboundImpl::Hysteria2(options) => Arc::new(hysteria2::Client::new(
+                Endpoint {
+                    address: options.server.clone(),
+                    resolver,
+                },
+                carrier,
+                &options,
+            )?),
+            OutboundImpl::AnyTls(options) => {
+                Arc::new(anytls::Client::new(&options, carrier, resolver)?)
+            }
             #[cfg(target_os = "linux")]
             OutboundImpl::Naive(options) => Arc::new(naive::Client::new(
                 options.clone(),

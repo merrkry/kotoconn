@@ -6,6 +6,7 @@ the repository root, run all integration checks or select protocol suites:
 ```sh
 mise exec -- moon run workspace:test-e2e
 mise exec -- moon run docker:test -- socks5 nested
+mise exec -- moon run docker:test -- hysteria2 hysteria2-salamander
 mise exec -- moon run docker:test -- naive naive-nested naive-quic
 ```
 
@@ -25,3 +26,6 @@ inside its test container and verifies it through an explicit trust anchor.
 Keep the artifact directory printed by a failed run. If cleanup was interrupted,
 use its recorded Compose project name to remove only that run's resources.
 Give concurrent builds distinct image tags when testing different revisions.
+
+The Hysteria suites use the official 2.12.3 image with BBR in both directions.
+Their test-only TLS material is documented in [hysteria2](hysteria2/README.md).

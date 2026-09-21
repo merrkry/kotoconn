@@ -169,6 +169,74 @@ pub(crate) struct Shadowsocks2022OutboundConfig {
 }
 
 #[derive(FromJs, TS, StructuralConvert)]
+#[convert(
+    from(config::Hysteria2InboundConfig),
+    into(config::Hysteria2InboundConfig)
+)]
+#[ts(as = "config::Hysteria2InboundConfig")]
+pub(crate) struct Hysteria2InboundConfig {
+    pub listen: SocketAddr,
+    pub password: String,
+    /// PEM certificate chain, leaf first.
+    pub certificate: String,
+    /// PEM private key matching the leaf certificate.
+    pub private_key: String,
+    pub obfs_password: Option<String>,
+}
+
+#[derive(FromJs, TS, StructuralConvert)]
+#[convert(
+    from(config::Hysteria2OutboundConfig),
+    into(config::Hysteria2OutboundConfig)
+)]
+#[ts(as = "config::Hysteria2OutboundConfig")]
+pub(crate) struct Hysteria2OutboundConfig {
+    pub server: Target,
+    pub password: String,
+    /// TLS server name; defaults to the configured server's domain or IP.
+    pub server_name: Option<String>,
+    /// Additional trusted PEM CA certificates. Public roots remain enabled.
+    pub ca_certificate: Option<String>,
+    pub obfs_password: Option<String>,
+}
+
+#[derive(FromJs, TS, StructuralConvert)]
+#[convert(from(config::TlsClientConfig), into(config::TlsClientConfig))]
+#[ts(as = "config::TlsClientConfig")]
+pub(crate) struct TlsClientConfig {
+    pub server_name: Option<String>,
+    pub certificate: Option<String>,
+}
+
+#[derive(FromJs, TS, StructuralConvert)]
+#[convert(from(config::TlsServerConfig), into(config::TlsServerConfig))]
+#[ts(as = "config::TlsServerConfig")]
+pub(crate) struct TlsServerConfig {
+    pub certificate: String,
+    pub private_key: String,
+}
+
+#[derive(FromJs, TS, StructuralConvert)]
+#[convert(from(config::AnyTlsInboundConfig), into(config::AnyTlsInboundConfig))]
+#[ts(as = "config::AnyTlsInboundConfig")]
+pub(crate) struct AnyTlsInboundConfig {
+    pub listen: SocketAddr,
+    pub password: String,
+    pub tls: TlsServerConfig,
+    pub padding_scheme: Option<String>,
+}
+
+#[derive(FromJs, TS, StructuralConvert)]
+#[convert(from(config::AnyTlsOutboundConfig), into(config::AnyTlsOutboundConfig))]
+#[ts(as = "config::AnyTlsOutboundConfig")]
+pub(crate) struct AnyTlsOutboundConfig {
+    pub server: Target,
+    pub password: String,
+    pub tls: TlsClientConfig,
+    pub idle_session_timeout: Option<Timeout>,
+}
+
+#[derive(FromJs, TS, StructuralConvert)]
 #[convert(from(config::NaiveOutboundConfig), into(config::NaiveOutboundConfig))]
 #[ts(as = "config::NaiveOutboundConfig")]
 pub(crate) struct NaiveOutboundConfig {

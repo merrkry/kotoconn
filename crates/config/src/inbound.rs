@@ -1,5 +1,6 @@
 mod direct;
 mod http;
+mod hysteria2;
 mod naive;
 mod shadowsocks2022;
 mod socks5;
@@ -11,6 +12,7 @@ use crate::RoutingHandlerId;
 
 pub use direct::DirectInboundConfig;
 pub use http::HttpInboundConfig;
+pub use hysteria2::Hysteria2InboundConfig;
 pub use naive::NaiveInboundConfig;
 pub use shadowsocks2022::Shadowsocks2022InboundConfig;
 pub use socks5::Socks5InboundConfig;
@@ -33,6 +35,8 @@ pub struct InboundConfig {
 #[derive(Debug, Clone, PartialEq, Eq, ts_rs::TS)]
 #[ts(type = "{ readonly __brand: unique symbol }")]
 pub enum InboundImpl {
+    Hysteria2(Hysteria2InboundConfig),
+    AnyTls(crate::AnyTlsInboundConfig),
     Shadowsocks2022(Shadowsocks2022InboundConfig),
     Socks5(Socks5InboundConfig),
     Http(HttpInboundConfig),

@@ -121,8 +121,24 @@ api! {
             Ok(config::DnsHandlerResult::Drop.into())
         }
 
+        fn hysteria2_inbound(self, options: Hysteria2InboundConfig) -> InboundImpl {
+            Ok(config::InboundImpl::Hysteria2(options.into()).into())
+        }
+
+        fn hysteria2_outbound(self, options: Hysteria2OutboundConfig) -> OutboundImpl {
+            Ok(config::OutboundImpl::Hysteria2(options.into()).into())
+        }
+
         fn http_inbound(self, options: HttpInboundConfig) -> InboundImpl {
             Ok(config::InboundImpl::Http(options.into()).into())
+        }
+
+        fn anytls_inbound(self, options: AnyTlsInboundConfig) -> InboundImpl {
+            Ok(config::InboundImpl::AnyTls(options.into()).into())
+        }
+
+        fn anytls_outbound(self, options: AnyTlsOutboundConfig) -> OutboundImpl {
+            Ok(config::OutboundImpl::AnyTls(options.into()).into())
         }
 
         fn socks5_inbound(self, options: Socks5InboundConfig) -> InboundImpl {

@@ -13,12 +13,27 @@ const KEY: &str = "AAECAwQFBgcICQoLDA0ODw==";
 
 const LIMIT: Duration = Duration::from_secs(20);
 
+fn hysteria_certificate() -> &'static rcgen::CertifiedKey<rcgen::KeyPair> {
+    static CERTIFICATE: std::sync::LazyLock<rcgen::CertifiedKey<rcgen::KeyPair>> =
+        std::sync::LazyLock::new(|| {
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap()
+        });
+    &CERTIFICATE
+}
+
 fn direct() -> OutboundImpl {
     OutboundImpl::Direct(DirectOutboundConfig {})
 }
 
 fn outbound(kind: &str, server: Target) -> OutboundImpl {
     match kind {
+        "hysteria2" => OutboundImpl::Hysteria2(Hysteria2OutboundConfig {
+            server,
+            password: KEY.into(),
+            server_name: Some("localhost".into()),
+            ca_certificate: Some(hysteria_certificate().cert.pem()),
+            obfs_password: Some("salamander-test".into()),
+        }),
         "http" => OutboundImpl::Http(HttpOutboundConfig { server }),
         "socks5" => OutboundImpl::Socks5(Socks5OutboundConfig { server }),
         "shadowsocks2022" => OutboundImpl::Shadowsocks2022(Shadowsocks2022OutboundConfig {
@@ -41,10 +56,12 @@ async fn daemon_with_idle(idle: u32) -> Result<Daemon> {
         const direct = k.dialer({{ dialer: undefined, outbound: {{ resolve_handler: resolver, implementation: k.direct_outbound({{}}) }} }});
         const routing = k.routing_handler(flow => flow.protocol === 'udp' ? k.route_udp(direct) : k.route(direct, flow.dest));
         const listen = {{ address: k.ip('127.0.0.1'), port: 0 }};
-        for (const implementation of [k.http_inbound({{listen}}), k.socks5_inbound({{listen}}), k.shadowsocks2022_inbound({{listen, password: '{KEY}'}})]) {{
+        for (const implementation of [k.http_inbound({{listen}}), k.socks5_inbound({{listen}}), k.shadowsocks2022_inbound({{listen, password: '{KEY}'}}), k.hysteria2_inbound({{listen, password: '{KEY}', certificate: {certificate:?}, private_key: {private_key:?}, obfs_password: 'salamander-test'}})]) {{
             k.inbound({{ implementation, routing_handler: routing, udp_idle_timeout: k.timeout({idle}) }});
         }}
-    "#
+    "#,
+        certificate = hysteria_certificate().cert.pem(),
+        private_key = hysteria_certificate().signing_key.serialize_pem(),
     );
     Ok(Daemon::start_with_sources(
         "main.ts".into(),
@@ -63,7 +80,8 @@ fn address(daemon: &Daemon, kind: &str) -> Target {
         .find(|(_, c)| {
             matches!(
                 (kind, &c.implementation),
-                ("http", InboundImpl::Http(_))
+                ("hysteria2", InboundImpl::Hysteria2(_))
+                    | ("http", InboundImpl::Http(_))
                     | ("socks5", InboundImpl::Socks5(_))
                     | ("shadowsocks2022", InboundImpl::Shadowsocks2022(_))
             )
@@ -146,7 +164,7 @@ async fn protocols_and_nested_carriers_preserve_tcp_and_udp() -> Result<()> {
         let (tcp, udp) = echoes(&scope).await?;
         let system: Arc<dyn Carrier> = Arc::new(System::new(scope.clone()));
 
-        for kind in ["http", "socks5", "shadowsocks2022"] {
+        for kind in ["http", "socks5", "shadowsocks2022", "hysteria2"] {
             let client = Clients::new(
                 outbound(kind, address(&daemon, kind)),
                 system.clone(),
@@ -178,7 +196,26 @@ async fn protocols_and_nested_carriers_preserve_tcp_and_udp() -> Result<()> {
             socks,
             Arc::new(SystemResolver),
         )?;
-        tcp_roundtrip(&http, tcp).await?;
+        tcp_roundtrip(&http, tcp.clone()).await?;
+
+        // QUIC travels through SOCKS UDP carried by Shadowsocks.
+        let lower = Arc::new(Clients::new(
+            outbound("shadowsocks2022", address(&daemon, "shadowsocks2022")),
+            system.clone(),
+            Arc::new(SystemResolver),
+        )?);
+        let lower = Arc::new(Clients::new(
+            outbound("socks5", address(&daemon, "socks5")),
+            lower,
+            Arc::new(SystemResolver),
+        )?);
+        let hysteria = Clients::new(
+            outbound("hysteria2", address(&daemon, "hysteria2")),
+            lower,
+            Arc::new(SystemResolver),
+        )?;
+        tcp_roundtrip(&hysteria, tcp.clone()).await?;
+        udp_roundtrip(&hysteria, udp.clone()).await?;
 
         // A domain user target cannot accidentally fall through to OS DNS.
         let direct = Clients::new(direct(), system, Arc::new(SystemResolver))?;
@@ -243,74 +280,76 @@ async fn http_admission_preserves_pipelined_bytes_and_rejects_bad_headers() -> R
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sessions_split_by_destination_and_close_without_killing_association() -> Result<()> {
-    tokio::time::timeout(LIMIT, async {
-        let daemon = daemon().await?;
-        let scope = Scope::new();
-        let (_, a) = echoes(&scope).await?;
-        let (_, b) = echoes(&scope).await?;
-        let client = Clients::new(
-            outbound("socks5", address(&daemon, "socks5")),
-            Arc::new(System::new(scope.clone())),
-            Arc::new(SystemResolver),
-        )?;
-        let mut association = client.udp(a.clone()).await?;
+    for kind in ["socks5", "hysteria2"] {
+        tokio::time::timeout(LIMIT, async {
+            let daemon = daemon().await?;
+            let scope = Scope::new();
+            let (_, a) = echoes(&scope).await?;
+            let (_, b) = echoes(&scope).await?;
+            let client = Clients::new(
+                outbound(kind, address(&daemon, kind)),
+                Arc::new(System::new(scope.clone())),
+                Arc::new(SystemResolver),
+            )?;
+            let mut association = client.udp(a.clone()).await?;
 
-        for destination in [&a, &b, &a] {
+            for destination in [&a, &b, &a] {
+                association
+                    .tx
+                    .send(Packet {
+                        target: destination.clone(),
+                        payload: vec![1].into(),
+                    })
+                    .await?;
+                assert_eq!(association.rx.recv().await.unwrap().target, *destination);
+            }
+
+            let sessions = daemon.sessions().await?;
+            let a_session = sessions.iter().find(|s| s.destination == a).unwrap();
+            let b_session = sessions.iter().find(|s| s.destination == b).unwrap();
+            assert_eq!(sessions.len(), 2);
+            a_session.close();
+            a_session.wait().await;
+
             association
                 .tx
                 .send(Packet {
-                    target: destination.clone(),
-                    payload: vec![1].into(),
+                    target: b.clone(),
+                    payload: vec![2].into(),
                 })
                 .await?;
-            assert_eq!(association.rx.recv().await.unwrap().target, *destination);
-        }
+            assert_eq!(association.rx.recv().await.unwrap().payload, vec![2]);
+            assert!(
+                daemon
+                    .sessions()
+                    .await?
+                    .iter()
+                    .any(|s| s.id == b_session.id)
+            );
+            association
+                .tx
+                .send(Packet {
+                    target: a.clone(),
+                    payload: vec![3].into(),
+                })
+                .await?;
+            assert_eq!(association.rx.recv().await.unwrap().payload, vec![3]);
+            assert!(
+                daemon
+                    .sessions()
+                    .await?
+                    .iter()
+                    .any(|s| s.destination == a && s.id != a_session.id)
+            );
 
-        let sessions = daemon.sessions().await?;
-        let a_session = sessions.iter().find(|s| s.destination == a).unwrap();
-        let b_session = sessions.iter().find(|s| s.destination == b).unwrap();
-        assert_eq!(sessions.len(), 2);
-        a_session.close();
-        a_session.wait().await;
-
-        association
-            .tx
-            .send(Packet {
-                target: b.clone(),
-                payload: vec![2].into(),
-            })
-            .await?;
-        assert_eq!(association.rx.recv().await.unwrap().payload, vec![2]);
-        assert!(
-            daemon
-                .sessions()
-                .await?
-                .iter()
-                .any(|s| s.id == b_session.id)
-        );
-        association
-            .tx
-            .send(Packet {
-                target: a.clone(),
-                payload: vec![3].into(),
-            })
-            .await?;
-        assert_eq!(association.rx.recv().await.unwrap().payload, vec![3]);
-        assert!(
-            daemon
-                .sessions()
-                .await?
-                .iter()
-                .any(|s| s.destination == a && s.id != a_session.id)
-        );
-
-        drop(association);
-        scope.close();
-        scope.wait().await;
-        daemon.shutdown().await?;
-        Ok::<_, anyhow::Error>(())
-    })
-    .await??;
+            drop(association);
+            scope.close();
+            scope.wait().await;
+            daemon.shutdown().await?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+    }
     Ok(())
 }
 
@@ -590,6 +629,207 @@ async fn shutdown_deadline_reports_forced_network_cleanup() -> Result<()> {
         assert_eq!(stream.read(&mut [0]).await?, 0);
         scope.close();
         scope.wait().await;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hysteria_shared_connection_keeps_siblings_alive_and_retires_when_unused() -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct CountUdp {
+        lower: System,
+        calls: Arc<AtomicUsize>,
+    }
+    impl Carrier for CountUdp {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::BOTH
+        }
+        fn scope(&self) -> &Scope {
+            self.lower.scope()
+        }
+        fn tcp_scoped(
+            &self,
+            target: Target,
+            scope: Scope,
+        ) -> futures_util::future::BoxFuture<'_, Result<BoxStream>> {
+            self.lower.tcp_scoped(target, scope)
+        }
+        fn udp_scoped(
+            &self,
+            target: Target,
+            scope: Scope,
+        ) -> futures_util::future::BoxFuture<'_, Result<Datagram>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.lower.udp_scoped(target, scope)
+        }
+    }
+    tokio::time::timeout(LIMIT, async {
+        let daemon = daemon().await?;
+        let scope = Scope::new();
+        let (tcp, udp) = echoes(&scope).await?;
+        let client_scope = Scope::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let client = Clients::new(
+            outbound("hysteria2", address(&daemon, "hysteria2")),
+            Arc::new(CountUdp {
+                lower: System::new(client_scope.clone()),
+                calls: calls.clone(),
+            }),
+            Arc::new(SystemResolver),
+        )?;
+        let mut stream = client.tcp(tcp.clone()).await?;
+        let mut greeting = [0; 5];
+        stream.read_exact(&mut greeting).await?;
+        assert_eq!(&greeting, b"hello");
+        let mut packets = client.udp(udp.clone()).await?;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Closing TCP must leave a UDP lease on the same QUIC connection usable.
+        client.control(TransportProtocol::Tcp).close();
+        client.control(TransportProtocol::Tcp).wait().await;
+        assert_eq!(stream.read(&mut [0]).await?, 0);
+        drop(stream);
+        packets
+            .tx
+            .send(Packet {
+                target: udp.clone(),
+                payload: vec![3; 8192].into(),
+            })
+            .await?;
+        assert_eq!(packets.rx.recv().await.unwrap().payload, vec![3; 8192]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        drop(packets);
+        // The configured client itself stays alive. No fixed idle timer is needed
+        // to release its manager, QUIC drivers, and lower UDP carrier.
+        client_scope.wait().await;
+        udp_roundtrip(&client, udp).await?;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        client_scope.wait().await;
+        client_scope.close();
+        scope.close();
+        scope.wait().await;
+        assert_eq!(daemon.shutdown().await?, kotoconn_daemon::Shutdown::Drained);
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hysteria_rejects_bad_credentials_certificates_and_tcp_only_carriers() -> Result<()> {
+    tokio::time::timeout(LIMIT, async {
+        let daemon = daemon().await?;
+        let scope = Scope::new();
+        let server = address(&daemon, "hysteria2");
+        let OutboundImpl::Hysteria2(options) = outbound("hysteria2", server.clone()) else {
+            unreachable!()
+        };
+        let endpoint = Endpoint {
+            address: server.clone(),
+            resolver: Arc::new(SystemResolver),
+        };
+        let system: Arc<dyn Carrier> = Arc::new(System::new(scope.clone()));
+        for failure in ["password", "name", "ca"] {
+            let mut options = options.clone();
+            match failure {
+                "password" => options.password = "wrong".into(),
+                "name" => options.server_name = Some("wrong.example".into()),
+                "ca" => options.ca_certificate = None,
+                _ => unreachable!(),
+            }
+            let client = kotoconn_outbounds::hysteria2::Client::new(
+                endpoint.clone(),
+                system.clone(),
+                &options,
+            )?;
+            assert!(
+                Client::tcp(&client, target("127.0.0.1:9".parse()?), scope.child())
+                    .await
+                    .is_err(),
+                "{failure}"
+            );
+            drop(client);
+        }
+        let http: Arc<dyn Carrier> = Arc::new(Clients::new(
+            outbound("http", server),
+            system,
+            Arc::new(SystemResolver),
+        )?);
+        assert!(kotoconn_outbounds::hysteria2::Client::new(endpoint, http, &options).is_err());
+        scope.close();
+        scope.wait().await;
+        assert_eq!(daemon.shutdown().await?, kotoconn_daemon::Shutdown::Drained);
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hysteria_cancelled_setup_releases_the_carrier_without_an_idle_deadline() -> Result<()> {
+    struct PendingCarrier {
+        scope: Scope,
+        started: tokio::sync::mpsc::Sender<()>,
+    }
+    impl Carrier for PendingCarrier {
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::BOTH
+        }
+        fn scope(&self) -> &Scope {
+            &self.scope
+        }
+        fn tcp_scoped(
+            &self,
+            _: Target,
+            _: Scope,
+        ) -> futures_util::future::BoxFuture<'_, Result<BoxStream>> {
+            Box::pin(async { anyhow::bail!("unexpected TCP carrier request") })
+        }
+        fn udp_scoped(
+            &self,
+            _: Target,
+            _: Scope,
+        ) -> futures_util::future::BoxFuture<'_, Result<Datagram>> {
+            Box::pin(async move {
+                self.started.send(()).await?;
+                std::future::pending().await
+            })
+        }
+    }
+    tokio::time::timeout(LIMIT, async {
+        let root = Scope::new();
+        let (started, mut ready) = tokio::sync::mpsc::channel(1);
+        let server = target("127.0.0.1:1".parse()?);
+        let OutboundImpl::Hysteria2(options) = outbound("hysteria2", server.clone()) else {
+            unreachable!()
+        };
+        let client = Arc::new(kotoconn_outbounds::hysteria2::Client::new(
+            Endpoint {
+                address: server.clone(),
+                resolver: Arc::new(SystemResolver),
+            },
+            Arc::new(PendingCarrier {
+                scope: root.clone(),
+                started,
+            }),
+            &options,
+        )?);
+        let caller = Scope::new();
+        let task_client = client.clone();
+        let task_scope = caller.clone();
+        let task =
+            tokio::spawn(
+                async move { Client::tcp(task_client.as_ref(), server, task_scope).await },
+            );
+        ready.recv().await.unwrap();
+        caller.close();
+        assert!(task.await?.is_err());
+        root.wait().await;
+        drop(client);
+        root.close();
         Ok::<_, anyhow::Error>(())
     })
     .await??;

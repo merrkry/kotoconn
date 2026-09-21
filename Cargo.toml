@@ -1,9 +1,11 @@
 [workspace]
 members = [
+    "crates/anytls",
     "crates/cli",
     "crates/config",
     "crates/daemon",
     "crates/http",
+    "crates/hysteria2",
     "crates/inbounds",
     "crates/naive",
     "crates/outbounds",
@@ -25,22 +27,28 @@ publish = false
 
 [workspace.dependencies]
 anyhow = "1.0.104"
+anytls = { version = "0.3.17", default-features = false, features = ["core"] }
 base64 = "0.22.1"
 bytes = "1.12.1"
+blake2 = "0.11.0"
 clap = "4.6.6"
 cronet = "=0.2.0"
 derive_more = "2.1.1"
 duplicate = "2.0.1"
 fast-socks5 = "1.0.0"
 futures-util = "0.3.34"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
 h2 = "0.4.19"
 
 hickory-proto = { version = "0.26.3", default-features = false }
 http = "1.5.0"
 httparse = "1.10.1"
 kotoconn-config = { path = "crates/config" }
+kotoconn-anytls = { path = "crates/anytls" }
 kotoconn-daemon = { path = "crates/daemon" }
 kotoconn-http = { path = "crates/http" }
+kotoconn-hysteria2 = { path = "crates/hysteria2" }
 kotoconn-inbounds = { path = "crates/inbounds" }
 kotoconn-naive = { path = "crates/naive" }
 kotoconn-outbounds = { path = "crates/outbounds" }
@@ -51,7 +59,12 @@ kotoconn-socks5 = { path = "crates/socks5" }
 kotoconn-tun = { path = "crates/tun" }
 kotoconn-typescript = { path = "crates/typescript" }
 oxc = { version = "0.149.0", default-features = false }
+parking_lot = "0.12.5"
 rand = "0.9.5"
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+quinn-proto = { version = "0.11.18", default-features = false }
+rustls = { version = "0.23.44", default-features = false, features = ["ring", "std", "tls12"] }
+sha2 = "0.11.0"
 rcgen = "0.14.10"
 rquickjs = "0.13.0"
 rustix = "1.1.4"
@@ -64,8 +77,9 @@ subtle = "2.6.1"
 tempfile = "3.27.0"
 thiserror = "2.0.20"
 tokio = "1.53.1"
-tokio-rustls = "0.26.5"
 tokio-util = "0.7.19"
+tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1.0.9"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 trybuild = "1.0.121"
