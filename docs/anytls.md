@@ -18,8 +18,9 @@ AnyTLS FIN's full-close semantics. Its bundled UoT datagram codec also uses SOCK
 family values rather than UoT's distinct family values. Tests cover the latter
 with independent wire vectors.
 
-A client reuses the newest idle TLS session before connecting again. Concurrent
-requests open separate TLS sessions. Each session assigns increasing stream IDs.
+A client reuses the TLS session that most recently became idle before connecting
+again. Concurrent requests open separate TLS sessions. Each session assigns
+increasing stream IDs.
 The default idle timeout is 60 seconds; `idle_session_timeout` can override it.
 Sessions never share state across configured clients. Dropping a logical stream
 releases its session; closing the carrier cancels all dependent sessions.
