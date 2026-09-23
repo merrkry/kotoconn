@@ -6,9 +6,7 @@ use tokio::{
 };
 
 fn peer() -> Command {
-    let executable = std::env::var_os("KOTOCONN_ANYTLS_GO")
-        .expect("set KOTOCONN_ANYTLS_GO to the built Go reference helper");
-    let mut command = Command::new(executable);
+    let mut command = Command::new("anytls-go-peer");
     command.kill_on_drop(true).stderr(Stdio::inherit());
     command
 }
@@ -24,7 +22,6 @@ fn certificates(fixture: &Fixture) -> Result<tempfile::TempDir> {
 }
 
 #[tokio::test]
-#[ignore = "requires the pinned Go reference helper; see docs/anytls.md"]
 async fn rust_client_interoperates_with_official_go_server() -> Result<()> {
     tokio::time::timeout(Duration::from_secs(20), async {
         let mut fixture = Fixture::new(None).await?;
@@ -126,7 +123,6 @@ async fn rust_client_interoperates_with_official_go_server() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires the pinned Go reference helper; see docs/anytls.md"]
 async fn official_go_client_interoperates_with_rust_server() -> Result<()> {
     tokio::time::timeout(Duration::from_secs(20), async {
         let fixture = Fixture::new(Some("stop=2\n0=40-40\n1=256-256")).await?;

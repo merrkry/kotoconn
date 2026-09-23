@@ -8,6 +8,7 @@ mise exec -- moon run workspace:test-e2e
 mise exec -- moon run docker:test -- socks5 nested
 mise exec -- moon run docker:test -- hysteria2 hysteria2-salamander
 mise exec -- moon run docker:test -- naive naive-nested naive-quic
+mise exec -- moon run docker:test -- anytls
 ```
 
 For Linux TUN changes, see [TUN verification](tun_support/README.md). For
@@ -16,6 +17,13 @@ performance comparisons, see [benchmarks](../benchmarks/README.md).
 When adding protocol coverage, edit [run.py](run.py) for scenarios and
 [traffic.py](traffic.py) for traffic assertions. Put exact parser and scheduling
 regressions in Rust tests; use e2e for interoperability and kernel integration.
+
+The AnyTLS suite runs the adapter against the pinned official Go session library
+in both directions. The task builds the Go peer and Rust test harness, then runs
+them in containers with only loopback networking. These scenarios run by default,
+including in CI, and cover connection reuse, padding updates, TCP and UDP. See
+[AnyTLS verification](../docs/anytls.md#verification) for details. Use
+`--anytls-image` to select a separately tagged interoperability image.
 
 The Naive suite tests HTTP/2 in both directions against the pinned sing-box
 image. `naive-nested` and `naive-quic` place the server on the SOCKS gateway's

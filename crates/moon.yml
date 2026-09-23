@@ -4,6 +4,7 @@ fileGroups:
     - /Cargo.toml
     - /Cargo.lock
     - /crates/**/*
+    - /e2e/anytls/**/*.rs
     - /external/smoltcp/**/*
     - /tools/rust.py
     - /tools/cronet.py
@@ -25,7 +26,7 @@ tasks:
     command: cargo fmt --all -- --check
   lint:
     inputs: ["@group(sources)"]
-    command: uv run --locked python tools/rust.py clippy --workspace --all-targets --locked -- -D warnings
+    command: uv run --locked python tools/rust.py clippy --workspace --all-targets --features kotoconn-anytls/interop-tests --locked -- -D warnings
     options:
       mutex: cargo
   test:
@@ -58,6 +59,12 @@ tasks:
     inputs: ["@group(sources)"]
     command: uv run --locked python tools/rust.py stage debug
     outputs: [/target/tun/debug/kotoconn, /target/tun/debug/kotoconn-tun-traffic, /target/tun/debug/libcronet.so]
+    options:
+      mutex: cargo
+  build-anytls-interop:
+    inputs: ["@group(sources)"]
+    command: uv run --locked python tools/rust.py stage-anytls-interop
+    outputs: [/target/anytls-interop/anytls-tests]
     options:
       mutex: cargo
   build-linux-release:

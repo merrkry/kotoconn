@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("target", choices=["app", "test-runtime"])
+    parser.add_argument("target", choices=["app", "test-runtime", "anytls-interop"])
     parser.add_argument("--tag", required=True)
     args = parser.parse_args()
     cache_root = os.environ.get("KOTOCONN_DOCKER_CACHE")

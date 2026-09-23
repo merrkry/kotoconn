@@ -9,6 +9,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 ENTRYPOINT ["kotoconn"]
 CMD ["--log-format", "json", "run", "--config", "/config/main.ts", "--shutdown-timeout", "3"]
 
+FROM runtime AS anytls-interop
+COPY target/anytls-interop/anytls-tests /usr/local/bin/anytls-tests
+COPY target/anytls-interop/anytls-go-peer /usr/local/bin/anytls-go-peer
+ENTRYPOINT ["anytls-tests"]
+
 FROM ghcr.io/astral-sh/uv:0.12.5 AS uv
 
 FROM runtime AS test-runtime
