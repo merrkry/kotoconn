@@ -55,7 +55,11 @@ connection per client. Closing either transport entry leaves the other usable.
 The last user releases the connection immediately, allowing scope completion
 and daemon shutdown without waiting for an idle pool timer. A later request
 establishes a new connection. Failed connections are replaced for new requests;
-existing TCP streams are never replayed.
+existing TCP streams are never replayed. Neither direction imposes a fixed count
+limit on Hysteria UDP associations. The client assigns increasing 32-bit session
+IDs and rejects new associations if that connection's ID space is exhausted,
+preventing collisions with previous IDs. The server expires idle associations
+using the inbound `udp_idle_timeout`, with a minimum retention of one second.
 
 Quinn's endpoint and connection drivers participate in scope cancellation and
 completion. Inbound TCP acknowledges admission before routing, consistently with
@@ -66,7 +70,7 @@ sessions remain separated by association and destination.
 Authentication failures and ordinary HTTP/3 requests receive an empty 404
 response. HTTP/3 control processing continues after authentication. Unknown or
 malformed Hysteria datagrams are discarded. The adapter bounds field lengths,
-concurrent streams, association counts, and reassembly memory. Reassembly holds
+concurrent streams and reassembly memory. Reassembly holds
 at most 64 incomplete packets and 256 KiB of payload per connection. Each
 received datagram removes incomplete packets older than ten seconds. UDP
 payloads larger than 65,507 bytes are discarded.

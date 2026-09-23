@@ -17,8 +17,6 @@ use tokio::{
     time::Instant,
 };
 
-const MAX_ASSOCIATIONS: usize = 4096;
-
 pub struct Registration {
     pub scope: Scope,
     pub reply: oneshot::Sender<Result<Datagram>>,
@@ -38,27 +36,6 @@ struct ServerAssociations {
 }
 
 impl ServerAssociations {
-    fn has_capacity(&mut self) -> bool {
-        if self.entries.len() < MAX_ASSOCIATIONS {
-            return true;
-        }
-
-        // Reclaim closed scopes before rejecting a new ID. Scan only under
-        // admission pressure; ordinary packet handling uses the activity index.
-        self.entries.retain(|id, association| {
-            if association.close.0.is_closed() {
-                let removed = self.activity.remove(&(association.active, *id));
-                debug_assert!(removed);
-                false
-            } else {
-                true
-            }
-        });
-        debug_assert_eq!(self.entries.len(), self.activity.len());
-
-        self.entries.len() < MAX_ASSOCIATIONS
-    }
-
     fn insert(&mut self, id: u32, association: Association) {
         self.remove(id);
         self.activity.insert((association.active, id));
@@ -143,8 +120,8 @@ pub async fn client(
                     return Ok(());
                 };
                 associations.retain(|_, value| !value.close.0.is_closed());
-                if associations.len() >= MAX_ASSOCIATIONS || next > u32::MAX as u64 {
-                    let _ = registration.reply.send(Err(anyhow::anyhow!("Hysteria UDP association limit")));
+                if next > u32::MAX as u64 {
+                    let _ = registration.reply.send(Err(anyhow::anyhow!("Hysteria UDP session ID space exhausted")));
                     continue;
                 }
                 if registration.reply.is_closed() || registration.scope.is_closed() {
@@ -280,9 +257,6 @@ pub async fn server(
                     associations.remove(id);
                 }
                 if !associations.entries.contains_key(&id) {
-                    if !associations.has_capacity() {
-                        continue;
-                    }
                     associations.insert(id, associate(&context, id, responses.clone())?);
                 }
 
@@ -336,47 +310,6 @@ mod tests {
             },
             scope,
         )
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn closed_association_frees_capacity_before_its_idle_deadline() {
-        let retention = Duration::from_secs(10);
-        let mut associations = ServerAssociations::default();
-        for id in 0..MAX_ASSOCIATIONS as u32 {
-            let (association, _) = association();
-            associations.insert(id, association);
-        }
-        let deadline = associations.next_expiry(retention).unwrap();
-        assert!(Instant::now() < deadline);
-        assert!(!associations.has_capacity());
-
-        associations.entries[&0].close.0.close();
-        assert!(associations.has_capacity());
-        assert!(!associations.entries.contains_key(&0));
-        assert!(!associations.activity.iter().any(|(_, id)| *id == 0));
-        assert_eq!(associations.entries.len(), MAX_ASSOCIATIONS - 1);
-        assert_eq!(associations.activity.len(), MAX_ASSOCIATIONS - 1);
-        assert_eq!(associations.next_expiry(retention), Some(deadline));
-        assert!(
-            associations
-                .entries
-                .values()
-                .all(|value| !value.close.0.is_closed())
-        );
-
-        let (replacement, replacement_scope) = association();
-        associations.insert(MAX_ASSOCIATIONS as u32, replacement);
-        assert!(!associations.has_capacity());
-        associations.expire(retention);
-        assert_eq!(associations.entries.len(), MAX_ASSOCIATIONS);
-        assert!(!replacement_scope.is_closed());
-
-        tokio::time::advance(retention).await;
-        associations.expire(retention);
-        assert!(replacement_scope.is_closed());
-        assert!(associations.entries.is_empty());
-        assert!(associations.activity.is_empty());
-        assert!(associations.has_capacity());
     }
 
     #[tokio::test(start_paused = true)]
