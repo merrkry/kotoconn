@@ -10,7 +10,20 @@ tasks:
     options:
       cache: false
   build:
-    deps: [build-app, build-runtime]
+    deps: [build-app, build-runtime, build-anytls]
+  build-anytls-peer:
+    command: go -C e2e/anytls/reference build -mod readonly -trimpath -o ../../../target/anytls-interop/anytls-go-peer .
+    env:
+      CGO_ENABLED: "0"
+      GOOS: linux
+      GOTOOLCHAIN: local
+    inputs: [/e2e/anytls/reference/**/*, /mise.toml, $KOTOCONN_BUILD_HOST]
+    outputs: [/target/anytls-interop/anytls-go-peer]
+  build-anytls:
+    command: uv run --locked python tools/docker.py anytls-interop --tag kotoconn-anytls-interop:local
+    deps: [rust:build-anytls-interop, build-anytls-peer]
+    options:
+      cache: false
   test:
     command: uv run --locked python e2e/run.py
     deps: [build]

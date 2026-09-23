@@ -4,6 +4,9 @@
 !e2e/Dockerfile
 !.python-version
 !target/
+!target/anytls-interop/
+!target/anytls-interop/anytls-tests
+!target/anytls-interop/anytls-go-peer
 !target/tun/
 !target/tun/debug/
 !target/tun/debug/kotoconn

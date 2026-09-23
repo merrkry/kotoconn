@@ -24,7 +24,8 @@ use tokio_util::{codec::FramedRead, sync::CancellationToken};
 
 const LIMIT: Duration = Duration::from_secs(10);
 
-#[path = "interop_tests.rs"]
+#[cfg(feature = "interop-tests")]
+#[path = "../../../e2e/anytls/interop.rs"]
 mod interop;
 
 struct Network {
@@ -97,6 +98,7 @@ struct Fixture {
     network: Arc<Network>,
     options: AnyTlsOutboundConfig,
     targets: mpsc::UnboundedReceiver<Target>,
+    #[cfg(feature = "interop-tests")]
     private_key: String,
 }
 
@@ -149,6 +151,7 @@ impl Fixture {
             network,
             options,
             targets: receive,
+            #[cfg(feature = "interop-tests")]
             private_key,
         })
     }

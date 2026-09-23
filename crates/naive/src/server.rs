@@ -9,7 +9,7 @@ use futures_util::future::BoxFuture;
 use h2::{RecvStream, SendStream};
 use http::{Method, Response, StatusCode};
 use kotoconn_config::NaiveInboundConfig;
-use kotoconn_protocol::{self as p, BoundServer, Scope, ServerContext};
+use kotoconn_protocol::{self as p, BoundServer, BoxStream, Scope, ServerContext};
 use std::{
     io,
     net::SocketAddr,
@@ -29,6 +29,43 @@ use tokio_rustls::{
         pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
     },
 };
+use tokio_util::sync::CancellationToken;
+
+type Connection = h2::server::Connection<tokio_rustls::server::TlsStream<BoxStream>, Bytes>;
+
+async fn handshake(
+    tls: TlsAcceptor,
+    io: BoxStream,
+    stopping: &CancellationToken,
+) -> Result<Option<Connection>> {
+    let handshake = async {
+        let tls = tls.accept(io).await?;
+        ensure!(
+            tls.get_ref().1.alpn_protocol() == Some(b"h2"),
+            "Naive requires HTTP/2 ALPN"
+        );
+
+        Ok::<_, anyhow::Error>(
+            h2::server::Builder::new()
+                .max_concurrent_streams(1024)
+                .max_header_list_size(16 * 1024)
+                .initial_window_size(8 * 1024 * 1024)
+                .initial_connection_window_size(32 * 1024 * 1024)
+                .handshake(tls)
+                .await?,
+        )
+    };
+
+    // Bound TLS and HTTP/2 peer I/O, and release unadmitted connections as soon
+    // as the listener stops instead of retaining them through the drain period.
+    tokio::select! {
+        biased;
+        _ = stopping.cancelled() => Ok(None),
+        result = tokio::time::timeout(std::time::Duration::from_secs(15), handshake) => {
+            Ok(Some(result??))
+        }
+    }
+}
 
 pub struct Server {
     tls: TlsAcceptor,
@@ -44,9 +81,12 @@ impl Server {
             "Naive requires a PEM certificate chain"
         );
         let key = PrivateKeyDer::from_pem_slice(options.private_key.as_bytes())?;
-        let mut tls = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certificates, key)?;
+        let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_single_cert(certificates, key)?;
         tls.alpn_protocols = vec![b"h2".to_vec()];
 
         Ok(Self {
@@ -89,16 +129,9 @@ impl p::Server for Server {
 
                         async move {
                             let _close = Close(scope.clone());
-                            let tls = tls.accept(io).await?;
-                            ensure!(
-                                tls.get_ref().1.alpn_protocol() == Some(b"h2"),
-                                "Naive requires HTTP/2 ALPN"
-                            );
-                            let mut connection = h2::server::Builder::new()
-                                .max_concurrent_streams(1024)
-                                .max_header_list_size(16 * 1024)
-                                .handshake(tls)
-                                .await?;
+                            let Some(mut connection) = handshake(tls, io, &stopping).await? else {
+                                return Ok(());
+                            };
 
                             let mut draining = false;
                             loop {
@@ -273,6 +306,64 @@ impl Drop for H2Io {
     fn drop(&mut self) {
         if !self.eof || !self.shutdown {
             self.send.send_reset(h2::Reason::CANCEL);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_rustls::TlsConnector;
+
+    fn tls_pair() -> (TlsAcceptor, TlsConnector) {
+        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let server = Server::new(&NaiveInboundConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            username: "user".into(),
+            password: "secret".into(),
+            certificate: certificate.cert.pem(),
+            private_key: certificate.signing_key.serialize_pem(),
+        })
+        .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate.cert.der().clone()).unwrap();
+        let mut client = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        client.alpn_protocols = vec![b"h2".to_vec()];
+        (server.tls, TlsConnector::from(Arc::new(client)))
+    }
+
+    #[tokio::test]
+    async fn stopping_cancels_tls_and_http2_handshakes() {
+        let (server, client) = tls_pair();
+        for complete_tls in [false, true] {
+            let (io, peer) = tokio::io::duplex(65536);
+            let stopping = CancellationToken::new();
+            let opening = handshake(server.clone(), Box::pin(io), &stopping);
+            tokio::pin!(opening);
+
+            let _peer = if complete_tls {
+                // Completing TLS proves the server has accepted the connection.
+                // Retain the peer without sending the HTTP/2 preface.
+                Some(tokio::select! {
+                    result = client.connect("localhost".try_into().unwrap(), peer) => result.unwrap(),
+                    _ = &mut opening => panic!("HTTP/2 preface has not been sent"),
+                })
+            } else {
+                assert!(futures_util::poll!(&mut opening).is_pending());
+                stopping.cancel();
+                assert!(opening.await.unwrap().is_none());
+                continue;
+            };
+            assert!(futures_util::poll!(&mut opening).is_pending());
+
+            stopping.cancel();
+            assert!(opening.await.unwrap().is_none());
         }
     }
 }

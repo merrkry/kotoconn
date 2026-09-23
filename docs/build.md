@@ -11,6 +11,8 @@ mise exec -- moon run workspace:check
 
 mise owns native tools, uv owns Python, and moon owns orchestration. Activate
 mise in your shell to omit `mise exec --` from subsequent commands.
+The pinned Go toolchain builds the official AnyTLS peer for e2e tests; moon builds
+it and the Rust test harness before packaging their interoperability container.
 
 ## Finding tasks
 

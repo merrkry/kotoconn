@@ -18,8 +18,9 @@ AnyTLS FIN's full-close semantics. Its bundled UoT datagram codec also uses SOCK
 family values rather than UoT's distinct family values. Tests cover the latter
 with independent wire vectors.
 
-A client reuses the newest idle TLS session before connecting again. Concurrent
-requests open separate TLS sessions. Each session assigns increasing stream IDs.
+A client reuses the TLS session that most recently became idle before connecting
+again. Concurrent requests open separate TLS sessions. Each session assigns
+increasing stream IDs.
 The default idle timeout is 60 seconds; `idle_session_timeout` can override it.
 Sessions never share state across configured clients. Dropping a logical stream
 releases its session; closing the carrier cancels all dependent sessions.
@@ -48,21 +49,23 @@ uses `k.anytls_inbound({ listen, password, tls: { certificate, private_key } })`
 
 ## Verification
 
-`moon run rust:test` includes adapter and daemon tests. The optional interoperability
-tests run the unmodified official Go session library pinned in
-`crates/anytls/tests/reference/go.mod`, with sing's UoT codec. They cover both
+`moon run rust:test` includes adapter and daemon tests. The default e2e suite also
+tests the adapter against the unmodified official Go session library pinned in
+`e2e/anytls/reference/go.mod`, with sing's UoT codec. These tests cover both
 directions, session reuse, padding updates across TLS connections, SYNACK failure,
 server-first TCP, and connected/datagram UDP with empty and large payloads.
 
-With Go 1.24 or newer available through mise, run from the repository root:
+To run just the AnyTLS scenarios from the repository root:
 
 ```sh
-mise exec -- go -C crates/anytls/tests/reference build -o "$PWD/target/anytls-go-peer" .
-KOTOCONN_ANYTLS_GO="$PWD/target/anytls-go-peer" mise exec -- uv run --locked python tools/rust.py test -p kotoconn-anytls interop -- --ignored
+mise exec -- moon run docker:test -- anytls
 ```
 
-The helper binds an ephemeral loopback port and prints readiness after binding.
-Tests generate certificates locally and terminate their child processes on exit.
+The task builds the Go peer with the mise-pinned toolchain and compiles the Rust
+test harness with `interop-tests`. Both run in an isolated container with no
+external network access. The helper binds an ephemeral loopback port and reports
+readiness after binding. Tests generate temporary certificates and terminate child
+processes on exit. Each direction's output is saved in its e2e artifact directory.
 
 References: [AnyTLS protocol](https://github.com/anytls/anytls-go/blob/main/docs/protocol.md),
 [sing-box UoT](https://sing-box.sagernet.org/configuration/shared/udp-over-tcp/),

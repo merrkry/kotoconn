@@ -1,6 +1,7 @@
 [tools]
 "github:moonrepo/moon" = "2.5.5"
 "github:rust-cross/cargo-zigbuild" = "0.23.4"
+go = "1.26.7"
 node = "24.19.0"
 pnpm = "11.25.0"
 rust = { version = "1.98.1", components = "clippy,rustfmt" }

@@ -1,4 +1,4 @@
-"""Run isolated Compose scenarios using only Python's standard library."""
+"""Run isolated protocol scenarios using only Python's standard library."""
 
 import argparse
 import concurrent.futures
@@ -12,6 +12,7 @@ import time
 import uuid
 from pathlib import Path
 
+import anytls
 import hysteria2
 from lifecycle import has_event
 
@@ -19,7 +20,7 @@ LOGGER = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent
 KEY = "AAECAwQFBgcICQoLDA0ODw=="
-PROTOCOLS = ("http", "socks5", "shadowsocks2022", "naive") + hysteria2.SUITES
+PROTOCOLS = ("http", "socks5", "shadowsocks2022", "naive", "anytls") + hysteria2.SUITES
 SUITES = (*PROTOCOLS, "naive-nested", "naive-quic", "nested", "typescript")
 
 
@@ -439,6 +440,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("suites", nargs="*", choices=SUITES)
     parser.add_argument("--image", default="kotoconn-e2e:local")
+    parser.add_argument("--anytls-image", default="kotoconn-anytls-interop:local")
     parser.add_argument(
         "--compose",
         default="docker compose",
@@ -447,7 +449,7 @@ def main():
     parser.add_argument(
         "--engine",
         default="docker",
-        help="Engine command used for inspecting exit status",
+        help="Container engine command",
     )
     parser.add_argument(
         "--jobs",
@@ -470,7 +472,9 @@ def main():
 
     signal.signal(signal.SIGTERM, interrupted)
     scenarios = [
-        Scenario(args, suite, direction)
+        anytls.Scenario(args, direction)
+        if suite == "anytls"
+        else Scenario(args, suite, direction)
         for suite in (args.suites or SUITES)
         for direction in (("client", "server") if suite in PROTOCOLS else ("both",))
     ]

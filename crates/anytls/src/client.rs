@@ -30,8 +30,41 @@ impl Drop for Slot {
 #[derive(Default)]
 struct Pool {
     sessions: BTreeMap<u64, Slot>,
+    idle: Vec<u64>,
     sequence: u64,
     draining: bool,
+}
+
+impl Pool {
+    fn prune(&mut self, timeout: Duration) {
+        self.sessions.retain(|_, slot| {
+            !slot.handle.closed.is_cancelled()
+                && slot
+                    .idle_since
+                    .is_none_or(|since| since.elapsed() < timeout)
+        });
+        self.idle.retain(|id| self.sessions.contains_key(id));
+    }
+
+    fn reuse(&mut self, timeout: Duration) -> Option<Arc<Handle>> {
+        self.prune(timeout);
+        let id = self.idle.pop()?;
+        // SAFETY: prune retains only IDs present in sessions, under the pool lock.
+        let slot = self.sessions.get_mut(&id).expect("idle session");
+        debug_assert!(slot.idle_since.is_some());
+        slot.idle_since = None;
+        Some(slot.handle.clone())
+    }
+
+    fn mark_idle(&mut self, id: u64) {
+        if self.draining {
+            self.sessions.remove(&id);
+        } else if let Some(slot) = self.sessions.get_mut(&id) {
+            debug_assert!(slot.idle_since.is_none());
+            slot.idle_since = Some(Instant::now());
+            self.idle.push(id);
+        }
+    }
 }
 
 pub struct Client {
@@ -78,12 +111,7 @@ impl Client {
                 let Some(pool) = cleaning.upgrade() else {
                     return Ok(());
                 };
-                pool.lock().sessions.retain(|_, slot| {
-                    !slot.handle.closed.is_cancelled()
-                        && slot
-                            .idle_since
-                            .is_none_or(|since| since.elapsed() < idle_timeout)
-                });
+                pool.lock().prune(idle_timeout);
             }
         })?;
         Ok(Self {
@@ -105,23 +133,7 @@ impl Client {
 
     async fn connect(&self, address: Bytes, work: WorkGuard) -> Result<BoxStream> {
         self.carrier.capabilities().require(Capabilities::TCP)?;
-        let reusable = {
-            let mut pool = self.pool.lock();
-            pool.sessions.retain(|_, slot| {
-                !slot.handle.closed.is_cancelled()
-                    && slot
-                        .idle_since
-                        .is_none_or(|since| since.elapsed() < self.idle_timeout)
-            });
-            pool.sessions
-                .values_mut()
-                .rev()
-                .find(|slot| slot.idle_since.is_some())
-                .map(|slot| {
-                    slot.idle_since = None;
-                    slot.handle.clone()
-                })
-        };
+        let reusable = self.pool.lock().reuse(self.idle_timeout);
         let session = match reusable {
             Some(session) => session,
             None => self.new_session().await?,
@@ -171,12 +183,7 @@ impl Client {
         let idle_pool = Arc::downgrade(&self.pool);
         let idle = Box::new(move || {
             if let Some(pool) = idle_pool.upgrade() {
-                let mut pool = pool.lock();
-                if pool.draining {
-                    pool.sessions.remove(&sequence);
-                } else if let Some(slot) = pool.sessions.get_mut(&sequence) {
-                    slot.idle_since = Some(Instant::now());
-                }
+                pool.lock().mark_idle(sequence);
             }
         });
         let handle = Session::start(
@@ -211,6 +218,7 @@ impl p::Client for Client {
         let mut pool = self.pool.lock();
         pool.draining = true;
         pool.sessions.retain(|_, slot| slot.idle_since.is_none());
+        pool.idle.clear();
         self.cleanup_stop.cancel();
     }
 
@@ -232,5 +240,57 @@ impl p::Client for Client {
             let stream = self.open(address.into(), scope.clone()).await?;
             udp::start(stream, Some(destination), scope)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn reuse_follows_idle_order_even_when_timestamps_match() {
+        let scope = Scope::new();
+        let mut pool = Pool::default();
+        let mut peers = Vec::new();
+        for id in 1..=2 {
+            let (io, peer) = tokio::io::duplex(1024);
+            peers.push(peer);
+            let session = scope.child();
+            let (padding, _) = watch::channel(PaddingFactory::default());
+            let handle = Session::start(io, &session, padding, None, None, None).unwrap();
+            pool.sessions.insert(
+                id,
+                Slot {
+                    handle,
+                    scope: session,
+                    idle_since: None,
+                },
+            );
+        }
+
+        let older = pool.sessions[&1].handle.clone();
+        let newer = pool.sessions[&2].handle.clone();
+        pool.mark_idle(2);
+        pool.mark_idle(1);
+        assert_eq!(pool.sessions[&1].idle_since, pool.sessions[&2].idle_since);
+        let timeout = Duration::from_secs(60);
+        assert!(Arc::ptr_eq(&pool.reuse(timeout).unwrap(), &older));
+        assert!(Arc::ptr_eq(&pool.reuse(timeout).unwrap(), &newer));
+        assert!(pool.reuse(timeout).is_none());
+
+        pool.mark_idle(1);
+        pool.mark_idle(2);
+        newer.closed.cancel();
+        assert!(Arc::ptr_eq(&pool.reuse(timeout).unwrap(), &older));
+        assert!(pool.idle.is_empty());
+        assert!(!pool.sessions.contains_key(&2));
+
+        pool.mark_idle(1);
+        tokio::time::advance(timeout).await;
+        assert!(pool.reuse(timeout).is_none());
+        assert!(pool.sessions.is_empty());
+        assert!(pool.idle.is_empty());
+        scope.close();
+        scope.wait().await;
     }
 }

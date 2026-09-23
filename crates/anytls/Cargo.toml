@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+interop-tests = []
+
 [dependencies]
 anyhow.workspace = true
 anytls.workspace = true
