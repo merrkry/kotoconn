@@ -1,62 +1,44 @@
-//! Always-ready I/O must leave opportunities for reverse traffic and cancellation.
+//! Always-ready I/O must yield so other tasks can run and cancel it.
 use kotoconn_protocol::{Scope, queue, stream_buffer};
 use std::cell::Cell;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    sync::Notify,
-};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const BACKLOG: usize = 8192;
 
 #[tokio::test]
-async fn busy_datagram_forwarding_allows_reverse_traffic_and_cancellation() {
-    let (source, mut incoming) = queue::channel(1024 * 1024, |_: &usize| 0);
-    let (outgoing, _sink) = queue::channel(1024 * 1024, |_: &usize| 0);
-    let (replies, mut reverse) = queue::channel(1024, |_: &usize| 0);
-    for index in 0..BACKLOG {
-        source.try_send(index).unwrap();
+async fn ready_queue_receives_and_sends_allow_cancellation() {
+    for receiving in [true, false] {
+        let (tx, mut rx) = queue::channel(1024 * 1024, |_: &usize| 0);
+        if receiving {
+            for index in 0..BACKLOG {
+                tx.try_send(index).unwrap();
+            }
+        }
+        let scope = Scope::new();
+        let completed = Cell::new(0);
+        let transfer = scope.run(async {
+            for index in 0..BACKLOG {
+                // Exercise each direction alone: a send must not hide a receive
+                // that never yields, or vice versa.
+                if receiving {
+                    assert_eq!(rx.recv().await, Some(index));
+                } else {
+                    tx.send(index).await?;
+                }
+                completed.set(completed.get() + 1);
+            }
+            Ok(())
+        });
+        let cancel = async {
+            assert!(
+                completed.get() > 0 && completed.get() < BACKLOG,
+                "receiving={receiving}"
+            );
+            scope.close();
+        };
+        let (result, ()) = tokio::join!(biased; transfer, cancel);
+        assert!(result.is_err());
     }
-    replies.try_send(42).unwrap();
-    let scope = Scope::new();
-    let started = Notify::new();
-    let forwarded = Cell::new(0);
-
-    let forward = scope.run(async {
-        while let Some(packet) = incoming.recv().await {
-            outgoing.send(packet).await?;
-            forwarded.set(forwarded.get() + 1);
-            started.notify_one();
-        }
-        Ok(())
-    });
-    let backward = async {
-        started.notified().await;
-        assert_eq!(reverse.recv().await, Some(42));
-        assert!(forwarded.get() > 0 && forwarded.get() < BACKLOG);
-        scope.close();
-    };
-    let (result, ()) = tokio::join!(forward, backward);
-    assert!(result.is_err());
-}
-
-#[tokio::test]
-async fn ready_sends_yield_without_waiting_for_a_full_queue() {
-    let (tx, _rx) = queue::channel(1024 * 1024, |_: &usize| 0);
-    let scope = Scope::new();
-    let sent = Cell::new(0);
-    let sender = scope.run(async {
-        for index in 0..BACKLOG {
-            tx.send(index).await?;
-            sent.set(sent.get() + 1);
-        }
-        Ok(())
-    });
-    let cancel = async {
-        assert!(sent.get() > 0 && sent.get() < BACKLOG);
-        scope.close();
-    };
-    let (result, ()) = tokio::join!(biased; sender, cancel);
-    assert!(result.is_err());
 }
 
 #[tokio::test]

@@ -480,7 +480,12 @@ async fn capability_checks_and_udp_policy_contract_reject_invalid_requests() -> 
         assert!(socks.capabilities().tcp);
         assert!(!socks.capabilities().udp);
         // Fails before any connection attempt or fallback to system UDP.
-        assert!(socks.udp(target("127.0.0.1:2".parse()?)).await.is_err());
+        let error = socks
+            .udp(target("127.0.0.1:2".parse()?))
+            .await
+            .err()
+            .expect("TCP-only carrier must reject UDP");
+        assert!(error.to_string().contains("carrier lacks required capabilities"), "{error:#}");
         let source = r#"
             import { kotoconn as k } from '@kotoconn/bindings';
             const resolver = k.resolve_handler(name => k.lookup(name));

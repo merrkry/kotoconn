@@ -329,6 +329,10 @@ mod tests {
                 args.port = echo.local_addr().unwrap().port();
                 let (ports, reservations) = reserve_ports(args.source).await;
                 args.udp_source_ports = Some(ports);
+                let reserved_ports: Vec<_> = reservations
+                    .iter()
+                    .map(|socket| socket.local_addr().unwrap().port())
+                    .collect();
 
                 // Observe the real source tuples, including every wraparound.
                 // Different round counts let flows progress and finish independently.
@@ -345,7 +349,7 @@ mod tests {
                         let sequence = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
                         assert_eq!(
                             peer.port(),
-                            ports.partition(2, flow).unwrap().port(sequence)
+                            reserved_ports[flow as usize * 2 + (sequence % 2) as usize]
                         );
                         seen[flow as usize].insert(peer);
                         assert_eq!(echo.send_to(&bytes[..size], peer).await.unwrap(), size);

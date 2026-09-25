@@ -76,7 +76,6 @@ mod tests {
     #[test]
     fn source_port_cycles_stay_disjoint_when_flows_advance_independently() {
         let ports: SourcePorts = "50000-50063".parse().unwrap();
-        ports.validate(8).unwrap();
         let mut all = std::collections::HashSet::new();
         for flow in 0..8 {
             let cycle = ports.partition(8, flow).unwrap();
@@ -95,8 +94,12 @@ mod tests {
         assert_eq!(all.len(), 64);
 
         let edge: SourcePorts = "65520-65535".parse().unwrap();
-        edge.validate(8).unwrap();
         assert_eq!(edge.partition(8, 7).unwrap().port(u64::MAX), 65535);
+
+        let full: SourcePorts = "1-65535".parse().unwrap();
+        assert_eq!(full.partition(3, 0).unwrap().port(0), 1);
+        assert_eq!(full.partition(3, 2).unwrap().port(21844), 65535);
+        assert_eq!(full.partition(3, 2).unwrap().port(21845), 43691);
     }
 
     #[test]
@@ -106,19 +109,15 @@ mod tests {
         }
         let ports: SourcePorts = "50000-50063".parse().unwrap();
         for connections in [0, 3, 33, 65] {
-            assert!(ports.validate(connections).is_err());
+            assert!(
+                ports.partition(connections, 0).is_err(),
+                "connections={connections}"
+            );
         }
-    }
 
-    #[test]
-    fn partitions_validate_before_use() {
-        let ports: SourcePorts = "1-65535".parse().unwrap();
-        assert!(ports.partition(0, 0).is_err());
-        assert!(ports.partition(3, 3).is_err());
-        assert!(ports.partition(3, u64::MAX).is_err());
-        assert_eq!(ports.partition(3, 0).unwrap().port(0), 1);
-        assert_eq!(ports.partition(3, 2).unwrap().port(21844), 65535);
-        assert_eq!(ports.partition(3, 2).unwrap().port(21845), 43691);
+        for flow in [8, u64::MAX] {
+            assert!(ports.partition(8, flow).is_err(), "flow={flow}");
+        }
         assert!(
             "65535-65535"
                 .parse::<SourcePorts>()

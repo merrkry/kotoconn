@@ -468,57 +468,7 @@ async fn cancellation_waits_for_release_and_leaves_other_streams_usable() -> Res
 }
 
 #[tokio::test]
-async fn received_fin_is_not_echoed_and_heartbeats_continue() -> Result<()> {
-    tokio::time::timeout(LIMIT, async {
-        let fixture = Fixture::new(None).await?;
-        let tls = fixture.raw().await?;
-        let (reader, mut writer) = tokio::io::split(tls);
-        let mut frames = FramedRead::new(reader, wire::Frames);
-        let settings = format!(
-            "v=2\nclient=kotoconn-test\npadding-md5={}",
-            PaddingFactory::default().md5()
-        );
-        writer
-            .write_all(&Frame::with_data(Command::Settings, 0, settings.into()).to_bytes()?)
-            .await?;
-        for sid in [1, 2] {
-            for frame in [
-                Frame::new(Command::Syn, sid),
-                Frame::with_data(
-                    Command::Psh,
-                    sid,
-                    wire::address(&target("127.0.0.1:80".parse()?))?.into(),
-                ),
-            ] {
-                writer.write_all(&frame.to_bytes()?).await?;
-            }
-            writer.flush().await?;
-            loop {
-                let frame = frames.next().await.unwrap()?;
-                if frame.cmd == Command::Psh {
-                    assert_eq!(frame.sid, sid);
-                    assert_eq!(&frame.data[..], b"ready");
-                    break;
-                }
-            }
-            writer
-                .write_all(&Frame::new(Command::Fin, sid).to_bytes()?)
-                .await?;
-            writer
-                .write_all(&Frame::new(Command::HeartRequest, 0).to_bytes()?)
-                .await?;
-            writer.flush().await?;
-            // The heartbeat is a protocol barrier after FIN, without a delay.
-            assert_eq!(frames.next().await.unwrap()?.cmd, Command::HeartResponse);
-        }
-        fixture.close().await;
-        Ok::<_, anyhow::Error>(())
-    })
-    .await?
-}
-
-#[tokio::test]
-async fn closing_one_multiplexed_stream_preserves_the_other() -> Result<()> {
+async fn received_fin_preserves_siblings_and_heartbeats_without_being_echoed() -> Result<()> {
     tokio::time::timeout(LIMIT, async {
         let fixture = Fixture::new(None).await?;
         let tls = fixture.raw().await?;
@@ -558,6 +508,13 @@ async fn closing_one_multiplexed_stream_preserves_the_other() -> Result<()> {
             .write_all(&Frame::new(Command::Fin, 1).to_bytes()?)
             .await?;
         writer
+            .write_all(&Frame::new(Command::HeartRequest, 0).to_bytes()?)
+            .await?;
+        writer.flush().await?;
+        // The heartbeat follows FIN on the wire, so an echoed FIN fails this read.
+        assert_eq!(frames.next().await.unwrap()?.cmd, Command::HeartResponse);
+
+        writer
             .write_all(&Frame::with_data(Command::Psh, 2, Bytes::from_static(b"alive")).to_bytes()?)
             .await?;
         writer.flush().await?;
@@ -565,6 +522,16 @@ async fn closing_one_multiplexed_stream_preserves_the_other() -> Result<()> {
         assert_eq!(reply.sid, 2);
         assert_eq!(reply.cmd, Command::Psh);
         assert_eq!(&reply.data[..], b"alive");
+
+        writer
+            .write_all(&Frame::new(Command::Fin, 2).to_bytes()?)
+            .await?;
+        writer
+            .write_all(&Frame::new(Command::HeartRequest, 0).to_bytes()?)
+            .await?;
+        writer.flush().await?;
+        assert_eq!(frames.next().await.unwrap()?.cmd, Command::HeartResponse);
+
         fixture.close().await;
         Ok::<_, anyhow::Error>(())
     })
