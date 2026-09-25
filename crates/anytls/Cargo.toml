@@ -27,5 +27,5 @@ webpki-roots.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
+rcgen.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util", "process"] }
