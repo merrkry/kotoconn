@@ -81,8 +81,9 @@ impl Server {
             "Naive requires a PEM certificate chain"
         );
         let key = PrivateKeyDer::from_pem_slice(options.private_key.as_bytes())?;
+
         let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
+            rustls::crypto::aws_lc_rs::default_provider(),
         ))
         .with_safe_default_protocol_versions()?
         .with_no_client_auth()
@@ -327,14 +328,16 @@ mod tests {
         .unwrap();
         let mut roots = rustls::RootCertStore::empty();
         roots.add(certificate.cert.der().clone()).unwrap();
+
         let mut client = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
+            rustls::crypto::aws_lc_rs::default_provider(),
         ))
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_root_certificates(roots)
         .with_no_client_auth();
         client.alpn_protocols = vec![b"h2".to_vec()];
+
         (server.tls, TlsConnector::from(Arc::new(client)))
     }
 

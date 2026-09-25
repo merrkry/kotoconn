@@ -24,11 +24,13 @@ pub(crate) fn client(
         }
     }
 
-    let config =
-        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+    let config = ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+
     Ok((TlsConnector::from(Arc::new(config)), name))
 }
 
@@ -36,12 +38,15 @@ pub(crate) fn server(options: &TlsServerConfig) -> Result<TlsAcceptor> {
     let certificates = certificates(&options.certificate)?;
     let key = PrivateKeyDer::from_pem_slice(options.private_key.as_bytes())
         .context("invalid TLS private key PEM")?;
-    let config =
-        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()?
-            .with_no_client_auth()
-            .with_single_cert(certificates, key)
-            .context("invalid TLS certificate or mismatched private key")?;
+
+    let config = ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .with_no_client_auth()
+    .with_single_cert(certificates, key)
+    .context("invalid TLS certificate or mismatched private key")?;
+
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 

@@ -14,6 +14,9 @@ mise in your shell to omit `mise exec --` from subsequent commands.
 The pinned Go toolchain builds the official AnyTLS peer for e2e tests; moon builds
 it and the Rust test harness before packaging their interoperability container.
 
+Rust TLS, QUIC, and test certificate generation use `aws-lc-rs`, shared with
+Shadowsocks.
+
 ## Finding tasks
 
 Use `moon tasks` to discover tasks. Names follow `scope:action[-variant]`,
