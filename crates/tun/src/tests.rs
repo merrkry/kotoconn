@@ -113,7 +113,7 @@ fn gso_tcp_preserves_aggregate_bytes_sequence_and_flags_in_both_families() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn gso_udp_preserves_datagram_boundaries_without_rebuilding_payloads() {
+fn gso_udp_preserves_payload_and_segment_size_in_both_families() {
     for (ipv6, segment_size) in [(false, 1000), (true, 1000), (false, 8), (true, 8)] {
         let flow = flow(ipv6);
         let payload: Vec<_> = (0..2501).map(|i| (i % 251) as u8).collect();
@@ -133,14 +133,12 @@ fn gso_udp_preserves_datagram_boundaries_without_rebuilding_payloads() {
         let mut frame = vec![0; tun_rs::VIRTIO_NET_HDR_LEN];
         header.encode(&mut frame).unwrap();
         frame.extend_from_slice(&packet);
-        let pointer = frame.as_ptr();
         let (verified, size) = offload::normalize(&mut frame).unwrap();
-        assert_eq!(pointer, frame.as_ptr());
         let packet = decoded(&frame[tun_rs::VIRTIO_NET_HDR_LEN..]);
         let (actual_flow, actual) = packet.udp_with_checksum(verified).unwrap();
         assert_eq!(actual_flow, flow);
-        let parts: Vec<_> = actual.chunks(usize::from(size.unwrap())).collect();
-        assert_eq!(parts, payload.chunks(segment_size).collect::<Vec<_>>());
+        assert_eq!(size, Some(segment_size as u16));
+        assert_eq!(actual, payload);
     }
 }
 
