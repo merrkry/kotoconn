@@ -42,10 +42,8 @@ Before editing `external/smoltcp`, follow the [stable fork branch workflow](exte
 
 ## Verification
 
-Use static checks; start a dev server or preview only when explicitly asked.
+Run all toolchain commands through `mise exec --`. Moon is the task runner.
 
-- Run tools through `mise exec --`, or activate mise in the shell. See [build orchestration](docs/build.md) when changing tasks, tool versions, caches, containers or CI.
-- TypeScript: run `pnpm run format` and `pnpm run check` before finishing.
-- Rust: run `moon run rust:format`, `moon run rust:lint`, and `moon run rust:test` separately. Keep Rust checks out of `package.json`.
-- Python: run `moon run python:check`.
-- To refresh generated editor types, run `pnpm run generate-bindings`.
+During development, run checks appropriate to the change. Before finishing, run the full standard checks with `mise exec -- moon run workspace:check`. Use `workspace:ci` when e2e and benchmark smoke tests are also needed. Read Moon configuration and language toolchain files for other tasks and options.
+
+Read [build orchestration](docs/build.md) when changing tasks, tool versions, caches, containers or CI.
