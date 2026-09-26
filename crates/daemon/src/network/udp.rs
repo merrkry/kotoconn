@@ -13,22 +13,34 @@ impl Drop for Entry {
     }
 }
 
-pub(super) async fn association(handler: SessionHandler, mut packets: Datagram) -> Result<()> {
+pub(super) fn association(
+    handler: SessionHandler,
+    mut packets: Datagram,
+) -> BoxFuture<'static, Result<()>> {
     if let Some(target) = packets.single_target.take() {
-        let incoming = packets.take_receiver();
-        let worker = packets.worker.take();
-        return packets
-            .scope
-            .run(session(
-                handler,
-                target,
-                incoming,
-                packets.tx.clone(),
-                packets.scope.clone(),
-                worker,
-            ))
-            .await;
+        // Select the driver before constructing its future. Otherwise every TUN
+        // association retains the larger multi-target dispatch state while idle.
+        Box::pin(async move {
+            let incoming = packets.take_receiver();
+            let worker = packets.worker.take();
+            packets
+                .scope
+                .run(session(
+                    handler,
+                    target,
+                    incoming,
+                    packets.tx.clone(),
+                    packets.scope.clone(),
+                    worker,
+                ))
+                .await
+        })
+    } else {
+        Box::pin(route_packets(handler, packets))
     }
+}
+
+async fn route_packets(handler: SessionHandler, mut packets: Datagram) -> Result<()> {
     let mut sessions = HashMap::<Target, Entry>::new();
     let (completed, mut completions) = mpsc::unbounded_channel();
     let mut generation = 0;
