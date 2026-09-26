@@ -133,25 +133,51 @@ impl Carrier for Clients {
             })?;
             let scope = self.udp.child().tracked_by(&caller);
             let transport = scope.run(self.protocol.udp(target, scope.clone())).await?;
-            let lower = transport.scope.clone();
-            let control = scope.clone();
-            struct Close(Scope);
-            impl Drop for Close {
-                fn drop(&mut self) {
-                    self.0.close();
-                }
-            }
-            let close = Close(lower.clone());
-            scope.spawn(async move {
-                let close = close;
-                lower.cancelled().await;
-                control.close();
-                drop(close);
-                Ok(())
-            })?;
+            follow_datagram(scope, transport.scope.clone())?;
             Ok(transport)
         })
     }
+
+    fn udp_native_scoped(
+        &self,
+        target: Target,
+        caller: Scope,
+    ) -> BoxFuture<'_, Result<Option<NativeDatagram>>> {
+        Box::pin(async move {
+            self.capabilities().require(Capabilities {
+                tcp: false,
+                udp: true,
+            })?;
+            let scope = self.udp.child().tracked_by(&caller);
+            let transport = scope
+                .run(self.protocol.udp_native(target, scope.clone()))
+                .await?;
+            if let Some(transport) = &transport {
+                follow_datagram(scope, transport.scope.clone())?;
+            }
+            Ok(transport)
+        })
+    }
+}
+
+fn follow_datagram(scope: Scope, lower: Scope) -> Result<()> {
+    struct Close(Scope);
+
+    impl Drop for Close {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
+
+    let close = Close(lower.clone());
+    let control = scope.clone();
+    scope.spawn(async move {
+        let close = close;
+        lower.cancelled().await;
+        control.close();
+        drop(close);
+        Ok(())
+    })
 }
 
 struct Direct(Arc<dyn Carrier>);
@@ -167,5 +193,13 @@ impl Client for Direct {
 
     fn udp(&self, target: Target, scope: Scope) -> BoxFuture<'_, Result<Datagram>> {
         self.0.udp_scoped(target, scope)
+    }
+
+    fn udp_native(
+        &self,
+        target: Target,
+        scope: Scope,
+    ) -> BoxFuture<'_, Result<Option<NativeDatagram>>> {
+        self.0.udp_native_scoped(target, scope)
     }
 }

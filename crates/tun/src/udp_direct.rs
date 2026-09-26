@@ -106,7 +106,7 @@ impl Direct {
             flow: transfer.id.0,
             io: transfer.io,
             pending,
-            received: Vec::with_capacity(32),
+            received: Vec::new(),
             received_offset: 0,
             bytes,
             capacity: queue::Capacity::new(queue::INITIAL_BYTES),

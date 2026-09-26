@@ -90,7 +90,7 @@ struct TcpEntry {
 }
 
 struct UdpEntry {
-    packets: queue::Sender<p::Packet>,
+    packets: Option<queue::Sender<p::Packet>>,
     activity: p::Activity,
     scope: Scope,
     generation: u64,
@@ -457,7 +457,7 @@ impl Worker {
                         .checked_add(1)
                         .expect("TUN connection generation exhausted");
                     let scope = self.context.scope.child();
-                    let (mut association, driver) = p::packet_pair(scope.clone());
+                    let (mut association, mut driver) = p::packet_pair(scope.clone());
                     association.single_target = Some(p::target(flow.destination));
                     association.worker = Some(Arc::new(crate::udp_direct::Handoff {
                         id: (flow, self.generation),
@@ -465,6 +465,11 @@ impl Worker {
                         scope: scope.clone(),
                     }));
                     let packets = driver.tx.clone();
+                    let replies = driver.take_receiver();
+                    // The worker task owns association shutdown. Retain only the
+                    // reply receiver so native handoff can free the ingress queue.
+                    driver.disarm();
+                    drop(driver);
                     let activity = p::Activity::default();
                     let clock = activity.clone();
                     let handler = self.context.handler.clone();
@@ -481,7 +486,7 @@ impl Worker {
 
                     scope.spawn(async move {
                         let _completion = completion;
-                        let replies = udp_replies(flow, driver, output, reply_activity);
+                        let replies = udp_replies(flow, replies, output, reply_activity);
                         tokio::select! {
                             _ = stopping.cancelled() => {},
                             _ = clock.until_idle(idle) => {},
@@ -495,7 +500,7 @@ impl Worker {
                     self.udp.insert(
                         flow,
                         UdpEntry {
-                            packets,
+                            packets: Some(packets),
                             direct: None,
                             blocked: false,
                             activity,
@@ -531,7 +536,10 @@ impl Worker {
                         }
                         continue;
                     }
-                    let Ok(permit) = entry.packets.try_reserve(payload.len()) else {
+                    // SAFETY: Only this worker installs direct I/O and removes
+                    // its old queue. The direct branch above handles that state.
+                    let packets = entry.packets.as_ref().expect("queued UDP transport");
+                    let Ok(permit) = packets.try_reserve(payload.len()) else {
                         self.stats.capacity_drops += 1;
                         return Ok(());
                     };
@@ -648,6 +656,7 @@ pub(crate) async fn dispatch<R: PacketReceive>(
             Some(transfer) = transfer_events.recv() => {
                 if let Some(entry) = worker.udp.get_mut(&transfer.id.0).filter(|entry| entry.generation == transfer.id.1 && !entry.scope.is_closed()) {
                     entry.direct = Some(crate::udp_direct::Direct::new(transfer, worker.ready.clone()));
+                    entry.packets = None;
                 }
                 continue;
             },
@@ -727,12 +736,12 @@ pub(crate) async fn dispatch<R: PacketReceive>(
 
 async fn udp_replies(
     flow: Flow,
-    mut driver: p::Datagram,
+    mut replies: queue::Receiver<p::Packet>,
     output: queue::Sender<Transmit>,
     activity: p::Activity,
 ) -> Result<()> {
-    let mut batch = Vec::with_capacity(32);
-    while driver.rx.recv_many(&mut batch, 32).await != 0 {
+    let mut batch = Vec::new();
+    while replies.recv_many(&mut batch, 32).await != 0 {
         let mut pending = batch.drain(..).peekable();
         while let Some(packet) = pending.next() {
             let Ok(source) = p::socket_addr(&packet.target) else {

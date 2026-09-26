@@ -146,6 +146,16 @@ async fn session(
         client
             .control(TransportProtocol::Udp)
             .run(async {
+                if let Some(worker) = &worker
+                    && let Some(native) = client
+                        .udp_native_scoped(destination.clone(), scope.clone())
+                        .await?
+                {
+                    worker
+                        .transfer(native.io, incoming, activity.clone())
+                        .await?;
+                    return Ok(());
+                }
                 let mut outgoing = client.udp_scoped(destination, scope.clone()).await?;
                 if let Some(worker) = worker
                     && let Some(native) = outgoing.take_native().await?
