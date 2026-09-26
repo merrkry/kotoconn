@@ -96,6 +96,10 @@ impl Scope {
 
     pub fn spawn(&self, work: impl Future<Output = Result<()>> + Send + 'static) -> Result<()> {
         let guard = self.track()?;
+        // Keep large driver futures out of the surrounding cancellation task.
+        // The driver has one allocation for its lifetime, independent of the
+        // number of supervision layers that retain its completion state.
+        let work = Box::pin(work);
 
         let scope = self.clone();
         tokio::spawn(
