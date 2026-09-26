@@ -15,13 +15,12 @@ pub fn fill(bytes: &mut [u8], seed: u64, flow: u64, sequence: u64, direction: u6
         ^ word(direction ^ 0x589965cc75374cc3);
     // Fixed-size chunks let LLVM vectorize the full words. Handle the tail
     // separately so odd payload lengths retain the same wire pattern.
-    let words = bytes.len() / 8;
-    let mut chunks = bytes.chunks_exact_mut(8);
-    for (index, chunk) in chunks.by_ref().enumerate() {
+    let (chunks, tail) = bytes.as_chunks_mut::<8>();
+    let words = chunks.len();
+    for (index, chunk) in chunks.iter_mut().enumerate() {
         let value = word(key.wrapping_add((offset / 8 + index) as u64)).to_le_bytes();
-        chunk.copy_from_slice(&value);
+        *chunk = value;
     }
-    let tail = chunks.into_remainder();
     let value = word(key.wrapping_add((offset / 8 + words) as u64)).to_le_bytes();
     tail.copy_from_slice(&value[..tail.len()]);
 }

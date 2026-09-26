@@ -142,6 +142,7 @@ def run(args):
             "traffic_workers": args.traffic_workers,
             "udp_echo_batch": args.udp_echo_batch,
             "udp_server_receive_buffer": args.udp_server_receive_buffer,
+            "udp_rate_per_flow": args.udp_rate,
         },
         "runs": [],
     }
