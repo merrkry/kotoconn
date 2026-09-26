@@ -325,8 +325,7 @@ async fn transmit<W: PacketSend>(
     let mut sent_bytes = 0u64;
 
     while input.recv_many(&mut items, 64).await != 0 {
-        let mut pending = items.drain(..).peekable();
-        while let Some(item) = pending.next() {
+        for item in items.drain(..) {
             match item {
                 Transmit::Packet(packet) => packets.push(packet),
                 Transmit::TcpGso {
@@ -347,53 +346,50 @@ async fn transmit<W: PacketSend>(
                     sent_bytes +=
                         packet.len() as u64 + payload.iter().map(|p| p.len() as u64).sum::<u64>();
                 }
-                Transmit::Datagram {
+                Transmit::Datagrams {
                     source,
                     destination,
                     payload,
                 } => {
-                    let size = payload.len();
-                    if device.udp_gso()
-                        && size != 0
-                        && encoder.can_offload(source, destination, size)
-                    {
-                        debug_assert!(parts.is_empty());
-                        parts.push(payload);
-                        while parts.len() < 64 && (parts.len() + 1) * size <= 65507 {
-                            if !matches!(pending.peek(), Some(Transmit::Datagram { source: s, destination: d, payload: p })
-                                if *s == source && *d == destination && p.len() == size)
-                            {
-                                break;
-                            }
-                            // SAFETY: peek established this item's variant; no other
-                            // consumer can modify the local batch iterator.
-                            let Some(Transmit::Datagram { payload, .. }) = pending.next() else {
-                                unreachable!()
-                            };
+                    let mut pending = payload.into_iter().peekable();
+                    while let Some(payload) = pending.next() {
+                        let size = payload.len();
+                        if device.udp_gso()
+                            && size != 0
+                            && encoder.can_offload(source, destination, size)
+                        {
+                            debug_assert!(parts.is_empty());
                             parts.push(payload);
+                            while parts.len() < 64 && (parts.len() + 1) * size <= 65507 {
+                                if !pending.peek().is_some_and(|payload| payload.len() == size) {
+                                    break;
+                                }
+                                // SAFETY: peek found a payload in this local iterator.
+                                parts.push(pending.next().expect("peeked UDP payload"));
+                            }
+                            // SAFETY: The first size was validated and aggregation stops
+                            // before exceeding the IPv4 limit, also valid for IPv6.
+                            let header = encoder
+                                .header(source, destination, size, size * parts.len())
+                                .expect("validated UDP aggregate");
+                            if !packets.is_empty() {
+                                device.send_batch(&packets).await?;
+                                sent_packets += packets.len() as u64;
+                                sent_bytes += packets.iter().map(|p| p.len() as u64).sum::<u64>();
+                                packets.clear();
+                            }
+                            device
+                                .send_udp_segments(&header, &parts, size as u16)
+                                .await?;
+                            sent_packets += parts.len() as u64;
+                            sent_bytes += (header.len() * parts.len() + size * parts.len()) as u64;
+                            parts.clear();
+                            continue;
                         }
-                        // SAFETY: The first size was validated and aggregation stops
-                        // before exceeding the IPv4 limit, also valid for IPv6.
-                        let header = encoder
-                            .header(source, destination, size, size * parts.len())
-                            .expect("validated UDP aggregate");
-                        if !packets.is_empty() {
-                            device.send_batch(&packets).await?;
-                            sent_packets += packets.len() as u64;
-                            sent_bytes += packets.iter().map(|p| p.len() as u64).sum::<u64>();
-                            packets.clear();
+                        let datagram = encoder.encode(source, destination, &payload);
+                        if let Some(datagram) = datagram {
+                            packets.extend(datagram);
                         }
-                        device
-                            .send_udp_segments(&header, &parts, size as u16)
-                            .await?;
-                        sent_packets += parts.len() as u64;
-                        sent_bytes += (header.len() * parts.len() + size * parts.len()) as u64;
-                        parts.clear();
-                        continue;
-                    }
-                    let datagram = encoder.encode(source, destination, &payload);
-                    if let Some(datagram) = datagram {
-                        packets.extend(datagram);
                     }
                 }
             }
@@ -441,10 +437,15 @@ mod tests {
             for (port, output) in [(443, output0), (8443, output1)] {
                 let source = std::net::SocketAddr::new(source.ip(), port);
                 output
-                    .send(Transmit::Datagram {
+                    .send(Transmit::Datagrams {
                         source,
                         destination,
-                        payload: vec![7; 2500].into(),
+                        payload: vec![
+                            Bytes::new(),
+                            vec![7; 2500].into(),
+                            vec![3; 17].into(),
+                            vec![9; 2500].into(),
+                        ],
                     })
                     .await
                     .unwrap();
@@ -458,16 +459,25 @@ mod tests {
         let mut complete = Vec::new();
         while let Ok(packet) = received.try_recv() {
             let header = smoltcp::wire::Ipv4Packet::new_checked(&packet).unwrap();
-            if header.frag_offset() == 0 {
+            if header.frag_offset() == 0 && header.more_frags() {
                 assert!(ids.insert(header.ident()));
             }
             if let Some(packet) = decoder.decode(&packet, Instant::now()) {
                 complete.push(packet.into_owned());
             }
         }
-        assert_eq!(complete.len(), 2);
-        for packet in complete {
-            assert_eq!(packet.udp().unwrap().1, vec![7; 2500]);
+        assert_eq!(complete.len(), 8);
+        for port in [443, 8443] {
+            let payloads: Vec<_> = complete
+                .iter()
+                .map(|packet| packet.udp().unwrap())
+                .filter(|(flow, _)| flow.source.port() == port)
+                .map(|(_, payload)| payload.to_vec())
+                .collect();
+            assert_eq!(
+                payloads,
+                [vec![], vec![7; 2500], vec![3; 17], vec![9; 2500]]
+            );
         }
     }
 }

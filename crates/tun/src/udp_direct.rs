@@ -150,7 +150,7 @@ impl Direct {
     ) -> Progress {
         let mut completed = false;
         let mut progress = Progress::Idle;
-        while let Some(packet) = self.received.get_mut(self.received_offset) {
+        while let Some(packet) = self.received.get(self.received_offset) {
             let flow = p::socket_addr(&packet.target)
                 .ok()
                 .and_then(|source| udp::reply_flow(self.flow, source));
@@ -158,7 +158,20 @@ impl Direct {
                 self.received_offset += 1;
                 continue;
             };
-            let cost = packet.payload.len() + 48;
+
+            // Keep the native receive batch together through the output queue.
+            // Limit both descriptors and bytes so a GRO batch cannot monopolize
+            // the writer or turn one queue reservation into unbounded storage.
+            let mut count = 1;
+            let mut cost = packet.payload.len() + 48;
+            for next in self.received[self.received_offset + 1..].iter().take(63) {
+                let next_cost = next.payload.len() + 48;
+                if next.target != packet.target || cost + next_cost > 65536 {
+                    break;
+                }
+                count += 1;
+                cost += next_cost;
+            }
             let permit = match output.try_reserve(cost) {
                 Ok(permit) => permit,
                 Err(queue::Error::Full) => {
@@ -170,12 +183,17 @@ impl Direct {
                     break;
                 }
             };
-            permit.send(Transmit::Datagram {
+            let end = self.received_offset + count;
+            let payload = self.received[self.received_offset..end]
+                .iter_mut()
+                .map(|packet| std::mem::take(&mut packet.payload))
+                .collect();
+            permit.send(Transmit::Datagrams {
                 source,
                 destination,
-                payload: std::mem::take(&mut packet.payload),
+                payload,
             });
-            self.received_offset += 1;
+            self.received_offset = end;
             completed = true;
         }
         if completed {
@@ -343,7 +361,14 @@ mod tests {
                 id: (flow, 1),
                 io: Box::new(Replies {
                     sent,
-                    replies: vec![packet(vec![]), packet(vec![3])],
+                    replies: vec![
+                        packet(vec![]),
+                        packet(vec![3]),
+                        p::Packet {
+                            target: p::target("198.51.100.2:3000".parse().unwrap()),
+                            payload: vec![4].into(),
+                        },
+                    ],
                 }),
                 incoming,
                 activity: p::Activity::default(),
@@ -371,15 +396,21 @@ mod tests {
             direct.poll(&output, &activity),
             Progress::Blocked(_)
         ));
-        let Transmit::Datagram { payload, .. } = packets.try_recv().unwrap() else {
+        let Transmit::Datagrams { payload, .. } = packets.try_recv().unwrap() else {
             panic!()
         };
-        assert!(payload.is_empty());
+        assert_eq!(payload.len(), 2);
+        assert!(payload[0].is_empty());
+        assert_eq!(payload[1], [3][..]);
         assert!(matches!(direct.poll(&output, &activity), Progress::Idle));
-        let Transmit::Datagram { payload, .. } = packets.try_recv().unwrap() else {
+        let Transmit::Datagrams {
+            source, payload, ..
+        } = packets.try_recv().unwrap()
+        else {
             panic!()
         };
-        assert_eq!(payload, [3][..]);
+        assert_eq!(source, "198.51.100.2:3000".parse().unwrap());
+        assert_eq!(payload, [bytes::Bytes::from_static(&[4])]);
         assert!(packets.try_recv().is_err());
         drop(direct);
         completion.await.unwrap();

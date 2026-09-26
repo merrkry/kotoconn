@@ -815,7 +815,7 @@ impl transmit::Transmit {
     fn packet(self) -> Vec<u8> {
         match self {
             Self::Packet(packet) => packet.to_vec(),
-            Self::Datagram { .. } | Self::TcpGso { .. } => panic!("expected ordinary TCP packet"),
+            Self::Datagrams { .. } | Self::TcpGso { .. } => panic!("expected ordinary TCP packet"),
         }
     }
 }

@@ -733,20 +733,31 @@ async fn udp_replies(
 ) -> Result<()> {
     let mut batch = Vec::with_capacity(32);
     while driver.rx.recv_many(&mut batch, 32).await != 0 {
-        for packet in batch.drain(..) {
+        let mut pending = batch.drain(..).peekable();
+        while let Some(packet) = pending.next() {
             let Ok(source) = p::socket_addr(&packet.target) else {
                 continue;
             };
             let Some((source, destination)) = udp::reply_flow(flow, source) else {
                 continue;
             };
-            // One queued item owns the whole datagram. Only this association waits
-            // for capacity; shared ingress keeps receiving other connections.
+            let mut bytes = packet.payload.len() + 48;
+            let mut payload = vec![packet.payload];
+            while let Some(next) = pending.peek() {
+                if next.target != packet.target || bytes + next.payload.len() + 48 > 65536 {
+                    break;
+                }
+                bytes += next.payload.len() + 48;
+                // SAFETY: peek found this packet in the local receive batch.
+                payload.push(pending.next().expect("peeked UDP reply").payload);
+            }
+            // Only this association waits for output capacity; shared ingress
+            // keeps receiving other connections while the whole batch is pending.
             output
-                .send(Transmit::Datagram {
+                .send(Transmit::Datagrams {
                     source,
                     destination,
-                    payload: packet.payload,
+                    payload,
                 })
                 .await?;
         }

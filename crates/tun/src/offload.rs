@@ -101,7 +101,6 @@ impl PacketReceive for Receiver {
         cx: &mut Context<'_>,
         buffer: &mut ReceiveBuffer,
     ) -> Poll<io::Result<Received>> {
-        ready!(self.device.poll_readable(cx))?;
         let offload = self.device.tcp_gso();
         let length = MAX_IP_PACKET + if offload { VIRTIO_NET_HDR_LEN } else { 0 };
         let lease = buffer
