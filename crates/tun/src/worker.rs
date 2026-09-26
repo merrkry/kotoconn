@@ -14,7 +14,6 @@ use smoltcp::wire::{IpProtocol, TcpControl};
 use std::{
     collections::{BTreeMap, VecDeque},
     future::poll_fn,
-    hash::BuildHasher,
     sync::Arc,
 };
 use tokio::{sync::mpsc, time::Instant};

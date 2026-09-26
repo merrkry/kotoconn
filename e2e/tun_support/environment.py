@@ -134,16 +134,18 @@ def enter(args, script, category, *, sysctls=None):
         if binary is None:
             continue
         binary = binary.resolve(strict=True)
-        target = f"/inputs/{option}"
+        target = (
+            f"/inputs/{option}/kotoconn"
+            if option in ("binary", "baseline")
+            else f"/inputs/{option}"
+        )
         argv += ["--mount", f"type=bind,source={binary},target={target},readonly"]
-        if option == "binary":
+        if option in ("binary", "baseline"):
             native = binary.with_name("libcronet.so")
             if native.is_file():
                 argv += [
                     "--mount",
-                    f"type=bind,source={native},target=/inputs/libcronet.so,readonly",
-                    "--env",
-                    "LD_LIBRARY_PATH=/inputs",
+                    f"type=bind,source={native},target={Path(target).with_name('libcronet.so')},readonly",
                 ]
         overrides += ["--" + option.replace("_", "-"), target]
     argv += [
@@ -320,6 +322,16 @@ class Process:
         self.log.close()
 
 
+def daemon_environment(binary):
+    # Each saved binary must load its own native library, including a baseline
+    # with a different Cronet ABI. Never inherit another candidate's library path.
+    return dict(
+        os.environ,
+        RUST_LOG="info,kotoconn_tun=debug",
+        LD_LIBRARY_PATH=str(binary.parent),
+    )
+
+
 class Daemon(Process):
     def __init__(
         self,
@@ -349,7 +361,7 @@ class Daemon(Process):
         super().__init__(
             argv,
             directory / "daemon.log",
-            env=dict(os.environ, RUST_LOG="info,kotoconn_tun=debug"),
+            env=daemon_environment(binary),
         )
         try:
             self.event("daemon_ready")

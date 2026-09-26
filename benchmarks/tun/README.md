@@ -15,8 +15,8 @@ the same CPU allowance as Kotoconn. Collect a reference baseline deliberately; o
 this option for routine candidate measurements.
 
 Use `--baseline /path/to/previous/kotoconn` to measure an earlier Kotoconn build
-in the same run. Preserve its adjacent `libcronet.so`; use builds with the same
-Cronet ABI. Baseline, candidate and optional sing-box samples share the generator
+in the same run. Preserve its adjacent `libcronet.so`; each binary loads its own
+copy. Baseline, candidate and optional sing-box samples share the generator
 binary and alternate execution order. Keep the old proxy binary separate from
 the build output so a rebuild cannot replace it during measurement.
 

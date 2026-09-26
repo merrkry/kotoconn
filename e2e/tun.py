@@ -17,6 +17,7 @@ from e2e.tun_support.environment import (
     Daemon,
     add_arguments,
     configure_network,
+    daemon_environment,
     digest,
     enter,
     network_snapshot,
@@ -141,6 +142,7 @@ def lifecycle(args):
         capture_output=True,
         timeout=15,
         check=False,
+        env=daemon_environment(args.binary),
     )
     (directory / "daemon.log").write_text(result.stderr)
     assert result.returncode != 0 and "already exists" in result.stderr, result.stderr
