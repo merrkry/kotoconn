@@ -10,7 +10,8 @@ mise exec -- moon run benchmark:test-udp-churn
 
 Use `--help` for workload filters and measurement options. To compare against a
 caller-supplied sing-box 1.15 binary with the go TUN stack, pass
-`--sing-box /path/to/sing-box`. Collect a reference baseline deliberately; omit
+`--sing-box /path/to/sing-box`. The reference enables multi-queue TUN, using
+the same CPU allowance as Kotoconn. Collect a reference baseline deliberately; omit
 this option for routine candidate measurements.
 
 ## Comparing results
