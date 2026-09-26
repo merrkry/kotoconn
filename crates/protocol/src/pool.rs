@@ -1,27 +1,21 @@
 //! Reusable initialized blocks shared by payload and packet producers.
 use bytes::Bytes;
-use crossbeam_queue::SegQueue;
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
+use crossbeam_queue::ArrayQueue;
+use std::sync::Arc;
 
-const CLASSES: usize = 18;
+const MIN_CLASS: u32 = 8;
+const CLASSES: usize = 10;
 const CACHED_PER_CLASS: usize = 32;
-
-#[derive(Default)]
-struct Class {
-    blocks: SegQueue<Vec<u8>>,
-    cached: AtomicUsize,
-}
 
 /// Free blocks are a bounded cache, never an admission limit for live data.
 #[derive(Clone)]
-pub struct Pool(Arc<[Class; CLASSES]>);
+pub struct Pool(Arc<[ArrayQueue<Vec<u8>>; CLASSES]>);
 
 impl Default for Pool {
     fn default() -> Self {
-        Self(Arc::new(std::array::from_fn(|_| Class::default())))
+        Self(Arc::new(std::array::from_fn(|_| {
+            ArrayQueue::new(CACHED_PER_CLASS)
+        })))
     }
 }
 
@@ -39,16 +33,9 @@ impl AsRef<[u8]> for Lease {
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        let class = &self.pool.0[self.class];
-        if class
-            .cached
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                (n < CACHED_PER_CLASS).then_some(n + 1)
-            })
-            .is_ok()
-        {
-            class.blocks.push(std::mem::take(&mut self.bytes));
-        }
+        // The queue itself bounds the free cache. A full cache drops this block
+        // without a second atomic counter or allocating queue segments.
+        let _ = self.pool.0[self.class].push(std::mem::take(&mut self.bytes));
     }
 }
 
@@ -94,13 +81,10 @@ impl Pool {
         // SAFETY: All callers request at most a maximum IP frame plus headers.
         assert!(length <= 131072);
         let capacity = length.max(256).next_power_of_two();
-        let index = capacity.trailing_zeros() as usize;
+        let index = (capacity.trailing_zeros() - MIN_CLASS) as usize;
         let class = &self.0[index];
-        let mut bytes = match class.blocks.pop() {
-            Some(bytes) => {
-                class.cached.fetch_sub(1, Ordering::Relaxed);
-                bytes
-            }
+        let mut bytes = match class.pop() {
+            Some(bytes) => bytes,
             None => Vec::with_capacity(capacity),
         };
         bytes.resize(length, 0);
@@ -119,9 +103,7 @@ impl Pool {
 
     pub fn trim(&self) {
         for class in self.0.iter() {
-            while class.blocks.pop().is_some() {
-                class.cached.fetch_sub(1, Ordering::Relaxed);
-            }
+            while class.pop().is_some() {}
         }
     }
 }
@@ -137,7 +119,7 @@ mod tests {
         let view = bytes.slice(123..456);
         let ptr = bytes.as_ptr();
         drop(bytes);
-        assert_eq!(pool.0[10].cached.load(Ordering::Relaxed), 0);
+        assert!(pool.0.iter().all(ArrayQueue::is_empty));
         assert_eq!(view, [7; 333][..]);
         drop(view);
         let reused = pool.copy(&[9; 1000]);
@@ -145,6 +127,6 @@ mod tests {
         assert_eq!(reused, [9; 1000][..]);
         drop(reused);
         pool.trim();
-        assert_eq!(pool.0[10].cached.load(Ordering::Relaxed), 0);
+        assert!(pool.0.iter().all(ArrayQueue::is_empty));
     }
 }

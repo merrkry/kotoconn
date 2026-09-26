@@ -9,6 +9,7 @@ rustix = { workspace = true, features = ["net"] }
 tun-rs = { workspace = true, features = ["async_tokio"] }
 
 [dependencies]
+ahash = "0.8.12"
 anyhow.workspace = true
 bytes.workspace = true
 crossbeam-queue = "0.3"

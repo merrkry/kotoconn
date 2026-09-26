@@ -3,11 +3,11 @@ use crate::{
     udp,
     worker::{self, Shared},
 };
+use ahash::RandomState;
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use bytes::Bytes;
 use kotoconn_protocol::{ServerContext, queue};
 use std::{
-    collections::hash_map::RandomState,
     future::poll_fn,
     io,
     sync::Arc,

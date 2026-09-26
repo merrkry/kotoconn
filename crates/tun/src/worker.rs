@@ -5,13 +5,14 @@ use crate::{
     transmit::Transmit,
     udp,
 };
+use ahash::{AHashMap as HashMap, RandomState};
 use anyhow::Result;
 #[cfg(test)]
 use bytes::Bytes;
 use kotoconn_protocol::{self as p, Scope, ServerContext, queue};
 use smoltcp::wire::{IpProtocol, TcpControl};
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque, hash_map::RandomState},
+    collections::{BTreeMap, VecDeque},
     future::poll_fn,
     hash::BuildHasher,
     sync::Arc,
