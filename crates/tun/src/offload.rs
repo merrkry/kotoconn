@@ -8,8 +8,8 @@ use std::{
     task::{Context, Poll, ready},
 };
 use tun_rs::{
-    AsyncDevice, VIRTIO_NET_HDR_GSO_TCPV4, VIRTIO_NET_HDR_GSO_TCPV6, VIRTIO_NET_HDR_GSO_UDP_L4,
-    VIRTIO_NET_HDR_LEN, VirtioNetHdr,
+    AsyncDevice, SyncDevice, VIRTIO_NET_HDR_GSO_TCPV4, VIRTIO_NET_HDR_GSO_TCPV6,
+    VIRTIO_NET_HDR_GSO_UDP_L4, VIRTIO_NET_HDR_LEN, VirtioNetHdr,
 };
 
 const MAX_IP_PACKET: usize = 65575;
@@ -61,7 +61,9 @@ fn split(device: AsyncDevice) -> (Receiver, Sender) {
     )
 }
 
-pub(crate) fn queues(device: AsyncDevice) -> io::Result<Vec<(Receiver, Sender)>> {
+pub(crate) fn queues(
+    device: SyncDevice,
+) -> io::Result<Vec<impl FnOnce() -> io::Result<(Receiver, Sender)> + Send>> {
     let count = match std::thread::available_parallelism() {
         Ok(count) => count.get(),
         Err(error) => {
@@ -72,10 +74,13 @@ pub(crate) fn queues(device: AsyncDevice) -> io::Result<Vec<(Receiver, Sender)>>
     let mut queues = Vec::with_capacity(count);
     // Keep the original descriptor at index zero, matching Linux queue indices.
     for _ in 1..count {
-        queues.push(split(device.try_clone()?));
+        queues.push(device.try_clone()?);
     }
-    queues.insert(0, split(device));
-    Ok(queues)
+    queues.insert(0, device);
+    Ok(queues
+        .into_iter()
+        .map(|device| move || Ok(split(AsyncDevice::new(device)?)))
+        .collect())
 }
 
 impl PacketReceive for Receiver {

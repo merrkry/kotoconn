@@ -24,7 +24,7 @@ The adapter proxies unicast TCP and UDP over IPv4 and IPv6. smoltcp handles TCP 
 
 ICMP echo forwarding, multicast, source routing, IPsec and unsupported IPv6 extension chains are filtered. Supported IPv6 options are those accepted by smoltcp's option parser with an action that permits processing to continue. Linux TUN offload is enabled when the kernel supports it. TCP GSO aggregates enter smoltcp as complete large segments with their verified checksum metadata. UDP GSO retains shared payload views with individual datagram boundaries. Output uses vectored TCP/UDP GSO when supported. After policy routing, eligible native sockets execute in the flow's worker; other outbounds use the same chunk and datagram contracts.
 
-For queue ownership, TCP scheduling and shutdown, see [ADR 0009](../../docs/adr/0009-independent-tun-connection-drivers.md). For overload behavior, adaptive queues and packet storage, see [TUN buffering](../../docs/tun-buffering.md).
+Each Linux queue has its own runtime and I/O driver. Policy runs on the shared JavaScript thread; native forwarding runs in the queue's worker after routing. For queue ownership, TCP scheduling, extension points and shutdown, see [ADR 0009](../../docs/adr/0009-independent-tun-connection-drivers.md). For overload behavior, adaptive queues and packet storage, see [TUN buffering](../../docs/tun-buffering.md).
 
 Run the protocol tests with:
 

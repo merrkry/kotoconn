@@ -158,13 +158,47 @@ impl Drop for ConnectionGuard {
     }
 }
 
+struct WorkerRuntimes(Vec<tokio::runtime::Runtime>);
+
+impl Drop for WorkerRuntimes {
+    fn drop(&mut self) {
+        // run joins or aborts the queue tasks before returning. Background
+        // shutdown also makes dropping an aborted endpoint safe inside Tokio.
+        for runtime in self.0.drain(..) {
+            runtime.shutdown_background();
+        }
+    }
+}
+
 /// Own queue workers until TCP drains or cancellation stops device I/O.
 /// Queue membership stays fixed so established flow ownership cannot migrate.
 pub async fn run<R: PacketReceive + 'static, W: PacketSend + 'static>(
     queues: Vec<(R, W)>,
     mtu: usize,
-    mut context: ServerContext,
+    context: ServerContext,
 ) -> Result<()> {
+    run_workers(
+        queues.into_iter().map(|queue| move || Ok(queue)).collect(),
+        mtu,
+        context,
+        false,
+    )
+    .await
+}
+
+/// Open each queue inside its owning runtime so its readiness driver and native
+/// connections stay on that worker. Portable callers can use the current runtime.
+pub(crate) async fn run_workers<R, W, Q>(
+    queues: Vec<Q>,
+    mtu: usize,
+    mut context: ServerContext,
+    dedicated: bool,
+) -> Result<()>
+where
+    R: PacketReceive + 'static,
+    W: PacketSend + 'static,
+    Q: FnOnce() -> io::Result<(R, W)> + Send + 'static,
+{
     ensure!(
         (1280..=65535).contains(&mtu),
         "TUN MTU must be between 1280 and 65535"
@@ -189,41 +223,54 @@ pub async fn run<R: PacketReceive + 'static, W: PacketSend + 'static>(
     // Each writer owns its packet storage; only atomic fragment IDs are shared.
     let encoder = udp::Encoder::new(mtu);
     let mut workers: JoinSet<Result<()>> = JoinSet::new();
+    let mut runtimes = WorkerRuntimes(Vec::new());
     let count = queues.len();
-    for (id, ((read, write), inbox)) in queues.into_iter().zip(receivers).enumerate() {
+    for (id, (open, inbox)) in queues.into_iter().zip(receivers).enumerate() {
         let (output, packets) = queue::channel(queue::INITIAL_BYTES, Transmit::size);
-        let gso = write.tcp_gso();
         let state = shared.clone();
         let context = context.clone();
         let encoder = encoder.clone();
-        workers.spawn(
-            async move {
-                // RX and TX progress independently, but share one queue's task and wakeup.
-                // Other queues run in parallel; a pending writer does not stop this receiver.
-                tokio::try_join!(
-                    async {
-                        worker::dispatch(
-                            id,
-                            read,
-                            inbox,
-                            state,
-                            crate::tcp::Link { mtu, gso },
-                            context,
-                            output,
-                        )
+        let work = async move {
+            let (read, write) = open().with_context(|| format!("open TUN queue {id}"))?;
+            let gso = write.tcp_gso();
+            // RX and TX progress independently, but share one queue's task and wakeup.
+            // Other queues run in parallel; a pending writer does not stop this receiver.
+            tokio::try_join!(
+                async {
+                    worker::dispatch(
+                        id,
+                        read,
+                        inbox,
+                        state,
+                        crate::tcp::Link { mtu, gso },
+                        context,
+                        output,
+                    )
+                    .await
+                    .with_context(|| format!("TUN receive queue {id}"))
+                },
+                async {
+                    transmit(id, write, packets, encoder)
                         .await
-                        .with_context(|| format!("TUN receive queue {id}"))
-                    },
-                    async {
-                        transmit(id, write, packets, encoder)
-                            .await
-                            .with_context(|| format!("TUN transmit queue {id}"))
-                    },
-                )?;
-                Ok(())
-            }
-            .in_current_span(),
-        );
+                        .with_context(|| format!("TUN transmit queue {id}"))
+                },
+            )?;
+            Ok(())
+        }
+        .in_current_span();
+        if dedicated {
+            // A runtime owns this long-lived thread. Keeping it out of the
+            // caller's blocking pool leaves that pool available for DNS and I/O.
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name(format!("tun-queue-{id}"))
+                .enable_all()
+                .build()?;
+            workers.spawn_on(work, runtime.handle());
+            runtimes.0.push(runtime);
+        } else {
+            workers.spawn(work);
+        }
     }
 
     let result = async {
