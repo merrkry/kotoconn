@@ -547,8 +547,77 @@ async fn tcp_admits_without_application_io_and_preserves_half_close() {
     }
 }
 
+struct ShortWrites {
+    socket: tokio::net::TcpStream,
+    pause: bool,
+}
+
+impl tokio::io::AsyncRead for ShortWrites {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        out: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.socket).poll_read(cx, out)
+    }
+}
+
+impl tokio::io::AsyncWrite for ShortWrites {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::pin::Pin::new(&mut self.socket).poll_write(cx, &bytes[..bytes.len().min(3)])
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[io::IoSlice<'_>],
+    ) -> std::task::Poll<io::Result<usize>> {
+        if std::mem::take(&mut self.pause) {
+            cx.waker().wake_by_ref();
+            return std::task::Poll::Pending;
+        }
+        let mut prefix = [0; 3];
+        let mut count = 0;
+        for part in bytes {
+            let n = part.len().min(prefix.len() - count);
+            prefix[count..count + n].copy_from_slice(&part[..n]);
+            count += n;
+        }
+        let result = std::pin::Pin::new(&mut self.socket).poll_write(cx, &prefix[..count]);
+        self.pause = result.is_ready();
+        result
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.socket).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.socket).poll_shutdown(cx)
+    }
+}
+
+impl kotoconn_protocol::Stream for ShortWrites {
+    fn poll_direct(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<bool>> {
+        std::task::Poll::Ready(Ok(true))
+    }
+}
+
 #[tokio::test]
-async fn direct_handoff_preserves_prequeued_bytes_half_close_and_counts() {
+async fn direct_handoff_preserves_prequeued_bytes_partial_writes_half_close_and_counts() {
     for ipv6 in [false, true] {
         tokio::time::timeout(Duration::from_secs(5), async {
             let (stream, packets, mut replies, driver, server_seq) = accepted(ipv6).await;
@@ -560,24 +629,47 @@ async fn direct_handoff_preserves_prequeued_bytes_half_close_and_counts() {
                 .await
                 .unwrap();
             let (mut peer, _) = listener.accept().await.unwrap();
+            let mut sequence = 101;
+            for bytes in [b"he".as_slice(), b"llo", b" wo", b"rld"] {
+                packets
+                    .send(segment(
+                        flow(ipv6),
+                        sequence,
+                        Some(server_seq),
+                        TcpControl::None,
+                        bytes,
+                    ))
+                    .await
+                    .unwrap();
+                sequence += bytes.len() as i32;
+            }
             packets
                 .send(segment(
                     flow(ipv6),
-                    101,
+                    sequence,
                     Some(server_seq),
                     TcpControl::Fin,
-                    b"hello",
+                    &[],
                 ))
                 .await
                 .unwrap();
             let relay = tokio::spawn(async move {
                 let mut stream: kotoconn_protocol::BoxStream = Box::pin(stream);
-                kotoconn_protocol::relay(&mut stream, Box::pin(socket)).await
+                // Force accepted prefixes to end both inside a block and across
+                // block boundaries before FIN can shut down the socket.
+                kotoconn_protocol::relay(
+                    &mut stream,
+                    Box::pin(ShortWrites {
+                        socket,
+                        pause: false,
+                    }),
+                )
+                .await
             });
             let remote = tokio::spawn(async move {
                 let mut data = Vec::new();
                 peer.read_to_end(&mut data).await.unwrap();
-                assert_eq!(data, b"hello");
+                assert_eq!(data, b"hello world");
                 peer.write_all(b"world").await.unwrap();
                 peer.shutdown().await.unwrap();
             });
@@ -589,7 +681,13 @@ async fn direct_handoff_preserves_prequeued_bytes_half_close_and_counts() {
                 let fin = repr.control == TcpControl::Fin;
                 let end = repr.seq_number + repr.payload.len() + usize::from(fin);
                 packets
-                    .send(segment(flow(ipv6), 107, Some(end.0), TcpControl::None, &[]))
+                    .send(segment(
+                        flow(ipv6),
+                        sequence + 1,
+                        Some(end.0),
+                        TcpControl::None,
+                        &[],
+                    ))
                     .await
                     .unwrap();
                 if fin {
@@ -597,7 +695,7 @@ async fn direct_handoff_preserves_prequeued_bytes_half_close_and_counts() {
                 }
             }
             assert_eq!(received, b"world");
-            assert_eq!(relay.await.unwrap().unwrap(), (5, 5));
+            assert_eq!(relay.await.unwrap().unwrap(), (11, 5));
             remote.await.unwrap();
             // The data contract completed; stop this fixture's TIME_WAIT owner.
             driver.abort();
