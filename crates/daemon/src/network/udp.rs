@@ -135,7 +135,9 @@ async fn session(
     tracing::debug!("session started");
 
     let activity = p::Activity::default();
-    let work = async {
+    // Keep the relay state in one allocation instead of embedding it in each
+    // enclosing cancellation and idle-timeout future.
+    let work = Box::pin(async {
         let decision = handler
             .policy
             .route(
@@ -200,7 +202,7 @@ async fn session(
                 tokio::select! { result = forward => result, result = backward => result }
             })
             .await
-    };
+    });
     tokio::select! {
         biased;
         _ = activity.until_idle(handler.idle) => {
