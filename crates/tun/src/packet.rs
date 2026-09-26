@@ -1,7 +1,8 @@
 //! Validate and normalize IP before allocating transport state. Reassembly is
 //! shared by TCP and UDP, including fragmented initial SYNs.
+use ahash::AHashMap as HashMap;
 use smoltcp::{phy::ChecksumCapabilities, wire::*};
-use std::{borrow::Cow, collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{borrow::Cow, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::time::Instant;
 
 pub(crate) const REASSEMBLY_LIFETIME: Duration = Duration::from_secs(60);
@@ -337,6 +338,19 @@ impl Decoder {
         } else {
             self.next_expiry
         }
+    }
+
+    /// Reclaim one incomplete datagram under shared pressure. Poisoned IPv6
+    /// identities remain until expiry, so resource pressure cannot bypass RFC 5722.
+    /// A bound datagram returns its route identity for retiring queued deliveries.
+    pub fn discard_oldest(&mut self) -> Option<Arc<crate::fragments::Binding>> {
+        let key = self
+            .fragments
+            .iter()
+            .filter(|(_, assembly)| !assembly.poisoned)
+            .min_by_key(|(_, assembly)| assembly.expires)
+            .map(|(key, _)| *key)?;
+        self.fragments.remove(&key)?.binding
     }
 
     pub fn expire(&mut self, now: Instant) {

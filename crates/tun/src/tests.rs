@@ -363,7 +363,8 @@ fn ipv6_overlaps_poison_the_datagram_but_atomic_fragments_are_independent() {
     let now = Instant::now();
     assert!(decoder.decode(&packets[0], now).is_none());
     assert!(decoder.decode(&packets[0], now).is_none());
-    for packet in &packets[1..] {
+    decoder.discard_oldest();
+    for packet in &packets {
         assert!(decoder.decode(packet, now).is_none());
     }
     // Reuse the ID with an atomic fragment. RFC 6946 forbids sharing reassembly state.
@@ -1031,33 +1032,46 @@ fn reassembly_fits_its_allowance_without_geometric_buffer_growth() {
 }
 
 #[test]
-fn idle_reassembly_releases_shared_storage_at_its_deadline() {
-    for ipv6 in [false, true] {
-        let limits = packet::ReassemblyLimits::new(8192);
-        let mut idle = Decoder::new(limits.clone());
-        let mut active = Decoder::new(limits);
-        let f = flow(ipv6);
-        let now = Instant::now();
-        let mut encoder = udp::Encoder::new(1280);
-        for _ in 0..64 {
-            let frames = encoder.encode(f.source, f.destination, &[7; 2500]).unwrap();
-            assert!(idle.decode(&frames[0], now).is_none());
+fn idle_reassembly_releases_shared_storage_on_expiry_or_pressure() {
+    for reclaim in [false, true] {
+        for ipv6 in [false, true] {
+            let limits = packet::ReassemblyLimits::new(8192);
+            let pressure = limits.pressure();
+            let mut idle = Decoder::new(limits.clone());
+            let mut active = Decoder::new(limits);
+            let f = flow(ipv6);
+            let now = Instant::now();
+            let mut encoder = udp::Encoder::new(1280);
+            for _ in 0..64 {
+                let frames = encoder.encode(f.source, f.destination, &[7; 2500]).unwrap();
+                assert!(idle.decode(&frames[0], now).is_none());
+            }
+            let frames = encoder.encode(f.source, f.destination, &[9; 2500]).unwrap();
+            for frame in &frames {
+                assert!(active.decode(frame, now).is_none());
+            }
+            let deadline = if reclaim {
+                assert!(pressure.has_changed().unwrap());
+                for _ in 0..64 {
+                    idle.discard_oldest();
+                    active.discard_oldest();
+                }
+                now
+            } else {
+                let deadline = idle.deadline().unwrap();
+                idle.expire(deadline);
+                active.expire(deadline);
+                deadline
+            };
+            assert_eq!(idle.deadline(), None);
+            let mut completed = None;
+            for frame in &frames {
+                completed = active
+                    .decode(frame, deadline)
+                    .map(Packet::into_owned)
+                    .or(completed);
+            }
+            assert_eq!(completed.unwrap().udp().unwrap().1, [9; 2500]);
         }
-        let frames = encoder.encode(f.source, f.destination, &[9; 2500]).unwrap();
-        for frame in &frames {
-            assert!(active.decode(frame, now).is_none());
-        }
-        let deadline = idle.deadline().unwrap();
-        idle.expire(deadline);
-        active.expire(deadline);
-        assert_eq!(idle.deadline(), None);
-        let mut completed = None;
-        for frame in &frames {
-            completed = active
-                .decode(frame, deadline)
-                .map(Packet::into_owned)
-                .or(completed);
-        }
-        assert_eq!(completed.unwrap().udp().unwrap().1, [9; 2500]);
     }
 }

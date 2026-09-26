@@ -206,6 +206,19 @@ impl Worker {
         }
     }
 
+    fn forwarded(&mut self, forwarded: Forwarded, decoder: &mut Decoder) -> Result<()> {
+        match forwarded.packet {
+            ForwardedPacket::Frame(frame) => {
+                if let Some(packet) = decoder.decode(&frame.bytes, Instant::now()) {
+                    self.packet(packet, Some(&frame))?;
+                }
+            }
+            ForwardedPacket::Reassembled(packet) => self.packet(packet, None)?,
+            ForwardedPacket::Fragments(delivery) => self.fragments(delivery, decoder)?,
+        }
+        Ok(())
+    }
+
     fn frame(&mut self, frame: crate::Received, decoder: &mut Decoder) -> Result<()> {
         let bytes = &frame.bytes;
         self.stats.received_packets += 1;
@@ -528,10 +541,13 @@ impl Worker {
                         let payload = backing
                             .and_then(|source| crate::storage::view(source, payload))
                             .unwrap_or_else(|| self.pool.copy(payload));
-                        if !direct.enqueue(p::Packet {
-                            target: p::target(flow.destination),
-                            payload,
-                        }) {
+                        if !direct.enqueue(
+                            p::Packet {
+                                target: p::target(flow.destination),
+                                payload,
+                            },
+                            &entry.activity,
+                        ) {
                             self.stats.capacity_drops += 1;
                         }
                         continue;
@@ -575,6 +591,7 @@ pub(crate) async fn dispatch<R: PacketReceive>(
     output: queue::Sender<Transmit>,
 ) -> Result<()> {
     let (done, mut completed) = mpsc::unbounded_channel();
+    let mut pressure = shared.reassembly.pressure();
     let (ready, mut runnable) = mpsc::unbounded_channel();
     let (transfers, mut transfer_events) = mpsc::unbounded_channel();
     let pool = crate::pool::Pool::default();
@@ -627,6 +644,18 @@ pub(crate) async fn dispatch<R: PacketReceive>(
         let blocked = worker.blocked.front().copied();
         let event = tokio::select! {
             _ = shared.stop.cancelled() => return Ok(()),
+            Ok(()) = pressure.changed() => {
+                let now = Instant::now();
+                // Prefer orphan storage, then recover enough room for a fresh
+                // ingress batch instead of thrashing at the allocation limit.
+                for _ in 0..32 {
+                    if !shared.reassembly.needs_headroom(now) { break; }
+                    if shared.fragments.discard_oldest_pending(id) { continue; }
+                    let Some(binding) = decoder.discard_oldest() else { break; };
+                    shared.fragments.finish(&binding);
+                }
+                continue;
+            },
             _ = worker.context.stopping.cancelled(), if !worker.stopping => {
                 worker.stopping = true;
                 worker.udp.clear();
@@ -704,15 +733,18 @@ pub(crate) async fn dispatch<R: PacketReceive>(
         };
 
         match event {
-            Input::Forwarded(forwarded) => match forwarded.packet {
-                ForwardedPacket::Frame(frame) => {
-                    if let Some(packet) = decoder.decode(&frame.bytes, Instant::now()) {
-                        worker.packet(packet, Some(&frame))?;
-                    }
+            Input::Forwarded(forwarded) => {
+                worker.forwarded(forwarded, &mut decoder)?;
+                // Use the same batch budget as kernel ingress. Processing one
+                // forwarded frame against 32 local frames can starve reassembly.
+                for _ in 0..31 {
+                    let Ok(forwarded) = inbox.try_recv() else {
+                        break;
+                    };
+                    worker.forwarded(forwarded, &mut decoder)?;
+                    turns += 1;
                 }
-                ForwardedPacket::Reassembled(packet) => worker.packet(packet, None)?,
-                ForwardedPacket::Fragments(delivery) => worker.fragments(delivery, &mut decoder)?,
-            },
+            }
             Input::Read(frame) => {
                 worker.frame(frame, &mut decoder)?;
                 // Drain only frames already readable. Native UDP can then submit

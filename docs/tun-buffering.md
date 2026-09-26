@@ -36,6 +36,11 @@ After the daemon routes a TUN flow, eligible native TCP and UDP transports move 
 
 The daemon selects single-target and multi-target UDP drivers before constructing their futures. A TUN association retains only its own session state, rather than reserving the larger multi-target dispatch state for its entire lifetime.
 
+Local and forwarded ingress both drain at most 32 ready frames per turn. When a
+receive batch fills a direct UDP backlog, the worker tries to send its pending
+prefix before dropping new input. A pending socket still applies the normal
+byte limit without suspending shared reception.
+
 Packet queues reserve bytes atomically and consume batches. UDP replies to the TUN writer preserve batches with the same source and destination, bounded by 64 datagrams and 64 KiB including per-datagram charges. A single larger datagram remains sendable. One reservation and wakeup cover the batch; empty, unequal-size and fragmented datagrams retain their boundaries. Worker-local direct UDP backlog uses ordinary fields and a deque. Native Linux UDP uses `recvmmsg`/`sendmmsg`, UDP GRO metadata and vectored `UDP_SEGMENT` output where supported. An unsupported segmentation attempt falls back only for its unaccepted datagrams. Portable socket I/O keeps the same datagram boundaries. Successful forwarding records activity atomically per batch; idle timers check the latest activity when they expire.
 
 ## Backlog policy
@@ -48,7 +53,7 @@ Packet queues reserve bytes atomically and consume batches. UDP replies to the T
 | TUN transmit queue | TCP connections retry from the worker's blocked list; ordinary UDP writers wait; direct UDP retains one reply batch and retries from the worker's blocked list; immediate ACK/reset replies use nonblocking admission |
 | UDP association ingress | Drop new datagrams without blocking shared reception |
 | UDP GSO segments | Share one receive allocation; apply per-datagram admission before queueing views |
-| IP reassembly | Reject growth beyond shared allowance before allocation; expiry releases incomplete datagrams |
+| IP reassembly | Reject growth before allocation and notify all workers to reclaim their oldest incomplete datagram and orphan batch; poisoned identities retain their original expiry |
 
 `Capacity` measures completed bytes over a feedback interval. The target is the largest of the initial allowance, measured consumption rate times a target delay, and the previous target halved per elapsed interval. A smaller queue target constrains new admission without discarding accepted items. An empty packet queue can admit one complete item larger than its target, so a valid datagram remains sendable.
 
