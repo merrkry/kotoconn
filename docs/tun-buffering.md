@@ -51,7 +51,7 @@ Packet queues reserve bytes atomically and consume batches. UDP replies to the T
 | TCP RX | Advertise available receive credit; retain already accepted data |
 | TCP TX | Apply Stream write backpressure until ACK returns credit |
 | TUN transmit queue | TCP connections retry from the worker's blocked list; ordinary UDP writers wait; direct UDP retains one reply batch and retries from the worker's blocked list; immediate ACK/reset replies use nonblocking admission |
-| UDP association ingress | Drop new datagrams without blocking shared reception |
+| UDP association ingress | Try native progress, then drop new datagrams if still full; never block shared reception |
 | UDP GSO segments | Share one receive allocation; apply per-datagram admission before queueing views |
 | IP reassembly | Reject growth before allocation and notify all workers to reclaim their oldest incomplete datagram and orphan batch; poisoned identities retain their original expiry |
 

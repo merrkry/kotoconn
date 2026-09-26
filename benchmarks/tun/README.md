@@ -1,5 +1,8 @@
 # TUN measurements
 
+See the [direct forwarding report](direct-performance.md) for the current
+optimization results, reference comparison, remaining gaps and per-sample data.
+
 Use Linux with Docker and `/dev/net/tun`, following [workspace setup](../../docs/build.md):
 
 ```sh
