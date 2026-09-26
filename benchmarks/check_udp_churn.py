@@ -58,7 +58,6 @@ def main():
     args.repetitions = 1
     args.udp_rate = 10000
     args.sing_box = None
-    args.baseline = None
     with (
         patch.object(benchmark, "traffic", fixed_work),
     ):

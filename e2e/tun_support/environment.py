@@ -129,18 +129,14 @@ def enter(args, script, category, *, sysctls=None):
     # independently selectable inside the same container CPU allowance.
     generator_cpus = ",".join(map(str, sorted(os.sched_getaffinity(0))))
     overrides = []
-    for option in ("binary", "traffic_binary", "sing_box", "baseline"):
+    for option in ("binary", "traffic_binary", "sing_box"):
         binary = getattr(args, option, None)
         if binary is None:
             continue
         binary = binary.resolve(strict=True)
-        target = (
-            f"/inputs/{option}/kotoconn"
-            if option in ("binary", "baseline")
-            else f"/inputs/{option}"
-        )
+        target = f"/inputs/{option}"
         argv += ["--mount", f"type=bind,source={binary},target={target},readonly"]
-        if option in ("binary", "baseline"):
+        if option == "binary":
             native = binary.with_name("libcronet.so")
             if native.is_file():
                 argv += [
@@ -323,8 +319,7 @@ class Process:
 
 
 def daemon_environment(binary):
-    # Each saved binary must load its own native library, including a baseline
-    # with a different Cronet ABI. Never inherit another candidate's library path.
+    # Load the native library staged beside the daemon.
     return dict(
         os.environ,
         RUST_LOG="info,kotoconn_tun=debug",

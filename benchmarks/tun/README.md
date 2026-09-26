@@ -14,14 +14,9 @@ mise exec -- moon run benchmark:test-udp-churn
 Use `--help` for workload filters and measurement options. To compare against a
 caller-supplied sing-box 1.15 binary with the go TUN stack, pass
 `--sing-box /path/to/sing-box`. The reference enables multi-queue TUN, using
-the same CPU allowance as Kotoconn. Collect a reference baseline deliberately; omit
-this option for routine candidate measurements.
-
-Use `--baseline /path/to/previous/kotoconn` to measure an earlier Kotoconn build
-in the same run. Preserve its adjacent `libcronet.so`; each binary loads its own
-copy. Baseline, candidate and optional sing-box samples share the generator
-binary and alternate execution order. Keep the old proxy binary separate from
-the build output so a rebuild cannot replace it during measurement.
+the same CPU allowance as Kotoconn. Both implementations use the same generator
+binary and alternate execution order. Omit this option for routine candidate
+measurements.
 
 ## Comparing results
 

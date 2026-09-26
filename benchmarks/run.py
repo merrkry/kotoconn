@@ -134,7 +134,7 @@ def cases(args):
 
 
 def implementations(args, case_name):
-    names = ["baseline", "candidate"] if args.baseline else ["candidate"]
+    names = ["candidate"]
     if args.sing_box and case_name != "mixed-malformed":
         names.append("sing-box-go")
     return names
@@ -143,8 +143,6 @@ def implementations(args, case_name):
 def run(args):
     configure_network()
     binaries = {"candidate": args.binary}
-    if args.baseline:
-        binaries["baseline"] = args.baseline
     if args.sing_box:
         binaries["sing-box-go"] = args.sing_box
     result = {
@@ -328,11 +326,6 @@ def main():
         "--udp-rate", type=int, default=10000, help="offered datagrams/s per UDP flow"
     )
     parser.add_argument(
-        "--baseline",
-        type=Path,
-        help="optional earlier Kotoconn binary, measured alongside the candidate",
-    )
-    parser.add_argument(
         "--sing-box",
         type=Path,
         help="optional sing-box 1.15 reference with the go TUN stack",
@@ -340,8 +333,6 @@ def main():
     args = parser.parse_args()
     args.binary = args.binary.resolve(strict=True)
     args.traffic_binary = args.traffic_binary.resolve(strict=True)
-    if args.baseline:
-        args.baseline = args.baseline.resolve(strict=True)
     if args.sing_box:
         args.sing_box = args.sing_box.resolve(strict=True)
     args.mtu = list(dict.fromkeys(args.mtu or [1500, 9000]))
