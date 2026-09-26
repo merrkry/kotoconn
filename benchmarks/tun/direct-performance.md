@@ -132,7 +132,7 @@ histograms, process samples, configuration and logs:
 - [MTU 1500 single TCP, ordinary UDP and churn](../../target/performance/release-mtu1500/tun-vwlc0sy5/results.json)
 - [MTU 9000 matrix](../../target/performance/release-mtu9000/tun-v2rnhofj/results.json)
 - [148-case stress run](../../target/performance/release-stress/tun-si35c6rn/results.json)
-- [Full CI log](../../target/verification-final.log)
+- [Full CI log](../../target/verification-isolation-order.log)
 
 SHA256 digests:
 

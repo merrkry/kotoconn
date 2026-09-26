@@ -14,6 +14,12 @@ mise exec -- moon run docker:test -- anytls
 For Linux TUN changes, see [TUN verification](tun_support/README.md). For
 performance comparisons, see [benchmarks](../benchmarks/README.md).
 
+The protocol runner and Docker image builds share a Moon mutex with the host
+network isolation check. Rootful Docker can create bridge interfaces during
+these tasks, which would change the isolation check's host snapshot. TUN
+containers still run concurrently within that check. When invoking the Python
+runners directly, wait for protocol tests and image builds to finish first.
+
 When adding protocol coverage, edit [run.py](run.py) for scenarios and
 [traffic.py](traffic.py) for traffic assertions. Put exact parser and scheduling
 regressions in Rust tests; use e2e for interoperability and kernel integration.
