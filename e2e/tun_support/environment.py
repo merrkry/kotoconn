@@ -129,7 +129,7 @@ def enter(args, script, category, *, sysctls=None):
     # independently selectable inside the same container CPU allowance.
     generator_cpus = ",".join(map(str, sorted(os.sched_getaffinity(0))))
     overrides = []
-    for option in ("binary", "traffic_binary", "sing_box"):
+    for option in ("binary", "traffic_binary", "sing_box", "baseline"):
         binary = getattr(args, option, None)
         if binary is None:
             continue

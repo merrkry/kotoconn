@@ -14,6 +14,12 @@ caller-supplied sing-box 1.15 binary with the go TUN stack, pass
 the same CPU allowance as Kotoconn. Collect a reference baseline deliberately; omit
 this option for routine candidate measurements.
 
+Use `--baseline /path/to/previous/kotoconn` to measure an earlier Kotoconn build
+in the same run. Preserve its adjacent `libcronet.so`; use builds with the same
+Cronet ABI. Baseline, candidate and optional sing-box samples share the generator
+binary and alternate execution order. Keep the old proxy binary separate from
+the build output so a rebuild cannot replace it during measurement.
+
 ## Comparing results
 
 Use release binaries and identical workload, echo-server and CPU-affinity
