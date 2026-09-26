@@ -5,15 +5,15 @@ use crate::{
     transmit::Transmit,
     udp,
 };
+use ahash::{AHashMap as HashMap, RandomState};
 use anyhow::Result;
 #[cfg(test)]
 use bytes::Bytes;
 use kotoconn_protocol::{self as p, Scope, ServerContext, queue};
 use smoltcp::wire::{IpProtocol, TcpControl};
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque, hash_map::RandomState},
+    collections::{BTreeMap, VecDeque},
     future::poll_fn,
-    hash::BuildHasher,
     sync::Arc,
 };
 use tokio::{sync::mpsc, time::Instant};
@@ -90,7 +90,7 @@ struct TcpEntry {
 }
 
 struct UdpEntry {
-    packets: queue::Sender<p::Packet>,
+    packets: Option<queue::Sender<p::Packet>>,
     activity: p::Activity,
     scope: Scope,
     generation: u64,
@@ -204,6 +204,19 @@ impl Worker {
                 self.tcp.remove(&flow);
             }
         }
+    }
+
+    fn forwarded(&mut self, forwarded: Forwarded, decoder: &mut Decoder) -> Result<()> {
+        match forwarded.packet {
+            ForwardedPacket::Frame(frame) => {
+                if let Some(packet) = decoder.decode(&frame.bytes, Instant::now()) {
+                    self.packet(packet, Some(&frame))?;
+                }
+            }
+            ForwardedPacket::Reassembled(packet) => self.packet(packet, None)?,
+            ForwardedPacket::Fragments(delivery) => self.fragments(delivery, decoder)?,
+        }
+        Ok(())
     }
 
     fn frame(&mut self, frame: crate::Received, decoder: &mut Decoder) -> Result<()> {
@@ -457,7 +470,7 @@ impl Worker {
                         .checked_add(1)
                         .expect("TUN connection generation exhausted");
                     let scope = self.context.scope.child();
-                    let (mut association, driver) = p::packet_pair(scope.clone());
+                    let (mut association, mut driver) = p::packet_pair(scope.clone());
                     association.single_target = Some(p::target(flow.destination));
                     association.worker = Some(Arc::new(crate::udp_direct::Handoff {
                         id: (flow, self.generation),
@@ -465,6 +478,11 @@ impl Worker {
                         scope: scope.clone(),
                     }));
                     let packets = driver.tx.clone();
+                    let replies = driver.take_receiver();
+                    // The worker task owns association shutdown. Retain only the
+                    // reply receiver so native handoff can free the ingress queue.
+                    driver.disarm();
+                    drop(driver);
                     let activity = p::Activity::default();
                     let clock = activity.clone();
                     let handler = self.context.handler.clone();
@@ -481,7 +499,7 @@ impl Worker {
 
                     scope.spawn(async move {
                         let _completion = completion;
-                        let replies = udp_replies(flow, driver, output, reply_activity);
+                        let replies = udp_replies(flow, replies, output, reply_activity);
                         tokio::select! {
                             _ = stopping.cancelled() => {},
                             _ = clock.until_idle(idle) => {},
@@ -495,7 +513,7 @@ impl Worker {
                     self.udp.insert(
                         flow,
                         UdpEntry {
-                            packets,
+                            packets: Some(packets),
                             direct: None,
                             blocked: false,
                             activity,
@@ -523,15 +541,21 @@ impl Worker {
                         let payload = backing
                             .and_then(|source| crate::storage::view(source, payload))
                             .unwrap_or_else(|| self.pool.copy(payload));
-                        if !direct.enqueue(p::Packet {
-                            target: p::target(flow.destination),
-                            payload,
-                        }) {
+                        if !direct.enqueue(
+                            p::Packet {
+                                target: p::target(flow.destination),
+                                payload,
+                            },
+                            &entry.activity,
+                        ) {
                             self.stats.capacity_drops += 1;
                         }
                         continue;
                     }
-                    let Ok(permit) = entry.packets.try_reserve(payload.len()) else {
+                    // SAFETY: Only this worker installs direct I/O and removes
+                    // its old queue. The direct branch above handles that state.
+                    let packets = entry.packets.as_ref().expect("queued UDP transport");
+                    let Ok(permit) = packets.try_reserve(payload.len()) else {
                         self.stats.capacity_drops += 1;
                         return Ok(());
                     };
@@ -567,6 +591,7 @@ pub(crate) async fn dispatch<R: PacketReceive>(
     output: queue::Sender<Transmit>,
 ) -> Result<()> {
     let (done, mut completed) = mpsc::unbounded_channel();
+    let mut pressure = shared.reassembly.pressure();
     let (ready, mut runnable) = mpsc::unbounded_channel();
     let (transfers, mut transfer_events) = mpsc::unbounded_channel();
     let pool = crate::pool::Pool::default();
@@ -619,6 +644,18 @@ pub(crate) async fn dispatch<R: PacketReceive>(
         let blocked = worker.blocked.front().copied();
         let event = tokio::select! {
             _ = shared.stop.cancelled() => return Ok(()),
+            Ok(()) = pressure.changed() => {
+                let now = Instant::now();
+                // Prefer orphan storage, then recover enough room for a fresh
+                // ingress batch instead of thrashing at the allocation limit.
+                for _ in 0..32 {
+                    if !shared.reassembly.needs_headroom(now) { break; }
+                    if shared.fragments.discard_oldest_pending(id) { continue; }
+                    let Some(binding) = decoder.discard_oldest() else { break; };
+                    shared.fragments.finish(&binding);
+                }
+                continue;
+            },
             _ = worker.context.stopping.cancelled(), if !worker.stopping => {
                 worker.stopping = true;
                 worker.udp.clear();
@@ -648,6 +685,7 @@ pub(crate) async fn dispatch<R: PacketReceive>(
             Some(transfer) = transfer_events.recv() => {
                 if let Some(entry) = worker.udp.get_mut(&transfer.id.0).filter(|entry| entry.generation == transfer.id.1 && !entry.scope.is_closed()) {
                     entry.direct = Some(crate::udp_direct::Direct::new(transfer, worker.ready.clone()));
+                    entry.packets = None;
                 }
                 continue;
             },
@@ -695,15 +733,18 @@ pub(crate) async fn dispatch<R: PacketReceive>(
         };
 
         match event {
-            Input::Forwarded(forwarded) => match forwarded.packet {
-                ForwardedPacket::Frame(frame) => {
-                    if let Some(packet) = decoder.decode(&frame.bytes, Instant::now()) {
-                        worker.packet(packet, Some(&frame))?;
-                    }
+            Input::Forwarded(forwarded) => {
+                worker.forwarded(forwarded, &mut decoder)?;
+                // Use the same batch budget as kernel ingress. Processing one
+                // forwarded frame against 32 local frames can starve reassembly.
+                for _ in 0..31 {
+                    let Ok(forwarded) = inbox.try_recv() else {
+                        break;
+                    };
+                    worker.forwarded(forwarded, &mut decoder)?;
+                    turns += 1;
                 }
-                ForwardedPacket::Reassembled(packet) => worker.packet(packet, None)?,
-                ForwardedPacket::Fragments(delivery) => worker.fragments(delivery, &mut decoder)?,
-            },
+            }
             Input::Read(frame) => {
                 worker.frame(frame, &mut decoder)?;
                 // Drain only frames already readable. Native UDP can then submit
@@ -727,26 +768,37 @@ pub(crate) async fn dispatch<R: PacketReceive>(
 
 async fn udp_replies(
     flow: Flow,
-    mut driver: p::Datagram,
+    mut replies: queue::Receiver<p::Packet>,
     output: queue::Sender<Transmit>,
     activity: p::Activity,
 ) -> Result<()> {
-    let mut batch = Vec::with_capacity(32);
-    while driver.rx.recv_many(&mut batch, 32).await != 0 {
-        for packet in batch.drain(..) {
+    let mut batch = Vec::new();
+    while replies.recv_many(&mut batch, 32).await != 0 {
+        let mut pending = batch.drain(..).peekable();
+        while let Some(packet) = pending.next() {
             let Ok(source) = p::socket_addr(&packet.target) else {
                 continue;
             };
             let Some((source, destination)) = udp::reply_flow(flow, source) else {
                 continue;
             };
-            // One queued item owns the whole datagram. Only this association waits
-            // for capacity; shared ingress keeps receiving other connections.
+            let mut bytes = packet.payload.len() + 48;
+            let mut payload = vec![packet.payload];
+            while let Some(next) = pending.peek() {
+                if next.target != packet.target || bytes + next.payload.len() + 48 > 65536 {
+                    break;
+                }
+                bytes += next.payload.len() + 48;
+                // SAFETY: peek found this packet in the local receive batch.
+                payload.push(pending.next().expect("peeked UDP reply").payload);
+            }
+            // Only this association waits for output capacity; shared ingress
+            // keeps receiving other connections while the whole batch is pending.
             output
-                .send(Transmit::Datagram {
+                .send(Transmit::Datagrams {
                     source,
                     destination,
-                    payload: packet.payload,
+                    payload,
                 })
                 .await?;
         }

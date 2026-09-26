@@ -38,19 +38,35 @@ impl Carrier for System {
 
     fn udp_scoped(&self, target: Target, caller: Scope) -> BoxFuture<'_, Result<Datagram>> {
         Box::pin(async move {
-            let peer = socket_addr(&target)?;
-
-            let socket = UdpSocket::bind(if peer.is_ipv4() {
-                "0.0.0.0:0"
-            } else {
-                "[::]:0"
-            })
-            .await?;
-            socket.connect(peer).await?;
-            tracing::debug!(%peer, "connected UDP socket");
+            let socket = udp_socket(&target).await?;
             crate::native_udp::start(socket, target, self.scope.child().tracked_by(&caller))
         })
     }
+
+    fn udp_native_scoped(
+        &self,
+        target: Target,
+        caller: Scope,
+    ) -> BoxFuture<'_, Result<Option<NativeDatagram>>> {
+        Box::pin(async move {
+            let socket = udp_socket(&target).await?;
+            crate::native_udp::open(socket, target, self.scope.child().tracked_by(&caller))
+                .map(Some)
+        })
+    }
+}
+
+async fn udp_socket(target: &Target) -> Result<UdpSocket> {
+    let peer = socket_addr(target)?;
+    let socket = UdpSocket::bind(if peer.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    })
+    .await?;
+    socket.connect(peer).await?;
+    tracing::debug!(%peer, "connected UDP socket");
+    Ok(socket)
 }
 
 /// Temporary DNS implementation for policies that use the system resolver.

@@ -310,6 +310,6 @@ impl p::Handler for SessionHandler {
     }
 
     fn udp(&self, packets: Datagram) -> BoxFuture<'_, Result<()>> {
-        Box::pin(udp::association(self.clone(), packets))
+        udp::association(self.clone(), packets)
     }
 }

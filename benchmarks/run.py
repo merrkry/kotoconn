@@ -75,6 +75,25 @@ def cases(args):
                     "allow_loss": True,
                 },
             ),
+            (
+                "udp-large-1",
+                {
+                    "protocol": "udp",
+                    "rate": args.udp_rate,
+                    "datagram_bytes": 8192,
+                    "allow_loss": True,
+                },
+            ),
+            (
+                "udp-large",
+                {
+                    "protocol": "udp",
+                    "connections": 4,
+                    "rate": args.udp_rate,
+                    "datagram_bytes": 8192,
+                    "allow_loss": True,
+                },
+            ),
             ("udp-churn", {"protocol": "udp", "workload": "churn", "connections": 8}),
             (
                 "udp-sparse",
@@ -115,9 +134,10 @@ def cases(args):
 
 
 def implementations(args, case_name):
+    names = ["candidate"]
     if args.sing_box and case_name != "mixed-malformed":
-        return ["candidate", "sing-box-go"]
-    return ["candidate"]
+        names.append("sing-box-go")
+    return names
 
 
 def run(args):
@@ -139,6 +159,7 @@ def run(args):
             "traffic_workers": args.traffic_workers,
             "udp_echo_batch": args.udp_echo_batch,
             "udp_server_receive_buffer": args.udp_server_receive_buffer,
+            "udp_rate_per_flow": args.udp_rate,
         },
         "runs": [],
     }

@@ -14,6 +14,10 @@ mise exec -- moon run docker:test -- anytls
 For Linux TUN changes, see [TUN verification](tun_support/README.md). For
 performance comparisons, see [benchmarks](../benchmarks/README.md).
 
+Docker builds and protocol E2E share a Moon mutex with the host isolation check
+because they can create host bridge interfaces. When invoking runners directly,
+finish those tasks before starting the isolation check.
+
 When adding protocol coverage, edit [run.py](run.py) for scenarios and
 [traffic.py](traffic.py) for traffic assertions. Put exact parser and scheduling
 regressions in Rust tests; use e2e for interoperability and kernel integration.

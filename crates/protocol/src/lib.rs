@@ -20,7 +20,7 @@ pub use io::{
     packet_pair, prefix, stream_task,
 };
 pub use kotoconn_config::{Target, TransportProtocol};
-pub use packet_io::{BoxPacketIo, PacketIo, packet_io_task};
+pub use packet_io::{BoxPacketIo, NativeDatagram, PacketIo, packet_io_task};
 pub use server::{BoundServer, Handler, Server, ServerContext, accept_loop};
 use std::{net::SocketAddr, sync::Arc};
 
@@ -61,6 +61,16 @@ pub trait Carrier: Send + Sync {
     /// Propagate completion tracking through every layer of a connection attempt.
     fn tcp_scoped(&self, target: Target, caller: Scope) -> BoxFuture<'_, Result<BoxStream>>;
     fn udp_scoped(&self, target: Target, caller: Scope) -> BoxFuture<'_, Result<Datagram>>;
+
+    /// Open packet I/O for a caller that supplies its own driver. Declining must
+    /// perform no network I/O; the caller can then use udp_scoped normally.
+    fn udp_native_scoped(
+        &self,
+        _target: Target,
+        _caller: Scope,
+    ) -> BoxFuture<'_, Result<Option<NativeDatagram>>> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 /// Adapters own protocol state. The runtime supplies independent TCP/UDP lifetimes.
@@ -72,6 +82,16 @@ pub trait Client: Send + Sync {
     fn capabilities(&self) -> Capabilities;
     fn tcp(&self, target: Target, scope: Scope) -> BoxFuture<'_, Result<BoxStream>>;
     fn udp(&self, target: Target, scope: Scope) -> BoxFuture<'_, Result<Datagram>>;
+
+    /// Same opt-in contract as Carrier::udp_native_scoped. Encoded transports
+    /// keep their ordinary datagram driver unless they explicitly implement it.
+    fn udp_native(
+        &self,
+        _target: Target,
+        _scope: Scope,
+    ) -> BoxFuture<'_, Result<Option<NativeDatagram>>> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 /// Resolves only an outbound's own server address. User targets bypass this trait.

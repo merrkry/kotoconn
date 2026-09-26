@@ -9,6 +9,7 @@ rustix = { workspace = true, features = ["net"] }
 tun-rs = { workspace = true, features = ["async_tokio"] }
 
 [dependencies]
+ahash = "0.8.12"
 anyhow.workspace = true
 bytes.workspace = true
 crossbeam-queue = "0.3"
@@ -17,7 +18,7 @@ kotoconn-config.workspace = true
 kotoconn-protocol.workspace = true
 rand.workspace = true
 smoltcp = { workspace = true, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-tcp-cubic", "assembler-max-segment-count-32", "segmentation-offload"] }
-tokio = { workspace = true, features = ["io-util", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "rt-multi-thread", "sync", "time"] }
 tokio-util = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 

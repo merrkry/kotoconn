@@ -12,10 +12,10 @@ pub(crate) enum Transmit {
         payload: Vec<Bytes>,
         segment_size: u16,
     },
-    Datagram {
+    Datagrams {
         source: SocketAddr,
         destination: SocketAddr,
-        payload: bytes::Bytes,
+        payload: Vec<Bytes>,
     },
 }
 
@@ -29,7 +29,7 @@ impl Transmit {
                 storage::charge(packet.len() + payload.iter().map(Bytes::len).sum::<usize>())
                     + payload.len() * std::mem::size_of::<Bytes>()
             }
-            Self::Datagram { payload, .. } => payload.len() + 48,
+            Self::Datagrams { payload, .. } => payload.iter().map(|p| p.len() + 48).sum(),
         }
     }
 }

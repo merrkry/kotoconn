@@ -141,9 +141,7 @@ def enter(args, script, category, *, sysctls=None):
             if native.is_file():
                 argv += [
                     "--mount",
-                    f"type=bind,source={native},target=/inputs/libcronet.so,readonly",
-                    "--env",
-                    "LD_LIBRARY_PATH=/inputs",
+                    f"type=bind,source={native},target={Path(target).with_name('libcronet.so')},readonly",
                 ]
         overrides += ["--" + option.replace("_", "-"), target]
     argv += [
@@ -320,6 +318,15 @@ class Process:
         self.log.close()
 
 
+def daemon_environment(binary):
+    # Load the native library staged beside the daemon.
+    return dict(
+        os.environ,
+        RUST_LOG="info,kotoconn_tun=debug",
+        LD_LIBRARY_PATH=str(binary.parent),
+    )
+
+
 class Daemon(Process):
     def __init__(
         self,
@@ -349,7 +356,7 @@ class Daemon(Process):
         super().__init__(
             argv,
             directory / "daemon.log",
-            env=dict(os.environ, RUST_LOG="info,kotoconn_tun=debug"),
+            env=daemon_environment(binary),
         )
         try:
             self.event("daemon_ready")

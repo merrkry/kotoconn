@@ -270,36 +270,79 @@ async fn fragments_cross_receive_queues_and_replies_keep_the_flow_owner() {
 
 #[tokio::test]
 async fn receive_failure_releases_other_queues_without_cancelling_the_parent_scope() {
+    for dedicated in [false, true] {
+        let context = context();
+        let (output, _received) = mpsc::unbounded_channel();
+        let (input0, packets0) = mpsc::channel(1);
+        let (_input1, packets1) = mpsc::channel(1);
+        let (dropped, released) = oneshot::channel();
+        let queues = vec![
+            (
+                Receiver {
+                    packets: packets0,
+                    dropped: None,
+                },
+                Sender {
+                    queue: 0,
+                    packets: output.clone(),
+                },
+            ),
+            (
+                Receiver {
+                    packets: packets1,
+                    dropped: Some(dropped),
+                },
+                Sender {
+                    queue: 1,
+                    packets: output,
+                },
+            ),
+        ];
+        let endpoint = tokio::spawn(crate::endpoint::run_workers(
+            queues.into_iter().map(|queue| move || Ok(queue)).collect(),
+            1280,
+            context.clone(),
+            dedicated,
+        ));
+        drop(input0);
+        assert!(endpoint.await.unwrap().is_err());
+        released.await.unwrap();
+        assert!(!context.scope.is_closed());
+        context.scope.wait().await;
+    }
+}
+
+#[tokio::test]
+async fn aborting_a_dedicated_endpoint_releases_its_queue_after_open() {
     let context = context();
     let (output, _received) = mpsc::unbounded_channel();
-    let (input0, packets0) = mpsc::channel(1);
-    let (_input1, packets1) = mpsc::channel(1);
+    let (_input, packets) = mpsc::channel(1);
+    let (opened, ready) = oneshot::channel();
     let (dropped, released) = oneshot::channel();
-    let queues = vec![
-        (
-            Receiver {
-                packets: packets0,
-                dropped: None,
-            },
-            Sender {
-                queue: 0,
-                packets: output.clone(),
-            },
-        ),
-        (
-            Receiver {
-                packets: packets1,
-                dropped: Some(dropped),
-            },
-            Sender {
-                queue: 1,
-                packets: output,
-            },
-        ),
-    ];
-    let endpoint = tokio::spawn(run(queues, 1280, context.clone()));
-    drop(input0);
-    assert!(endpoint.await.unwrap().is_err());
+    let owner = std::thread::current().id();
+    let endpoint = tokio::spawn(crate::endpoint::run_workers(
+        vec![move || {
+            // Device readiness must be registered in the worker's runtime.
+            opened.send(std::thread::current().id()).unwrap();
+            Ok((
+                Receiver {
+                    packets,
+                    dropped: Some(dropped),
+                },
+                Sender {
+                    queue: 0,
+                    packets: output,
+                },
+            ))
+        }],
+        1280,
+        context.clone(),
+        true,
+    ));
+    assert_ne!(ready.await.unwrap(), owner);
+
+    endpoint.abort();
+    assert!(endpoint.await.unwrap_err().is_cancelled());
     released.await.unwrap();
     assert!(!context.scope.is_closed());
     context.scope.wait().await;

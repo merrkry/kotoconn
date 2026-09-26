@@ -4,11 +4,21 @@ use crate::{
 };
 use bytes::{Buf, Bytes};
 use std::{
+    cell::RefCell,
     io,
     pin::Pin,
     task::{Context, Poll, ready},
 };
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    task::coop,
+};
+
+thread_local! {
+    // A speculative read must not leave 64 KiB attached to every idle socket.
+    // Native reads finish synchronously, so sockets can share this scratch.
+    static TCP_RECEIVE: RefCell<Option<Lease>> = const { RefCell::new(None) };
+}
 
 /// Reusable receive storage for I/O implementations that cannot return owned data.
 pub struct ChunkBuffer {
@@ -80,27 +90,35 @@ impl Stream for tokio::net::TcpStream {
         Poll::Ready(Ok(true))
     }
     fn poll_read_chunk(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buffer: &mut ChunkBuffer,
     ) -> Poll<io::Result<Bytes>> {
-        ready!(self.poll_read_ready(cx))?;
-        let lease = buffer
-            .lease
-            .get_or_insert_with(|| buffer.pool.acquire(65536));
-        let mut out = ReadBuf::new(lease.as_mut());
-        ready!(self.as_mut().poll_read(cx, &mut out))?;
-        let n = out.filled().len();
-        if n == 0 {
-            buffer.lease = None;
-            return Poll::Ready(Ok(Bytes::new()));
+        let budget = ready!(coop::poll_proceed(cx));
+        loop {
+            ready!(self.poll_read_ready(cx))?;
+            let result: io::Result<Bytes> = TCP_RECEIVE.with_borrow_mut(|scratch| {
+                let lease = scratch.get_or_insert_with(|| buffer.pool.acquire(65536));
+                let n = self.try_read(lease.as_mut())?;
+                if n == 0 {
+                    return Ok(Bytes::new());
+                }
+                if n < 16384 {
+                    return Ok(buffer.pool.copy(&lease.as_ref()[..n]));
+                }
+
+                // SAFETY: The scratch lease stayed installed during try_read,
+                // which initialized n bytes. No borrow crosses a suspension.
+                Ok(scratch.take().expect("socket read scratch").freeze(n))
+            });
+            match result {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                result => {
+                    budget.made_progress();
+                    return Poll::Ready(result);
+                }
+            }
         }
-        // SAFETY: The read used the lease still held by this buffer.
-        Poll::Ready(Ok(buffer
-            .lease
-            .take()
-            .expect("socket read lease")
-            .publish(n)))
     }
 }
 
@@ -147,6 +165,19 @@ impl AsyncWrite for Prefix {
     ) -> Poll<io::Result<usize>> {
         self.inner.as_mut().poll_write(cx, bytes)
     }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        self.inner.as_mut().poll_write_vectored(cx, bytes)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.inner.as_mut().poll_flush(cx)
     }

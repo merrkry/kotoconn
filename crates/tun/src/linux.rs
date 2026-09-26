@@ -81,16 +81,17 @@ pub fn bind(options: TunInboundConfig, context: ServerContext) -> Result<BoundTu
 
     let device = builder
         .enable(true)
-        .build_async()
+        .build_sync()
         .context("create Linux TUN interface")?;
 
     let name = device.name().context("read TUN interface name")?;
     Ok(BoundTun {
         name,
-        run: Box::pin(crate::run(
+        run: Box::pin(crate::endpoint::run_workers(
             crate::offload::queues(device)?,
             usize::from(options.mtu),
             context,
+            true,
         )),
     })
 }

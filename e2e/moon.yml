@@ -5,10 +5,12 @@ tasks:
     deps: [rust:build-linux-debug]
     options:
       cache: false
+      mutex: docker-host-network
   build-runtime:
     command: uv run --locked python tools/docker.py test-runtime --tag kotoconn-tun:local
     options:
       cache: false
+      mutex: docker-host-network
   build:
     deps: [build-app, build-runtime, build-anytls]
   build-anytls-peer:
@@ -24,11 +26,13 @@ tasks:
     deps: [rust:build-anytls-interop, build-anytls-peer]
     options:
       cache: false
+      mutex: docker-host-network
   test:
     command: uv run --locked python e2e/run.py
     deps: [build]
     options:
       cache: false
+      mutex: docker-host-network
   test-tun:
     command: uv run --locked python e2e/tun.py
     deps: [rust:build-linux-debug, build-runtime]
@@ -39,3 +43,4 @@ tasks:
     deps: [rust:build-linux-debug, build-runtime]
     options:
       cache: false
+      mutex: docker-host-network

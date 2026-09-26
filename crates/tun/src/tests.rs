@@ -363,7 +363,8 @@ fn ipv6_overlaps_poison_the_datagram_but_atomic_fragments_are_independent() {
     let now = Instant::now();
     assert!(decoder.decode(&packets[0], now).is_none());
     assert!(decoder.decode(&packets[0], now).is_none());
-    for packet in &packets[1..] {
+    decoder.discard_oldest();
+    for packet in &packets {
         assert!(decoder.decode(packet, now).is_none());
     }
     // Reuse the ID with an atomic fragment. RFC 6946 forbids sharing reassembly state.
@@ -547,8 +548,77 @@ async fn tcp_admits_without_application_io_and_preserves_half_close() {
     }
 }
 
+struct ShortWrites {
+    socket: tokio::net::TcpStream,
+    pause: bool,
+}
+
+impl tokio::io::AsyncRead for ShortWrites {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        out: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.socket).poll_read(cx, out)
+    }
+}
+
+impl tokio::io::AsyncWrite for ShortWrites {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::pin::Pin::new(&mut self.socket).poll_write(cx, &bytes[..bytes.len().min(3)])
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[io::IoSlice<'_>],
+    ) -> std::task::Poll<io::Result<usize>> {
+        if std::mem::take(&mut self.pause) {
+            cx.waker().wake_by_ref();
+            return std::task::Poll::Pending;
+        }
+        let mut prefix = [0; 3];
+        let mut count = 0;
+        for part in bytes {
+            let n = part.len().min(prefix.len() - count);
+            prefix[count..count + n].copy_from_slice(&part[..n]);
+            count += n;
+        }
+        let result = std::pin::Pin::new(&mut self.socket).poll_write(cx, &prefix[..count]);
+        self.pause = result.is_ready();
+        result
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.socket).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.socket).poll_shutdown(cx)
+    }
+}
+
+impl kotoconn_protocol::Stream for ShortWrites {
+    fn poll_direct(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<bool>> {
+        std::task::Poll::Ready(Ok(true))
+    }
+}
+
 #[tokio::test]
-async fn direct_handoff_preserves_prequeued_bytes_half_close_and_counts() {
+async fn direct_handoff_preserves_prequeued_bytes_partial_writes_half_close_and_counts() {
     for ipv6 in [false, true] {
         tokio::time::timeout(Duration::from_secs(5), async {
             let (stream, packets, mut replies, driver, server_seq) = accepted(ipv6).await;
@@ -560,24 +630,47 @@ async fn direct_handoff_preserves_prequeued_bytes_half_close_and_counts() {
                 .await
                 .unwrap();
             let (mut peer, _) = listener.accept().await.unwrap();
+            let mut sequence = 101;
+            for bytes in [b"he".as_slice(), b"llo", b" wo", b"rld"] {
+                packets
+                    .send(segment(
+                        flow(ipv6),
+                        sequence,
+                        Some(server_seq),
+                        TcpControl::None,
+                        bytes,
+                    ))
+                    .await
+                    .unwrap();
+                sequence += bytes.len() as i32;
+            }
             packets
                 .send(segment(
                     flow(ipv6),
-                    101,
+                    sequence,
                     Some(server_seq),
                     TcpControl::Fin,
-                    b"hello",
+                    &[],
                 ))
                 .await
                 .unwrap();
             let relay = tokio::spawn(async move {
                 let mut stream: kotoconn_protocol::BoxStream = Box::pin(stream);
-                kotoconn_protocol::relay(&mut stream, Box::pin(socket)).await
+                // Force accepted prefixes to end both inside a block and across
+                // block boundaries before FIN can shut down the socket.
+                kotoconn_protocol::relay(
+                    &mut stream,
+                    Box::pin(ShortWrites {
+                        socket,
+                        pause: false,
+                    }),
+                )
+                .await
             });
             let remote = tokio::spawn(async move {
                 let mut data = Vec::new();
                 peer.read_to_end(&mut data).await.unwrap();
-                assert_eq!(data, b"hello");
+                assert_eq!(data, b"hello world");
                 peer.write_all(b"world").await.unwrap();
                 peer.shutdown().await.unwrap();
             });
@@ -589,7 +682,13 @@ async fn direct_handoff_preserves_prequeued_bytes_half_close_and_counts() {
                 let fin = repr.control == TcpControl::Fin;
                 let end = repr.seq_number + repr.payload.len() + usize::from(fin);
                 packets
-                    .send(segment(flow(ipv6), 107, Some(end.0), TcpControl::None, &[]))
+                    .send(segment(
+                        flow(ipv6),
+                        sequence + 1,
+                        Some(end.0),
+                        TcpControl::None,
+                        &[],
+                    ))
                     .await
                     .unwrap();
                 if fin {
@@ -597,7 +696,7 @@ async fn direct_handoff_preserves_prequeued_bytes_half_close_and_counts() {
                 }
             }
             assert_eq!(received, b"world");
-            assert_eq!(relay.await.unwrap().unwrap(), (5, 5));
+            assert_eq!(relay.await.unwrap().unwrap(), (11, 5));
             remote.await.unwrap();
             // The data contract completed; stop this fixture's TIME_WAIT owner.
             driver.abort();
@@ -717,7 +816,7 @@ impl transmit::Transmit {
     fn packet(self) -> Vec<u8> {
         match self {
             Self::Packet(packet) => packet.to_vec(),
-            Self::Datagram { .. } | Self::TcpGso { .. } => panic!("expected ordinary TCP packet"),
+            Self::Datagrams { .. } | Self::TcpGso { .. } => panic!("expected ordinary TCP packet"),
         }
     }
 }
@@ -933,33 +1032,46 @@ fn reassembly_fits_its_allowance_without_geometric_buffer_growth() {
 }
 
 #[test]
-fn idle_reassembly_releases_shared_storage_at_its_deadline() {
-    for ipv6 in [false, true] {
-        let limits = packet::ReassemblyLimits::new(8192);
-        let mut idle = Decoder::new(limits.clone());
-        let mut active = Decoder::new(limits);
-        let f = flow(ipv6);
-        let now = Instant::now();
-        let mut encoder = udp::Encoder::new(1280);
-        for _ in 0..64 {
-            let frames = encoder.encode(f.source, f.destination, &[7; 2500]).unwrap();
-            assert!(idle.decode(&frames[0], now).is_none());
+fn idle_reassembly_releases_shared_storage_on_expiry_or_pressure() {
+    for reclaim in [false, true] {
+        for ipv6 in [false, true] {
+            let limits = packet::ReassemblyLimits::new(8192);
+            let pressure = limits.pressure();
+            let mut idle = Decoder::new(limits.clone());
+            let mut active = Decoder::new(limits);
+            let f = flow(ipv6);
+            let now = Instant::now();
+            let mut encoder = udp::Encoder::new(1280);
+            for _ in 0..64 {
+                let frames = encoder.encode(f.source, f.destination, &[7; 2500]).unwrap();
+                assert!(idle.decode(&frames[0], now).is_none());
+            }
+            let frames = encoder.encode(f.source, f.destination, &[9; 2500]).unwrap();
+            for frame in &frames {
+                assert!(active.decode(frame, now).is_none());
+            }
+            let deadline = if reclaim {
+                assert!(pressure.has_changed().unwrap());
+                for _ in 0..64 {
+                    idle.discard_oldest();
+                    active.discard_oldest();
+                }
+                now
+            } else {
+                let deadline = idle.deadline().unwrap();
+                idle.expire(deadline);
+                active.expire(deadline);
+                deadline
+            };
+            assert_eq!(idle.deadline(), None);
+            let mut completed = None;
+            for frame in &frames {
+                completed = active
+                    .decode(frame, deadline)
+                    .map(Packet::into_owned)
+                    .or(completed);
+            }
+            assert_eq!(completed.unwrap().udp().unwrap().1, [9; 2500]);
         }
-        let frames = encoder.encode(f.source, f.destination, &[9; 2500]).unwrap();
-        for frame in &frames {
-            assert!(active.decode(frame, now).is_none());
-        }
-        let deadline = idle.deadline().unwrap();
-        idle.expire(deadline);
-        active.expire(deadline);
-        assert_eq!(idle.deadline(), None);
-        let mut completed = None;
-        for frame in &frames {
-            completed = active
-                .decode(frame, deadline)
-                .map(Packet::into_owned)
-                .or(completed);
-        }
-        assert_eq!(completed.unwrap().udp().unwrap().1, [9; 2500]);
     }
 }

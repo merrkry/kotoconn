@@ -7,6 +7,13 @@ use std::{
 
 pub type BoxPacketIo = Box<dyn PacketIo>;
 
+/// An established packet transport with carrier cancellation and completion tracking.
+/// Dropping io must close its scope; closing scope must revoke even unpolled I/O.
+pub struct NativeDatagram {
+    pub io: BoxPacketIo,
+    pub scope: Scope,
+}
+
 /// Prefix progress counts complete datagrams. Empty payloads remain valid.
 /// Pending leaves output/input unchanged; an error accepts no new datagrams.
 pub trait PacketIo: Send {

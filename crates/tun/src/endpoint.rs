@@ -3,11 +3,11 @@ use crate::{
     udp,
     worker::{self, Shared},
 };
+use ahash::RandomState;
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use bytes::Bytes;
 use kotoconn_protocol::{ServerContext, queue};
 use std::{
-    collections::hash_map::RandomState,
     future::poll_fn,
     io,
     sync::Arc,
@@ -158,13 +158,47 @@ impl Drop for ConnectionGuard {
     }
 }
 
+struct WorkerRuntimes(Vec<tokio::runtime::Runtime>);
+
+impl Drop for WorkerRuntimes {
+    fn drop(&mut self) {
+        // run joins or aborts the queue tasks before returning. Background
+        // shutdown also makes dropping an aborted endpoint safe inside Tokio.
+        for runtime in self.0.drain(..) {
+            runtime.shutdown_background();
+        }
+    }
+}
+
 /// Own queue workers until TCP drains or cancellation stops device I/O.
 /// Queue membership stays fixed so established flow ownership cannot migrate.
 pub async fn run<R: PacketReceive + 'static, W: PacketSend + 'static>(
     queues: Vec<(R, W)>,
     mtu: usize,
-    mut context: ServerContext,
+    context: ServerContext,
 ) -> Result<()> {
+    run_workers(
+        queues.into_iter().map(|queue| move || Ok(queue)).collect(),
+        mtu,
+        context,
+        false,
+    )
+    .await
+}
+
+/// Open each queue inside its owning runtime so its readiness driver and native
+/// connections stay on that worker. Portable callers can use the current runtime.
+pub(crate) async fn run_workers<R, W, Q>(
+    queues: Vec<Q>,
+    mtu: usize,
+    mut context: ServerContext,
+    dedicated: bool,
+) -> Result<()>
+where
+    R: PacketReceive + 'static,
+    W: PacketSend + 'static,
+    Q: FnOnce() -> io::Result<(R, W)> + Send + 'static,
+{
     ensure!(
         (1280..=65535).contains(&mtu),
         "TUN MTU must be between 1280 and 65535"
@@ -189,41 +223,54 @@ pub async fn run<R: PacketReceive + 'static, W: PacketSend + 'static>(
     // Each writer owns its packet storage; only atomic fragment IDs are shared.
     let encoder = udp::Encoder::new(mtu);
     let mut workers: JoinSet<Result<()>> = JoinSet::new();
+    let mut runtimes = WorkerRuntimes(Vec::new());
     let count = queues.len();
-    for (id, ((read, write), inbox)) in queues.into_iter().zip(receivers).enumerate() {
+    for (id, (open, inbox)) in queues.into_iter().zip(receivers).enumerate() {
         let (output, packets) = queue::channel(queue::INITIAL_BYTES, Transmit::size);
-        let gso = write.tcp_gso();
         let state = shared.clone();
         let context = context.clone();
         let encoder = encoder.clone();
-        workers.spawn(
-            async move {
-                // RX and TX progress independently, but share one queue's task and wakeup.
-                // Other queues run in parallel; a pending writer does not stop this receiver.
-                tokio::try_join!(
-                    async {
-                        worker::dispatch(
-                            id,
-                            read,
-                            inbox,
-                            state,
-                            crate::tcp::Link { mtu, gso },
-                            context,
-                            output,
-                        )
+        let work = async move {
+            let (read, write) = open().with_context(|| format!("open TUN queue {id}"))?;
+            let gso = write.tcp_gso();
+            // RX and TX progress independently, but share one queue's task and wakeup.
+            // Other queues run in parallel; a pending writer does not stop this receiver.
+            tokio::try_join!(
+                async {
+                    worker::dispatch(
+                        id,
+                        read,
+                        inbox,
+                        state,
+                        crate::tcp::Link { mtu, gso },
+                        context,
+                        output,
+                    )
+                    .await
+                    .with_context(|| format!("TUN receive queue {id}"))
+                },
+                async {
+                    transmit(id, write, packets, encoder)
                         .await
-                        .with_context(|| format!("TUN receive queue {id}"))
-                    },
-                    async {
-                        transmit(id, write, packets, encoder)
-                            .await
-                            .with_context(|| format!("TUN transmit queue {id}"))
-                    },
-                )?;
-                Ok(())
-            }
-            .in_current_span(),
-        );
+                        .with_context(|| format!("TUN transmit queue {id}"))
+                },
+            )?;
+            Ok(())
+        }
+        .in_current_span();
+        if dedicated {
+            // A runtime owns this long-lived thread. Keeping it out of the
+            // caller's blocking pool leaves that pool available for DNS and I/O.
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name(format!("tun-queue-{id}"))
+                .enable_all()
+                .build()?;
+            workers.spawn_on(work, runtime.handle());
+            runtimes.0.push(runtime);
+        } else {
+            workers.spawn(work);
+        }
     }
 
     let result = async {
@@ -278,8 +325,7 @@ async fn transmit<W: PacketSend>(
     let mut sent_bytes = 0u64;
 
     while input.recv_many(&mut items, 64).await != 0 {
-        let mut pending = items.drain(..).peekable();
-        while let Some(item) = pending.next() {
+        for item in items.drain(..) {
             match item {
                 Transmit::Packet(packet) => packets.push(packet),
                 Transmit::TcpGso {
@@ -300,53 +346,50 @@ async fn transmit<W: PacketSend>(
                     sent_bytes +=
                         packet.len() as u64 + payload.iter().map(|p| p.len() as u64).sum::<u64>();
                 }
-                Transmit::Datagram {
+                Transmit::Datagrams {
                     source,
                     destination,
                     payload,
                 } => {
-                    let size = payload.len();
-                    if device.udp_gso()
-                        && size != 0
-                        && encoder.can_offload(source, destination, size)
-                    {
-                        debug_assert!(parts.is_empty());
-                        parts.push(payload);
-                        while parts.len() < 64 && (parts.len() + 1) * size <= 65507 {
-                            if !matches!(pending.peek(), Some(Transmit::Datagram { source: s, destination: d, payload: p })
-                                if *s == source && *d == destination && p.len() == size)
-                            {
-                                break;
-                            }
-                            // SAFETY: peek established this item's variant; no other
-                            // consumer can modify the local batch iterator.
-                            let Some(Transmit::Datagram { payload, .. }) = pending.next() else {
-                                unreachable!()
-                            };
+                    let mut pending = payload.into_iter().peekable();
+                    while let Some(payload) = pending.next() {
+                        let size = payload.len();
+                        if device.udp_gso()
+                            && size != 0
+                            && encoder.can_offload(source, destination, size)
+                        {
+                            debug_assert!(parts.is_empty());
                             parts.push(payload);
+                            while parts.len() < 64 && (parts.len() + 1) * size <= 65507 {
+                                if !pending.peek().is_some_and(|payload| payload.len() == size) {
+                                    break;
+                                }
+                                // SAFETY: peek found a payload in this local iterator.
+                                parts.push(pending.next().expect("peeked UDP payload"));
+                            }
+                            // SAFETY: The first size was validated and aggregation stops
+                            // before exceeding the IPv4 limit, also valid for IPv6.
+                            let header = encoder
+                                .header(source, destination, size, size * parts.len())
+                                .expect("validated UDP aggregate");
+                            if !packets.is_empty() {
+                                device.send_batch(&packets).await?;
+                                sent_packets += packets.len() as u64;
+                                sent_bytes += packets.iter().map(|p| p.len() as u64).sum::<u64>();
+                                packets.clear();
+                            }
+                            device
+                                .send_udp_segments(&header, &parts, size as u16)
+                                .await?;
+                            sent_packets += parts.len() as u64;
+                            sent_bytes += (header.len() * parts.len() + size * parts.len()) as u64;
+                            parts.clear();
+                            continue;
                         }
-                        // SAFETY: The first size was validated and aggregation stops
-                        // before exceeding the IPv4 limit, also valid for IPv6.
-                        let header = encoder
-                            .header(source, destination, size, size * parts.len())
-                            .expect("validated UDP aggregate");
-                        if !packets.is_empty() {
-                            device.send_batch(&packets).await?;
-                            sent_packets += packets.len() as u64;
-                            sent_bytes += packets.iter().map(|p| p.len() as u64).sum::<u64>();
-                            packets.clear();
+                        let datagram = encoder.encode(source, destination, &payload);
+                        if let Some(datagram) = datagram {
+                            packets.extend(datagram);
                         }
-                        device
-                            .send_udp_segments(&header, &parts, size as u16)
-                            .await?;
-                        sent_packets += parts.len() as u64;
-                        sent_bytes += (header.len() * parts.len() + size * parts.len()) as u64;
-                        parts.clear();
-                        continue;
-                    }
-                    let datagram = encoder.encode(source, destination, &payload);
-                    if let Some(datagram) = datagram {
-                        packets.extend(datagram);
                     }
                 }
             }
@@ -394,10 +437,15 @@ mod tests {
             for (port, output) in [(443, output0), (8443, output1)] {
                 let source = std::net::SocketAddr::new(source.ip(), port);
                 output
-                    .send(Transmit::Datagram {
+                    .send(Transmit::Datagrams {
                         source,
                         destination,
-                        payload: vec![7; 2500].into(),
+                        payload: vec![
+                            Bytes::new(),
+                            vec![7; 2500].into(),
+                            vec![3; 17].into(),
+                            vec![9; 2500].into(),
+                        ],
                     })
                     .await
                     .unwrap();
@@ -411,16 +459,25 @@ mod tests {
         let mut complete = Vec::new();
         while let Ok(packet) = received.try_recv() {
             let header = smoltcp::wire::Ipv4Packet::new_checked(&packet).unwrap();
-            if header.frag_offset() == 0 {
+            if header.frag_offset() == 0 && header.more_frags() {
                 assert!(ids.insert(header.ident()));
             }
             if let Some(packet) = decoder.decode(&packet, Instant::now()) {
                 complete.push(packet.into_owned());
             }
         }
-        assert_eq!(complete.len(), 2);
-        for packet in complete {
-            assert_eq!(packet.udp().unwrap().1, vec![7; 2500]);
+        assert_eq!(complete.len(), 8);
+        for port in [443, 8443] {
+            let payloads: Vec<_> = complete
+                .iter()
+                .map(|packet| packet.udp().unwrap())
+                .filter(|(flow, _)| flow.source.port() == port)
+                .map(|(_, payload)| payload.to_vec())
+                .collect();
+            assert_eq!(
+                payloads,
+                [vec![], vec![7; 2500], vec![3; 17], vec![9; 2500]]
+            );
         }
     }
 }

@@ -22,6 +22,7 @@ class SingBox(Process):
                             "auto_route": False,
                             "dns_mode": "disabled",
                             "stack": "go",
+                            "multi_queue": True,
                             "address": ["192.0.2.1/30", "fd00::1/126"],
                         }
                     ],

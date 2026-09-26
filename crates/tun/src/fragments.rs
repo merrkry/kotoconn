@@ -5,8 +5,8 @@ use crate::{
     packet::{FragmentKey, REASSEMBLY_LIFETIME},
     reassembly::{Lease, Limits},
 };
+use ahash::AHashMap as HashMap;
 use std::{
-    collections::HashMap,
     mem::size_of,
     sync::{
         Arc, Mutex, MutexGuard,
@@ -220,6 +220,24 @@ impl Routes {
             state.entries.remove(&binding.key);
             // Keep the scheduled deadline until the next expiry scan. Clearing
             // it here would wake the supervisor for every completed datagram.
+        }
+    }
+
+    /// Orphans have no decoder owner yet. Reclaim their oldest retained batch
+    /// separately when the shared budget signals pressure.
+    pub fn discard_oldest_pending(&self, shard: usize) -> bool {
+        let mut state = self.lock(shard);
+        let key = state
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.pending.is_some())
+            .min_by_key(|(_, entry)| entry.binding.expires)
+            .map(|(key, _)| *key);
+        if let Some(key) = key {
+            state.entries.remove(&key);
+            true
+        } else {
+            false
         }
     }
 
@@ -447,29 +465,38 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn orphan_admission_charges_backing_storage_and_expires_without_new_traffic() {
-        let allowance = 4096;
-        let limits = Limits::new(allowance);
-        let routes = Routes::new(2, limits.clone());
-        let frames = frames(false, false);
-        let now = Instant::now();
-        // A short view can retain a much larger allocation.
-        let mut block = vec![0; allowance];
-        block[..frames[1].len()].copy_from_slice(&frames[1]);
-        let frame = Received {
-            bytes: Bytes::from(block).slice(..frames[1].len()),
-            allocation_size: allowance,
-            checksum_verified: false,
-            udp_segment_size: None,
-        };
-        assert!(route(&routes, frame, now).is_none());
-        assert!(limits.reserve(allowance, now).is_some());
+    async fn orphan_admission_charges_storage_and_releases_on_expiry_or_pressure() {
+        for reclaim in [false, true] {
+            let allowance = 4096;
+            let limits = Limits::new(allowance);
+            let routes = Routes::new(2, limits.clone());
+            let frames = frames(false, false);
+            let now = Instant::now();
+            // A short view can retain a much larger allocation.
+            let mut block = vec![0; allowance];
+            block[..frames[1].len()].copy_from_slice(&frames[1]);
+            let frame = Received {
+                bytes: Bytes::from(block).slice(..frames[1].len()),
+                allocation_size: allowance,
+                checksum_verified: false,
+                udp_segment_size: None,
+            };
+            assert!(route(&routes, frame, now).is_none());
+            assert!(limits.reserve(allowance, now).is_some());
 
-        assert!(route(&routes, received(frames[1].to_vec()), now).is_none());
-        assert!(limits.reserve(allowance, now).is_none());
-        routes.expire().await;
-        assert_eq!(Instant::now(), now + REASSEMBLY_LIFETIME);
-        assert!(limits.reserve(allowance, Instant::now()).is_some());
+            assert!(route(&routes, received(frames[1].to_vec()), now).is_none());
+            assert!(limits.reserve(allowance, now).is_none());
+            if reclaim {
+                for shard in 0..2 {
+                    routes.discard_oldest_pending(shard);
+                }
+                assert_eq!(Instant::now(), now);
+            } else {
+                routes.expire().await;
+                assert_eq!(Instant::now(), now + REASSEMBLY_LIFETIME);
+            }
+            assert!(limits.reserve(allowance, Instant::now()).is_some());
+        }
     }
 
     #[test]

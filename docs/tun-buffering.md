@@ -18,7 +18,7 @@ The worker can reuse a TIME-WAIT tuple for a bare SYN whose sequence follows all
 
 Each worker shares a payload pool with its Streams. Blocks use power-of-two size classes, at least 256 bytes and at most 128 KiB per block. The free cache retains at most 32 blocks per class; exhaustion allocates another block and never rejects a connection because a cache is empty. Cache bounds limit retained free memory, not live connections. A block returns only when its final immutable view is dropped. Native reads compact short messages before publication so a small datagram does not retain a maximum-size receive allocation. Publishing a shared view still allocates its ownership descriptor. Shutdown trims free blocks. Allocation uses ordinary Rust allocation and is not a recoverable process-wide OOM contract.
 
-Each TUN receive worker keeps one maximum-frame scratch buffer for short reads; large frames transfer that storage. Native UDP shares up to 32 receive slots of 64 KiB per executor thread, allocated on demand and retained until that thread exits. Idle associations do not retain their own receive scratch. Short messages copy once into independent pooled blocks, while large messages transfer a slot and replace it. No scratch borrow crosses an async suspension.
+Each TUN receive worker keeps one maximum-frame scratch buffer for short reads; large frames transfer that storage. Native TCP shares one 64 KiB receive slot per executor thread, and native UDP shares up to 32 slots. Slots are allocated on demand and retained until that thread exits. Idle native connections do not retain their own receive scratch. Short messages copy once into independent pooled blocks, while large messages transfer a slot and replace it. No scratch borrow crosses an async suspension.
 
 A worker owns one `PacketArena` for TCP emission. It reserves output allowance before encoding, so rejected packets cannot leave gaps between published views. Small packets share 16 KiB blocks and are charged twice their length; large packets use the same power-of-two pool as payloads and are also charged twice their length. Descriptor metadata is charged by the queue. Sharing an arena is safe because all of this worker's TCP packets enter the same output queue.
 
@@ -32,9 +32,11 @@ Native outbound TCP sockets use TCP_NODELAY, and TUN TCP disables Nagle. Small r
 
 Eager setup and cancellation run in owner tasks that carry no payload. Cancellation revokes established I/O even when its handle is idle. A resource temporarily held by a synchronous poll remains included in scope completion until that poll releases it.
 
-After the daemon routes a TUN flow, eligible native TCP and UDP transports move to that flow's worker. The worker polls socket readiness, TCP state and packet I/O directly. TCP retains half-close behavior and reports transferred byte counts to the session. UDP transfers its existing ingress queue before accepting new direct input; partial socket sends remove only the accepted prefix. Daemon routing, registration, carrier cancellation and idle expiry remain active. Encoded transports continue through the ordinary chunk or packet path.
+After routing, eligible native TCP and UDP transports move to the flow's worker. It polls socket readiness and protocol state directly. TCP batches blocks into vectored writes, returning receive credit only for the accepted prefix. Half-close, byte accounting, carrier cancellation and idle expiry remain active. Encoded transports use the ordinary chunk or packet path.
 
-Packet queues reserve bytes atomically and consume batches. Worker-local direct UDP backlog uses ordinary fields and a deque. Native Linux UDP uses `recvmmsg`/`sendmmsg`, UDP GRO metadata and vectored `UDP_SEGMENT` output where supported. An unsupported segmentation attempt falls back only for its unaccepted datagrams. Portable socket I/O keeps the same datagram boundaries. Successful forwarding records activity atomically per batch; idle timers check the latest activity when they expire.
+Direct UDP opens scoped packet I/O without an outbound relay queue. Other carriers can decline before network I/O. Existing ingress drains before new direct input, then releases its queue. Partial socket sends remove only the accepted prefix. Receive batches allocate on demand, so idle associations do not reserve payload storage.
+
+Packet queues reserve bytes atomically and consume batches. UDP replies preserve bounded batches with one source and destination through the TUN transmit queue, sharing a reservation and wakeup. Empty, unequal-size and fragmented datagrams retain their boundaries; a single datagram larger than the batch limit remains sendable. Worker-local direct UDP backlog uses ordinary fields and a deque. Native Linux UDP uses `recvmmsg`/`sendmmsg`, UDP GRO metadata and vectored `UDP_SEGMENT` output where supported. An unsupported segmentation attempt falls back only for its unaccepted datagrams. Portable socket I/O keeps the same datagram boundaries. Successful forwarding records activity atomically per batch; idle timers check the latest activity when they expire.
 
 ## Backlog policy
 
@@ -44,9 +46,9 @@ Packet queues reserve bytes atomically and consume batches. Worker-local direct 
 | TCP RX | Advertise available receive credit; retain already accepted data |
 | TCP TX | Apply Stream write backpressure until ACK returns credit |
 | TUN transmit queue | TCP connections retry from the worker's blocked list; ordinary UDP writers wait; direct UDP retains one reply batch and retries from the worker's blocked list; immediate ACK/reset replies use nonblocking admission |
-| UDP association ingress | Drop new datagrams without blocking shared reception |
+| UDP association ingress | Try native progress, then drop new datagrams if still full; never block shared reception |
 | UDP GSO segments | Share one receive allocation; apply per-datagram admission before queueing views |
-| IP reassembly | Reject growth beyond shared allowance before allocation; expiry releases incomplete datagrams |
+| IP reassembly | Reject growth before allocation and notify all workers to reclaim their oldest incomplete datagram and orphan batch; poisoned identities retain their original expiry |
 
 `Capacity` measures completed bytes over a feedback interval. The target is the largest of the initial allowance, measured consumption rate times a target delay, and the previous target halved per elapsed interval. A smaller queue target constrains new admission without discarding accepted items. An empty packet queue can admit one complete item larger than its target, so a valid datagram remains sendable.
 

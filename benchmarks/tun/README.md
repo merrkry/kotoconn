@@ -10,8 +10,10 @@ mise exec -- moon run benchmark:test-udp-churn
 
 Use `--help` for workload filters and measurement options. To compare against a
 caller-supplied sing-box 1.15 binary with the go TUN stack, pass
-`--sing-box /path/to/sing-box`. Collect a reference baseline deliberately; omit
-this option for routine candidate measurements.
+`--sing-box /path/to/sing-box`. The reference enables multi-queue TUN, using
+the same CPU allowance as Kotoconn. Both implementations use the same generator
+binary and alternate execution order. Omit this option for routine candidate
+measurements.
 
 ## Comparing results
 
@@ -25,6 +27,10 @@ Read completion rate together with loss and latency. Offered-load duration diffe
 from completion time under overload because receive drain remains in the measured
 window. Paced UDP allows reported loss; strict request/reply cases require every
 reply. UDP churn counts client sockets, which may reuse existing proxy associations.
+
+The full profile includes `udp-large-1` and `udp-large`, with 8192-byte datagrams
+on one and four flows. They exercise IP fragmentation at MTU 1500 and large
+unfragmented packets at MTU 9000. `--udp-rate` sets the offered rate per flow.
 
 Important metric interpretations:
 

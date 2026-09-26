@@ -27,12 +27,16 @@ struct Native {
     sender: crate::udp_batch::Sender,
 }
 
-pub(super) fn start(socket: UdpSocket, target: Target, scope: Scope) -> anyhow::Result<Datagram> {
+pub(super) fn open(
+    socket: UdpSocket,
+    target: Target,
+    scope: Scope,
+) -> anyhow::Result<NativeDatagram> {
     #[cfg(target_os = "linux")]
     if let Err(error) = crate::udp_batch::enable_gro(&socket) {
         tracing::debug!(%error, "UDP GRO unavailable");
     }
-    let native = packet_io_task(
+    let io = packet_io_task(
         scope.clone(),
         Box::new(Native {
             socket,
@@ -43,9 +47,14 @@ pub(super) fn start(socket: UdpSocket, target: Target, scope: Scope) -> anyhow::
             sender: crate::udp_batch::Sender::default(),
         }),
     )?;
+    Ok(NativeDatagram { io, scope })
+}
+
+pub(super) fn start(socket: UdpSocket, target: Target, scope: Scope) -> anyhow::Result<Datagram> {
+    let native = open(socket, target, scope.clone())?;
     let (mut user, driver) = packet_pair(scope.clone());
     let requests = user.offer_handoff();
-    scope.spawn(drive(native, driver, requests))?;
+    scope.spawn(drive(native.io, driver, requests))?;
     Ok(user)
 }
 

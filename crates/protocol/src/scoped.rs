@@ -204,6 +204,23 @@ impl AsyncWrite for Scoped {
         self.with(|stream| stream.poll_write(cx, bytes))
             .unwrap_or_else(|| self.unavailable())
     }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        self.shared.writer.register(cx.waker());
+        self.with(|stream| stream.poll_write_vectored(cx, bytes))
+            .unwrap_or_else(|| self.unavailable())
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.shared
+            .with(|stream| stream.is_write_vectored())
+            .unwrap_or(false)
+    }
+
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.shared.writer.register(cx.waker());
         self.with(|stream| stream.poll_flush(cx))
