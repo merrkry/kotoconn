@@ -75,6 +75,25 @@ def cases(args):
                     "allow_loss": True,
                 },
             ),
+            (
+                "udp-large-1",
+                {
+                    "protocol": "udp",
+                    "rate": args.udp_rate,
+                    "datagram_bytes": 8192,
+                    "allow_loss": True,
+                },
+            ),
+            (
+                "udp-large",
+                {
+                    "protocol": "udp",
+                    "connections": 4,
+                    "rate": args.udp_rate,
+                    "datagram_bytes": 8192,
+                    "allow_loss": True,
+                },
+            ),
             ("udp-churn", {"protocol": "udp", "workload": "churn", "connections": 8}),
             (
                 "udp-sparse",

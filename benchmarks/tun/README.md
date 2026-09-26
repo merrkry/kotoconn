@@ -33,6 +33,10 @@ from completion time under overload because receive drain remains in the measure
 window. Paced UDP allows reported loss; strict request/reply cases require every
 reply. UDP churn counts client sockets, which may reuse existing proxy associations.
 
+The full profile includes `udp-large-1` and `udp-large`, with 8192-byte datagrams
+on one and four flows. They exercise IP fragmentation at MTU 1500 and large
+unfragmented packets at MTU 9000. `--udp-rate` sets the offered rate per flow.
+
 Important metric interpretations:
 
 - Payload throughput counts verified traffic in both directions, excluding headers
