@@ -138,6 +138,12 @@ async fn session(
     // Keep the relay state in one allocation instead of embedding it in each
     // enclosing cancellation and idle-timeout future.
     let work = Box::pin(async {
+        let sniff = if let Some(config) = &handler.sniff {
+            kotoconn_inbounds::sniff::udp(&mut incoming, config).await
+        } else {
+            None
+        };
+
         let decision = handler
             .policy
             .route(
@@ -145,6 +151,7 @@ async fn session(
                 Flow {
                     protocol: TransportProtocol::Udp,
                     dest: destination.clone(),
+                    sniff,
                 },
             )
             .await?;

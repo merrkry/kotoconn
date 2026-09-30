@@ -27,6 +27,8 @@ pub struct InboundId(pub NonZeroU64);
 #[derive(Debug, Clone, PartialEq, Eq, ts_rs::TS)]
 pub struct InboundConfig {
     pub routing_handler: RoutingHandlerId,
+    #[ts(optional)]
+    pub sniff: Option<crate::SniffConfig>,
     #[ts(type = "Timeout")]
     pub udp_idle_timeout: Duration,
     pub implementation: InboundImpl,

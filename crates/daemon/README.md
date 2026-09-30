@@ -20,6 +20,28 @@ TCP and UDP clients expose independent close handles through `client_control`. `
 
 Shadowsocks uses the single-user AES-128-GCM 2022 method in this version. The example key is public test data, not a deployment credential. HTTP supports CONNECT only; SOCKS5 supports CONNECT and UDP ASSOCIATE without authentication. UDP session routing uses `route_udp` and cannot override the destination. `lookup` uses system DNS; the I/O carrier itself never resolves domain targets.
 
+## Inbound sniffing
+
+Set `sniff: { timeout: k.timeout(300) }` on `k.inbound(...)` to inspect payload before calling the routing handler. Omit `sniff` to disable it. The timeout must be positive and limits the whole inspection, rather than each read.
+
+Sniffing recognizes HTTP Host and TLS ClientHello SNI over TCP, and QUIC Initial ClientHello SNI over UDP. QUIC v1, v2 and drafts 29–32 are supported. Fragmented TCP headers, TLS records and QUIC CRYPTO frames are assembled within a 64 KiB inspection limit. UDP also stops after 32 datagrams. Unknown, malformed or incomplete payloads and timeouts continue to routing with `flow.sniff === undefined`. Transport I/O errors close the session.
+
+The handler receives `flow.sniff` with `protocol` set to `"http"`, `"tls"` or `"quic"`, and an optional `domain`. A recognized protocol without a hostname has `domain === undefined`. HTTP Host ports are removed, IP literals are excluded, and domains are lowercase. Encrypted ClientHello cannot expose its inner SNI.
+
+`flow.dest` keeps the original destination. The script decides whether to use the sniffed domain for TCP routing:
+
+```ts
+const routing = k.routing_handler((flow) => {
+  if (flow.protocol === "udp") return k.route_udp(dialer);
+
+  const domain = flow.sniff?.domain;
+  const target = domain ? k.domain(domain, flow.dest.port) : flow.dest;
+  return k.route(dialer, target);
+});
+```
+
+UDP sniffing runs once per destination-specific session and can select an outbound without changing the destination. Inspection preserves TCP bytes and complete datagrams, including their order and address metadata. Server-first TCP protocols wait until the sniff timeout before routing. This follows sing-box's [protocol sniffing](https://sing-box.sagernet.org/configuration/route/sniff/) and [sniff action](https://sing-box.sagernet.org/configuration/route/rule_action/#sniff), with the protocol scope listed above.
+
 ## Logging
 
 The `kotoconn` binary initializes a global tracing subscriber before starting the runtime. Logs go to stderr and default to `info`. Set `RUST_LOG` to control levels by module; an invalid filter fails startup. Use `--log-format json` for newline-delimited JSON, or keep the default `text` format. Text output uses color only when stderr is a terminal.

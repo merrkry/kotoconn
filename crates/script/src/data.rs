@@ -12,6 +12,53 @@ use ts_rs::TS;
 pub(crate) struct Flow {
     pub protocol: TransportProtocol,
     pub dest: Target,
+    pub sniff: Option<SniffResult>,
+}
+
+#[derive(FromJs, IntoJs, TS, StructuralConvert)]
+#[convert(from(config::SniffResult), into(config::SniffResult))]
+#[ts(as = "config::SniffResult")]
+pub(crate) struct SniffResult {
+    pub protocol: SniffProtocol,
+    pub domain: Option<String>,
+}
+
+#[derive(FromJs, TS, StructuralConvert)]
+#[convert(from(config::SniffConfig), into(config::SniffConfig))]
+#[ts(as = "config::SniffConfig")]
+pub(crate) struct SniffConfig {
+    pub timeout: Timeout,
+}
+
+#[derive(TS, StructuralConvert)]
+#[convert(from(config::SniffProtocol), into(config::SniffProtocol))]
+#[ts(as = "config::SniffProtocol")]
+pub(crate) enum SniffProtocol {
+    Http,
+    Tls,
+    Quic,
+}
+
+impl<'js> FromJs<'js> for SniffProtocol {
+    fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
+        match String::from_js(ctx, value)?.as_str() {
+            "http" => Ok(Self::Http),
+            "tls" => Ok(Self::Tls),
+            "quic" => Ok(Self::Quic),
+            _ => Err(invalid("expected http, tls or quic")),
+        }
+    }
+}
+
+impl<'js> IntoJs<'js> for SniffProtocol {
+    fn into_js(self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        match self {
+            Self::Http => "http",
+            Self::Tls => "tls",
+            Self::Quic => "quic",
+        }
+        .into_js(ctx)
+    }
 }
 
 #[derive(TS, StructuralConvert)]
@@ -63,6 +110,7 @@ pub(crate) struct OutboundConfig {
 #[ts(as = "config::InboundConfig")]
 pub(crate) struct InboundConfig {
     pub routing_handler: Routing,
+    pub sniff: Option<SniffConfig>,
     pub udp_idle_timeout: Timeout,
     pub implementation: InboundImpl,
 }

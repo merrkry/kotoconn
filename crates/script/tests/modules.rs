@@ -105,6 +105,7 @@ async fn seals_registration_after_native_await_and_calls_each_handler_family() {
                 routing,
                 Flow {
                     protocol: TransportProtocol::Udp,
+                    sniff: None,
                     dest: Target::Domain {
                         name: "test.invalid".into(),
                         port: 53

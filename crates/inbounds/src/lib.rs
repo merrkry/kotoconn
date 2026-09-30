@@ -1,5 +1,6 @@
 //! Public inbound construction. Wire protocols live in their own adapter crates.
 mod direct;
+pub mod sniff;
 
 use anyhow::Result;
 pub use kotoconn_anytls as anytls;

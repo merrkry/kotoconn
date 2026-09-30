@@ -61,6 +61,9 @@ impl Network {
                 !config.udp_idle_timeout.is_zero(),
                 "UDP idle timeout must be positive"
             );
+            if let Some(sniff) = &config.sniff {
+                ensure!(!sniff.timeout.is_zero(), "sniff timeout must be positive");
+            }
             ensure!(
                 policy
                     .config()
@@ -74,6 +77,7 @@ impl Network {
                 routing: config.routing_handler,
                 sessions: sessions.clone(),
                 idle: config.udp_idle_timeout,
+                sniff: config.sniff.clone(),
             });
 
             let server = kotoconn_inbounds::bind(
@@ -242,6 +246,7 @@ struct SessionHandler {
     routing: RoutingHandlerId,
     sessions: sessions::Sessions,
     idle: std::time::Duration,
+    sniff: Option<SniffConfig>,
 }
 
 impl p::Handler for SessionHandler {
@@ -268,6 +273,15 @@ impl p::Handler for SessionHandler {
 
                 let result = scope
                     .run(async {
+                        let sniff = if let Some(config) = &self.sniff {
+                            let (inspected, result) =
+                                kotoconn_inbounds::sniff::tcp(stream, config).await?;
+                            stream = inspected;
+                            result
+                        } else {
+                            None
+                        };
+
                         let decision = self
                             .policy
                             .route(
@@ -275,6 +289,7 @@ impl p::Handler for SessionHandler {
                                 Flow {
                                     protocol: TransportProtocol::Tcp,
                                     dest: destination,
+                                    sniff,
                                 },
                             )
                             .await?;

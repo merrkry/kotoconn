@@ -12,4 +12,6 @@ pub struct Flow {
     pub protocol: TransportProtocol,
     // The client's requested destination, unchanged by routing or resolution.
     pub dest: Target,
+    #[ts(type = "SniffResult | undefined")]
+    pub sniff: Option<crate::SniffResult>,
 }

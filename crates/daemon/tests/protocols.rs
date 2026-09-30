@@ -505,6 +505,7 @@ async fn capability_checks_and_udp_policy_contract_reject_invalid_requests() -> 
                 handler,
                 Flow {
                     protocol: TransportProtocol::Udp,
+                    sniff: None,
                     dest: target("127.0.0.1:2".parse()?),
                 },
             )
