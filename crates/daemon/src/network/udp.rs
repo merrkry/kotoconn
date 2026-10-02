@@ -13,16 +13,31 @@ impl Drop for Entry {
     }
 }
 
+struct Completion {
+    target: Target,
+    generation: u64,
+    sender: mpsc::UnboundedSender<(Target, u64)>,
+}
+
+impl Drop for Completion {
+    fn drop(&mut self) {
+        let _ = self.sender.send((self.target.clone(), self.generation));
+    }
+}
+
 pub(super) fn association(
     handler: SessionHandler,
     mut packets: Datagram,
 ) -> BoxFuture<'static, Result<()>> {
+    debug_assert!(packets.session_activity.is_none() || packets.single_target.is_some());
+
     if let Some(target) = packets.single_target.take() {
         // Select the driver before constructing its future. Otherwise every TUN
         // association retains the larger multi-target dispatch state while idle.
         Box::pin(async move {
             let incoming = packets.take_receiver();
             let worker = packets.worker.take();
+            let activity = packets.session_activity.take();
             packets
                 .scope
                 .run(session(
@@ -32,6 +47,7 @@ pub(super) fn association(
                     packets.tx.clone(),
                     packets.scope.clone(),
                     worker,
+                    activity,
                 ))
                 .await
         })
@@ -43,7 +59,7 @@ pub(super) fn association(
 async fn route_packets(handler: SessionHandler, mut packets: Datagram) -> Result<()> {
     let mut sessions = HashMap::<Target, Entry>::new();
     let (completed, mut completions) = mpsc::unbounded_channel();
-    let mut generation = 0;
+    let mut generation = 0u64;
 
     let mut batch = Vec::with_capacity(32);
     loop {
@@ -59,60 +75,67 @@ async fn route_packets(handler: SessionHandler, mut packets: Datagram) -> Result
                 }
             }
             count = packets.rx.recv_many(&mut batch, 32) => {
-                if count == 0 { return Ok(()); }
-                for packet in batch.drain(..) {
-                let target = packet.target.clone();
-
-                if sessions
-                    .get(&target)
-                    .is_some_and(|entry| entry.scope.is_closed())
-                {
-                    sessions.remove(&target);
+                if count == 0 {
+                    return Ok(());
                 }
 
-                if !sessions.contains_key(&target) {
-                    if sessions.len() >= 1024 {
-                        continue;
+                for packet in batch.drain(..) {
+                    let target = packet.target.clone();
+
+                    if sessions
+                        .get(&target)
+                        .is_some_and(|entry| entry.scope.is_closed())
+                    {
+                        sessions.remove(&target);
                     }
 
-                    generation += 1;
-                    let scope = packets.scope.child();
-                    let (tx, rx) = kotoconn_protocol::queue::channel(kotoconn_protocol::queue::INITIAL_BYTES, |packet: &Packet| packet.payload.len());
-                    let instance = handler.clone();
-                    let replies = packets.tx.clone();
-                    let done = completed.clone();
-                    let destination = target.clone();
-                    let control = scope.clone();
-
-                    let span = tracing::info_span!("session", protocol = "udp", ?destination, session_id = tracing::field::Empty);
-                    scope.spawn(async move {
-                        let result =
-                            control
-                                .run(session(
-                                    instance,
-                                    destination.clone(),
-                                    rx,
-                                    replies,
-                                    control.clone(),
-                                    None,
-                                ))
-                                .await;
-                        if let Err(error) = &result
-                            && !control.is_closed()
-                        {
-                            tracing::warn!(error = %format_args!("{error:#}"), "UDP session failed");
+                    if !sessions.contains_key(&target) {
+                        if sessions.len() >= 1024 {
+                            continue;
                         }
-                        tracing::debug!("session finished");
-                        control.close();
-                        let _ = done.send((destination, generation));
 
-                        result
-                    }.instrument(span))?;
+                        generation = generation.checked_add(1)
+                            .context("UDP session generation exhausted")?;
+                        let scope = packets.scope.child();
+                        let (tx, rx) = p::queue::channel(
+                            p::queue::INITIAL_BYTES,
+                            |packet: &Packet| packet.payload.len(),
+                        );
+                        let instance = handler.clone();
+                        let replies = packets.tx.clone();
+                        let completion = Completion {
+                            target: target.clone(),
+                            generation,
+                            sender: completed.clone(),
+                        };
+                        let destination = target.clone();
+                        let control = scope.clone();
 
-                    sessions.insert(target.clone(), Entry { tx, scope, generation });
-                }
+                        let span = tracing::info_span!("session", protocol = "udp", ?destination, session_id = tracing::field::Empty);
+                        scope.spawn(async move {
+                            let _completion = completion;
+                            let result = session(
+                                instance,
+                                destination,
+                                rx,
+                                replies,
+                                control,
+                                None,
+                                None,
+                            ).await;
+                            tracing::debug!("session finished");
 
-                let _ = sessions[&target].tx.try_send(packet);
+                            result
+                        }.instrument(span))?;
+
+                        sessions.insert(target.clone(), Entry { tx, scope, generation });
+                    }
+
+                    // SAFETY: this loop found or inserted the target; completions
+                    // cannot mutate the map until the next select iteration.
+                    debug_assert!(sessions.contains_key(&target));
+                    let entry = sessions.get(&target).expect("admitted UDP session");
+                    let _ = entry.tx.try_send(packet);
                 }
             }
         }
@@ -126,20 +149,29 @@ async fn session(
     replies: kotoconn_protocol::queue::Sender<Packet>,
     scope: Scope,
     worker: Option<Arc<dyn p::DatagramWorker>>,
+    shared_activity: Option<p::Activity>,
 ) -> Result<()> {
-    let registration = handler
-        .sessions
-        .register(destination.clone(), TransportProtocol::Udp, scope.clone())
-        .await?;
-    tracing::Span::current().record("session_id", registration.id.0);
-    tracing::debug!("session started");
+    let (lifetime, activity) = match shared_activity {
+        Some(activity) => (None, activity),
+        None => {
+            let lifetime = p::UdpSession::new(scope.clone(), handler.idle);
+            let activity = lifetime.activity();
+            (Some(lifetime), activity)
+        }
+    };
 
-    let activity = p::Activity::default();
     // Keep the relay state in one allocation instead of embedding it in each
     // enclosing cancellation and idle-timeout future.
     let work = Box::pin(async {
+        let registration = handler
+            .sessions
+            .register(destination.clone(), TransportProtocol::Udp, scope.clone())
+            .await?;
+        tracing::Span::current().record("session_id", registration.id.0);
+        tracing::debug!("session started");
+
         let sniff = if let Some(config) = &handler.sniff {
-            kotoconn_inbounds::sniff::udp(&mut incoming, config).await
+            kotoconn_inbounds::sniff::udp(&mut incoming, config, &scope).await
         } else {
             None
         };
@@ -190,8 +222,8 @@ async fn session(
                     while incoming.recv_many(&mut batch, 32).await != 0 {
                         for packet in batch.drain(..) {
                             outgoing.tx.send(packet).await?;
+                            activity.record();
                         }
-                        activity.record();
                     }
                     Ok::<(), anyhow::Error>(())
                 };
@@ -199,10 +231,13 @@ async fn session(
                 let backward = async {
                     let mut batch = Vec::with_capacity(32);
                     while outgoing.rx.recv_many(&mut batch, 32).await != 0 {
+                        let mut forwarded = false;
                         for packet in batch.drain(..) {
-                            let _ = replies.try_send(packet);
+                            forwarded |= replies.try_send(packet).is_ok();
                         }
-                        activity.record();
+                        if forwarded {
+                            activity.record();
+                        }
                     }
                     Ok::<(), anyhow::Error>(())
                 };
@@ -210,12 +245,8 @@ async fn session(
             })
             .await
     });
-    tokio::select! {
-        biased;
-        _ = activity.until_idle(handler.idle) => {
-            tracing::debug!("UDP session idle timeout");
-            Ok(())
-        },
-        result = work => result,
+    match lifetime {
+        Some(lifetime) => lifetime.run(work).await,
+        None => work.await,
     }
 }

@@ -24,7 +24,7 @@ Shadowsocks uses the single-user AES-128-GCM 2022 method in this version. The ex
 
 Set `sniff: { timeout: k.timeout(300) }` on `k.inbound(...)` to inspect payload before calling the routing handler. Omit `sniff` to disable it. The timeout must be positive and limits the whole inspection, rather than each read.
 
-Sniffing recognizes HTTP Host and TLS ClientHello SNI over TCP, and QUIC Initial ClientHello SNI over UDP. QUIC v1, v2 and drafts 29–32 are supported. Fragmented TCP headers, TLS records and QUIC CRYPTO frames are assembled within a 64 KiB inspection limit. UDP also stops after 32 datagrams. Unknown, malformed or incomplete payloads and timeouts continue to routing with `flow.sniff === undefined`. Transport I/O errors close the session.
+Sniffing recognizes HTTP Host and TLS ClientHello SNI over TCP, and QUIC Initial ClientHello SNI over UDP. QUIC v1, v2 and drafts 29–32 are supported. Fragmented TCP headers, TLS records and QUIC CRYPTO frames are assembled within a 64 KiB inspection limit. UDP also stops after 32 datagrams. Unsuccessful inspection leaves `flow.sniff === undefined` and preserves traffic for routing while the session remains active. UDP idle expiry or session cancellation can end the session during inspection and discard its buffers. Transport I/O errors close the session.
 
 The handler receives `flow.sniff` with `protocol` set to `"http"`, `"tls"` or `"quic"`, and an optional `domain`. A recognized protocol without a hostname has `domain === undefined`. HTTP Host ports are removed, IP literals are excluded, and domains are lowercase. Encrypted ClientHello cannot expose its inner SNI.
 

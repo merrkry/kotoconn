@@ -62,6 +62,7 @@ impl Scope {
         self
     }
 
+    /// Request abort of this scope and its descendants; completion is separate.
     pub fn close(&self) {
         self.token.cancel();
     }
@@ -74,7 +75,10 @@ impl Scope {
         self.token.cancelled().await;
     }
 
+    /// Observe registered work releasing its resources after drain or abort.
     pub async fn wait(&self) {
+        // SAFETY: new creates a tracker; child adds one and tracked_by preserves it.
+        debug_assert!(!self.trackers.is_empty());
         self.trackers.last().expect("scope tracker").wait().await;
     }
 

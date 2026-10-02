@@ -27,8 +27,11 @@ pub struct Datagram {
     pub tx: queue::Sender<Packet>,
     pub rx: queue::Receiver<Packet>,
     pub scope: Scope,
-    /// A TUN flow has one destination, so routing can own its ingress directly.
+    /// A connected association has one destination, so routing can own its ingress directly.
     pub single_target: Option<Target>,
+    /// Set only when the inbound owns this single-target session's idle deadline.
+    /// Routing and forwarding share this record instead of creating another timer.
+    pub session_activity: Option<Activity>,
     pub worker: Option<Arc<dyn DatagramWorker>>,
     handoff: Option<oneshot::Sender<oneshot::Sender<Option<BoxPacketIo>>>>,
     close_on_drop: bool,
@@ -140,6 +143,7 @@ pub fn packet_pair(scope: Scope) -> (Datagram, Datagram) {
             rx: a_rx,
             scope: scope.clone(),
             single_target: None,
+            session_activity: None,
             worker: None,
             handoff: None,
             close_on_drop: true,
@@ -149,6 +153,7 @@ pub fn packet_pair(scope: Scope) -> (Datagram, Datagram) {
             rx: b_rx,
             scope,
             single_target: None,
+            session_activity: None,
             worker: None,
             handoff: None,
             close_on_drop: true,

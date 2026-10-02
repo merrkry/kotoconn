@@ -1,6 +1,6 @@
 use kotoconn_config::{SniffConfig, SniffProtocol, SniffResult};
 use kotoconn_inbounds::sniff;
-use kotoconn_protocol::{Packet, queue, target};
+use kotoconn_protocol::{Packet, Scope, queue, target};
 use rustls::{ClientConfig, RootCertStore, Side, quic::Version};
 use std::{sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -27,7 +27,7 @@ fn tls_hello(sni: bool) -> Vec<u8> {
     let mut config = (*client_config()).clone();
     config.enable_sni = sni;
     let mut client =
-        rustls::ClientConnection::new(Arc::new(config), "sniff.example".try_into().unwrap())
+        rustls::ClientConnection::new(Arc::new(config), "SnIfF.ExAmPlE".try_into().unwrap())
             .unwrap();
     let mut bytes = Vec::new();
     while client.wants_write() {
@@ -41,6 +41,13 @@ async fn tcp_inspects_fragmented_headers_and_replays_every_byte() {
     let cases = [
         (
             b"GET / HTTP/1.1\r\nhOsT: Sniff.Example:8080\r\n\r\nbody".to_vec(),
+            Some(SniffResult {
+                protocol: SniffProtocol::Http,
+                domain: Some("sniff.example".into()),
+            }),
+        ),
+        (
+            b"VERSION-CONTROL / HTTP/1.1\r\nHost: Sniff.Example\r\n\r\n".to_vec(),
             Some(SniffResult {
                 protocol: SniffProtocol::Http,
                 domain: Some("sniff.example".into()),
@@ -83,7 +90,9 @@ async fn tcp_inspects_fragmented_headers_and_replays_every_byte() {
             peer.write_all(&sent).await.unwrap();
             peer.shutdown().await.unwrap();
         });
-        let (mut stream, result) = sniff::tcp(Box::pin(stream), &config()).await.unwrap();
+        let (mut stream, result) = sniff::tcp(Box::pin(stream), &config(), &Scope::new())
+            .await
+            .unwrap();
         assert_eq!(result, expected);
 
         let mut received = Vec::new();
@@ -97,7 +106,9 @@ async fn tcp_inspects_fragmented_headers_and_replays_every_byte() {
 async fn tcp_timeout_preserves_partial_payload_and_allows_server_first_io() {
     let (mut peer, stream) = tokio::io::duplex(1024);
     peer.write_all(b"GET / HTTP/1.1\r\nHost: ").await.unwrap();
-    let (mut stream, result) = sniff::tcp(Box::pin(stream), &config()).await.unwrap();
+    let (mut stream, result) = sniff::tcp(Box::pin(stream), &config(), &Scope::new())
+        .await
+        .unwrap();
     assert_eq!(result, None);
 
     let mut bytes = [0; 22];
@@ -109,8 +120,72 @@ async fn tcp_timeout_preserves_partial_payload_and_allows_server_first_io() {
     assert_eq!(&greeting, b"hello");
 
     let (_peer, stream) = tokio::io::duplex(1024);
-    let (_, result) = sniff::tcp(Box::pin(stream), &config()).await.unwrap();
+    let (_, result) = sniff::tcp(Box::pin(stream), &config(), &Scope::new())
+        .await
+        .unwrap();
     assert_eq!(result, None);
+}
+
+#[tokio::test]
+async fn tcp_interruption_returns_no_metadata_and_preserves_stream_io() {
+    let (mut peer, stream) = tokio::io::duplex(1024);
+    let payload = b"GET / HTTP/1.1\r\nHost: partial";
+    peer.write_all(payload).await.unwrap();
+    let interruption = Scope::new();
+    let config = config();
+    let mut inspecting = Box::pin(sniff::tcp(Box::pin(stream), &config, &interruption));
+    assert!(futures_util::poll!(inspecting.as_mut()).is_pending());
+
+    interruption.close();
+    let (mut stream, result) = inspecting.await.unwrap();
+    assert_eq!(result, None);
+    let mut replayed = vec![0; payload.len()];
+    stream.read_exact(&mut replayed).await.unwrap();
+    assert_eq!(replayed, payload);
+
+    stream.write_all(b"reply").await.unwrap();
+    let mut reply = [0; 5];
+    peer.read_exact(&mut reply).await.unwrap();
+    assert_eq!(&reply, b"reply");
+}
+
+#[tokio::test]
+async fn udp_interruption_replays_incomplete_quic_datagrams_in_order() {
+    let destination = target("192.0.2.1:443".parse().unwrap());
+    let hello = quic_hello(Version::V1);
+    let payloads = [
+        initial(Version::V1, 0, 0, &hello[..20]),
+        initial(Version::V1, 1, 20, &hello[20..40]),
+    ];
+    let (sender, mut receiver) = queue::channel(queue::INITIAL_BYTES, |p: &Packet| p.payload.len());
+    for payload in &payloads {
+        sender
+            .send(Packet {
+                target: destination.clone(),
+                payload: payload.clone().into(),
+            })
+            .await
+            .unwrap();
+    }
+    let interruption = Scope::new();
+    let config = config();
+    let mut inspecting = Box::pin(sniff::udp(&mut receiver, &config, &interruption));
+    assert!(futures_util::poll!(inspecting.as_mut()).is_pending());
+
+    interruption.close();
+    assert_eq!(inspecting.await, None);
+    sender
+        .send(Packet {
+            target: destination.clone(),
+            payload: Vec::new().into(),
+        })
+        .await
+        .unwrap();
+    for payload in payloads.into_iter().chain([Vec::new()]) {
+        let packet = receiver.try_recv().unwrap();
+        assert_eq!(packet.target, destination);
+        assert_eq!(packet.payload.as_ref(), payload);
+    }
 }
 
 fn varint(value: usize, out: &mut Vec<u8>) {
@@ -126,7 +201,7 @@ fn quic_hello(version: Version) -> Vec<u8> {
     let mut client = rustls::quic::ClientConnection::new(
         client_config(),
         version,
-        "sniff.example".try_into().unwrap(),
+        "SnIfF.ExAmPlE".try_into().unwrap(),
         Vec::new(),
     )
     .unwrap();
@@ -200,7 +275,7 @@ async fn udp_reassembles_authenticated_quic_crypto_and_replays_packets_in_order(
         drop(sender);
 
         assert_eq!(
-            sniff::udp(&mut receiver, &config()).await,
+            sniff::udp(&mut receiver, &config(), &Scope::new()).await,
             Some(SniffResult {
                 protocol: SniffProtocol::Quic,
                 domain: Some("sniff.example".into()),
@@ -240,7 +315,10 @@ async fn udp_unknown_corrupt_and_incomplete_payloads_remain_unchanged() {
             .await
             .unwrap();
 
-        assert_eq!(sniff::udp(&mut receiver, &config()).await, None);
+        assert_eq!(
+            sniff::udp(&mut receiver, &config(), &Scope::new()).await,
+            None
+        );
         let replayed = receiver.try_recv().unwrap();
         assert_eq!(replayed.target, destination);
         assert_eq!(replayed.payload.as_ref(), payload);

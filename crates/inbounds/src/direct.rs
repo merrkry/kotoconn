@@ -44,94 +44,110 @@ impl p::Server for Server {
     }
 }
 
-struct Association {
+struct SessionEntry {
     tx: kotoconn_protocol::queue::Sender<Packet>,
     scope: Scope,
-    active: tokio::time::Instant,
+    activity: Activity,
+    generation: u64,
 }
 
-impl Drop for Association {
+impl Drop for SessionEntry {
     fn drop(&mut self) {
         self.scope.close();
     }
 }
 
+struct Completion {
+    peer: SocketAddr,
+    generation: u64,
+    sender: mpsc::UnboundedSender<(SocketAddr, u64)>,
+}
+
+impl Drop for Completion {
+    fn drop(&mut self) {
+        let _ = self.sender.send((self.peer, self.generation));
+    }
+}
+
 async fn udp(socket: UdpSocket, target: Target, context: ServerContext) -> Result<()> {
-    let mut peers = HashMap::<SocketAddr, Association>::new();
-    let (responses, mut replies) = mpsc::channel::<(SocketAddr, Packet)>(64);
+    let mut peers = HashMap::<SocketAddr, SessionEntry>::new();
+    let (responses, mut replies) = mpsc::channel::<(SocketAddr, u64, Packet)>(64);
+    let (completed, mut completions) = mpsc::unbounded_channel();
+    let mut generation = 0u64;
     let mut buffer = vec![0; 65536];
 
     loop {
-        let expiry = peers
-            .values()
-            .map(|a| a.active + context.udp_idle_timeout)
-            .min();
-
         tokio::select! {
             biased;
             _ = context.stopping.cancelled() => return Ok(()),
             _ = context.scope.cancelled() => return Ok(()),
-            _ = async {
-                match expiry {
-                    Some(at) => tokio::time::sleep_until(at).await,
-                    None => std::future::pending().await,
+            Some((peer, generation)) = completions.recv() => {
+                if peers.get(&peer).is_some_and(|entry| entry.generation == generation) {
+                    peers.remove(&peer);
                 }
-            } => {
-                peers.retain(|_, a| a.active + context.udp_idle_timeout > tokio::time::Instant::now());
             }
             received = socket.recv_from(&mut buffer) => {
                 let (n, peer) = received?;
+                if peers.get(&peer).is_some_and(|entry| entry.scope.is_closed()) {
+                    peers.remove(&peer);
+                }
 
                 if !peers.contains_key(&peer) {
                     if peers.len() >= 4096 {
                         continue;
                     }
 
+                    generation = generation.checked_add(1)
+                        .ok_or_else(|| anyhow::anyhow!("direct UDP generation exhausted"))?;
                     let scope = context.scope.child();
-                    let (association, mut driver) = packet_pair(scope.clone());
+                    let lifetime = UdpSession::new(scope.clone(), context.udp_idle_timeout);
+                    let activity = lifetime.activity();
+                    let (mut association, mut driver) = packet_pair(scope.clone());
+                    association.single_target = Some(target.clone());
+                    association.session_activity = Some(activity.clone());
                     let tx = driver.tx.clone();
                     let handler = context.handler.clone();
                     let responses = responses.clone();
+                    let completion = Completion { peer, generation, sender: completed.clone() };
 
                     scope.spawn(async move {
-                        let work = handler.udp(association);
-                        tokio::pin!(work);
+                        let _completion = completion;
+                        lifetime.run(async {
+                            let work = handler.udp(association);
+                            tokio::pin!(work);
 
-                        loop {
-                            tokio::select! {
-                                result = &mut work => return result,
-                                reply = driver.rx.recv() => {
-                                    let Some(reply) = reply else { return Ok(()); };
-                                    let _ = responses.try_send((peer, reply));
+                            loop {
+                                tokio::select! {
+                                    result = &mut work => return result,
+                                    reply = driver.rx.recv() => {
+                                        let Some(reply) = reply else { return Ok(()); };
+                                        let _ = responses.try_send((peer, generation, reply));
+                                    }
                                 }
                             }
-                        }
+                        }).await
                     })?;
 
-                    peers.insert(
-                        peer,
-                        Association {
-                            tx,
-                            scope,
-                            active: tokio::time::Instant::now(),
-                        },
-                    );
+                    peers.insert(peer, SessionEntry { tx, scope, activity, generation });
                 }
 
-                let association = peers.get_mut(&peer).expect("inserted association");
-                association.active = tokio::time::Instant::now();
-
+                // SAFETY: this loop is the sole map owner and found or inserted this peer.
+                debug_assert!(peers.contains_key(&peer));
+                let association = peers.get(&peer).expect("admitted direct UDP session");
                 let _ = association.tx.try_send(Packet {
                     target: target.clone(),
                     payload: buffer[..n].to_vec().into(),
                 });
             }
             reply = replies.recv() => {
-                let Some((peer, packet)) = reply else { return Ok(()); };
-                if let Some(association) = peers.get_mut(&peer) {
-                    association.active = tokio::time::Instant::now();
+                let Some((peer, generation, packet)) = reply else { return Ok(()); };
+                let Some(association) = peers.get(&peer)
+                    .filter(|entry| entry.generation == generation && !entry.scope.is_closed())
+                else { continue; };
 
-                    if let Err(error) = socket.send_to(&packet.payload, peer).await {
+                match socket.send_to(&packet.payload, peer).await {
+                    Ok(_) => association.activity.record(),
+                    Err(error) => {
                         tracing::warn!(error = %format_args!("{error:#}"), "direct UDP reply");
                     }
                 }

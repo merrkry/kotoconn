@@ -4,7 +4,7 @@ mod tls;
 
 use bytes::Bytes;
 use kotoconn_config::{SniffConfig, SniffProtocol, SniffResult};
-use kotoconn_protocol::{BoxStream, Packet, prefix, queue};
+use kotoconn_protocol::{BoxStream, Packet, Scope, prefix, queue};
 use std::io;
 use tokio::io::AsyncReadExt;
 
@@ -18,10 +18,12 @@ enum Outcome {
 }
 
 /// I/O errors remain session errors. Unrecognized, incomplete or oversized
-/// payloads and sniff timeout simply leave the flow without sniff metadata.
+/// payloads, timeout and interruption leave the flow without sniff metadata.
+/// Dropping this future terminates inspection without returning or replaying data.
 pub async fn tcp(
     mut stream: BoxStream,
     config: &SniffConfig,
+    interruption: &Scope,
 ) -> io::Result<(BoxStream, Option<SniffResult>)> {
     let mut bytes = Vec::new();
     let mut acceptor = rustls::server::Acceptor::default();
@@ -55,9 +57,11 @@ pub async fn tcp(
         }
     };
 
-    let result = match tokio::time::timeout(config.timeout, inspecting).await {
-        Ok(result) => result,
-        Err(_) => Ok(None),
+    let result = tokio::select! {
+        biased;
+        _ = interruption.cancelled() => Ok(None),
+        _ = tokio::time::sleep(config.timeout) => Ok(None),
+        result = inspecting => result,
     };
 
     Ok((prefix(Bytes::from(bytes), stream), result?))
@@ -68,6 +72,7 @@ pub async fn tcp(
 pub async fn udp(
     incoming: &mut queue::Receiver<Packet>,
     config: &SniffConfig,
+    interruption: &Scope,
 ) -> Option<SniffResult> {
     let mut packets = Vec::new();
     let mut bytes = 0;
@@ -93,21 +98,17 @@ pub async fn udp(
         None
     };
 
-    let result = tokio::time::timeout(config.timeout, inspecting)
-        .await
-        .ok()
-        .flatten();
+    let result = tokio::select! {
+        biased;
+        _ = interruption.cancelled() => None,
+        _ = tokio::time::sleep(config.timeout) => None,
+        result = inspecting => result,
+    };
     incoming.prepend(packets);
     result
 }
 
 fn http(bytes: &[u8]) -> Outcome {
-    // Reject binary protocols before waiting for an HTTP header terminator.
-    let method = bytes.split(|byte| *byte == b' ').next().unwrap_or_default();
-    if method.len() > 32 || !method.iter().all(u8::is_ascii_alphabetic) {
-        return Outcome::Unknown;
-    }
-
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut request = httparse::Request::new(&mut headers);
     match request.parse(bytes) {

@@ -4,7 +4,7 @@ A TUN endpoint runs one worker per queue, with independent receive/dispatch and 
 
 Each Linux worker owns a Tokio runtime with one worker thread. It creates the async TUN device and polls native sockets there so readiness and forwarding share an I/O driver. Shutdown joins workers before releasing runtimes; abort cancels their tasks and shuts down the runtimes without blocking the caller.
 
-Policy runs on the shared QuickJS thread before native handoff. Future sniffing belongs before outbound selection; buffered prefixes must preserve order and receive credit. Device creation stays separate from packet and stream contracts. The generic packet entry point uses the caller's runtime to support other platform adapters and deterministic protocol tests.
+Policy runs on the shared QuickJS thread before native handoff. Sniffing precedes outbound selection; buffered prefixes must preserve order and receive credit. Device creation stays separate from packet and stream contracts. The generic packet entry point uses the caller's runtime to support other platform adapters and deterministic protocol tests.
 
 The worker owns each TCP state machine and drives it directly through our smoltcp fork. It passes validated IP/TCP representations to the connection and encodes output into worker-owned packet storage. Per-connection virtual devices, interfaces, route tables, socket sets, packet queues and driver tasks are unnecessary. Ready notifications are deduplicated per connection; ordered deadlines select timer work without scanning all connections. Bounded turns preserve fairness. A blocked output records the connection for retry instead of suspending shared reception.
 

@@ -275,7 +275,7 @@ impl p::Handler for SessionHandler {
                     .run(async {
                         let sniff = if let Some(config) = &self.sniff {
                             let (inspected, result) =
-                                kotoconn_inbounds::sniff::tcp(stream, config).await?;
+                                kotoconn_inbounds::sniff::tcp(stream, config, &scope).await?;
                             stream = inspected;
                             result
                         } else {

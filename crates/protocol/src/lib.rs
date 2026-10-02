@@ -8,6 +8,7 @@ pub mod pool;
 pub mod queue;
 mod scoped;
 mod server;
+mod session;
 pub mod stream_buffer;
 
 pub use activity::Activity;
@@ -22,6 +23,7 @@ pub use io::{
 pub use kotoconn_config::{Target, TransportProtocol};
 pub use packet_io::{BoxPacketIo, NativeDatagram, PacketIo, packet_io_task};
 pub use server::{BoundServer, Handler, Server, ServerContext, accept_loop};
+pub use session::UdpSession;
 use std::{net::SocketAddr, sync::Arc};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

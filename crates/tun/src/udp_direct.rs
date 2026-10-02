@@ -126,14 +126,14 @@ impl Direct {
         self.ready.wake_by_ref();
     }
 
-    pub fn enqueue(&mut self, packet: p::Packet, activity: &p::Activity) -> bool {
+    pub fn enqueue(&mut self, packet: p::Packet) -> bool {
         let cost = cost(&packet);
         if self.bytes != 0 && self.bytes.saturating_add(cost) > self.capacity.target(Instant::now())
         {
             // A receive batch can exceed this flow's byte allowance. Submit its
             // current prefix before dropping input that a writable socket accepts.
             let waker = Waker::from(self.ready.clone());
-            self.flush_requests(&mut Context::from_waker(&waker), activity);
+            self.flush_requests(&mut Context::from_waker(&waker));
             if self.bytes != 0
                 && self.bytes.saturating_add(cost) > self.capacity.target(Instant::now())
             {
@@ -146,16 +146,7 @@ impl Direct {
         true
     }
 
-    fn record(&self, activity: &p::Activity) {
-        self.activity.record();
-        activity.record();
-    }
-
-    fn flush_replies(
-        &mut self,
-        output: &queue::Sender<Transmit>,
-        activity: &p::Activity,
-    ) -> Progress {
+    fn flush_replies(&mut self, output: &queue::Sender<Transmit>) -> Progress {
         let mut completed = false;
         let mut progress = Progress::Idle;
         while let Some(packet) = self.received.get(self.received_offset) {
@@ -205,7 +196,7 @@ impl Direct {
             completed = true;
         }
         if completed {
-            self.record(activity);
+            self.activity.record();
         }
         if self.received_offset == self.received.len() {
             self.received.clear();
@@ -214,13 +205,13 @@ impl Direct {
         progress
     }
 
-    fn flush_requests(&mut self, cx: &mut Context<'_>, activity: &p::Activity) {
+    fn flush_requests(&mut self, cx: &mut Context<'_>) {
         if !self.pending.is_empty() {
             let packets = self.pending.make_contiguous();
             let count = match self.io.poll_send(cx, &packets[..packets.len().min(32)]) {
                 Poll::Ready(Ok(count)) => {
                     debug_assert!(count > 0 && count <= packets.len().min(32));
-                    self.record(activity);
+                    self.activity.record();
                     count
                 }
                 Poll::Ready(Err(error)) => {
@@ -248,19 +239,19 @@ impl Direct {
 
     /// Retain at most one received batch under output pressure. The worker retries
     /// on output readiness; this flow's send half and other flows remain runnable.
-    pub fn poll(&mut self, output: &queue::Sender<Transmit>, activity: &p::Activity) -> Progress {
+    pub fn poll(&mut self, output: &queue::Sender<Transmit>) -> Progress {
         self.ready.queued.store(false, Ordering::Release);
         let waker = Waker::from(self.ready.clone());
         let mut cx = Context::from_waker(&waker);
-        self.flush_requests(&mut cx, activity);
-        match self.flush_replies(output, activity) {
+        self.flush_requests(&mut cx);
+        match self.flush_replies(output) {
             Progress::Idle => {}
             blocked => return blocked,
         }
         match self.io.poll_recv(&mut cx, &mut self.received) {
             Poll::Ready(Ok(0)) => Progress::Closed,
             Poll::Ready(Ok(_)) => {
-                let progress = self.flush_replies(output, activity);
+                let progress = self.flush_replies(output);
                 if matches!(progress, Progress::Idle) {
                     self.wake();
                 }
@@ -390,29 +381,19 @@ mod tests {
         output
             .try_send(Transmit::Packet(vec![0; 40].into()))
             .unwrap();
-        let activity = p::Activity::default();
-        assert!(matches!(
-            direct.poll(&output, &activity),
-            Progress::Blocked(_)
-        ));
-        assert!(direct.enqueue(packet(vec![9]), &activity));
-        assert!(matches!(
-            direct.poll(&output, &activity),
-            Progress::Blocked(_)
-        ));
+        assert!(matches!(direct.poll(&output), Progress::Blocked(_)));
+        assert!(direct.enqueue(packet(vec![9])));
+        assert!(matches!(direct.poll(&output), Progress::Blocked(_)));
         assert_eq!(sends.recv().await.unwrap(), 9);
         packets.try_recv().unwrap();
-        assert!(matches!(
-            direct.poll(&output, &activity),
-            Progress::Blocked(_)
-        ));
+        assert!(matches!(direct.poll(&output), Progress::Blocked(_)));
         let Transmit::Datagrams { payload, .. } = packets.try_recv().unwrap() else {
             panic!()
         };
         assert_eq!(payload.len(), 2);
         assert!(payload[0].is_empty());
         assert_eq!(payload[1], [3][..]);
-        assert!(matches!(direct.poll(&output, &activity), Progress::Idle));
+        assert!(matches!(direct.poll(&output), Progress::Idle));
         let Transmit::Datagrams {
             source, payload, ..
         } = packets.try_recv().unwrap()
@@ -453,17 +434,11 @@ mod tests {
                 },
                 ready,
             );
-            assert!(direct.enqueue(packet(2), &p::Activity::default()));
-            assert!(direct.enqueue(packet(3), &p::Activity::default()));
+            assert!(direct.enqueue(packet(2)));
+            assert!(direct.enqueue(packet(3)));
             let (output, _packets) = queue::channel(queue::INITIAL_BYTES, Transmit::size);
-            assert!(matches!(
-                direct.poll(&output, &p::Activity::default()),
-                Progress::Idle
-            ));
-            assert!(matches!(
-                direct.poll(&output, &p::Activity::default()),
-                Progress::Idle
-            ));
+            assert!(matches!(direct.poll(&output), Progress::Idle));
+            assert!(matches!(direct.poll(&output), Progress::Idle));
             for byte in 0..4 {
                 assert_eq!(received.recv().await.unwrap(), byte);
             }
