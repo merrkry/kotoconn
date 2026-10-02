@@ -2,29 +2,37 @@ language: python
 tasks:
   sync:
     inputs: ["@group(sources)"]
-    command: uv sync --locked
+    command: uv sync --locked --all-groups
     options:
       cache: false
   format:
     inputs: ["@group(sources)"]
-    command: uv run --locked ruff format
+    command: uv run --locked --no-sync ruff format .
     deps: [sync]
     options:
       cache: false
   check-format:
     inputs: ["@group(sources)"]
-    command: uv run --locked ruff format --check
+    command: uv run --locked --no-sync ruff format --check .
     deps: [sync]
   lint:
     inputs: ["@group(sources)"]
-    command: uv run --locked ruff check
+    command: uv run --locked --no-sync ruff check .
     deps: [sync]
   typecheck:
     inputs: ["@group(sources)"]
-    command: uv run --locked pyrefly check
+    command: uv run --locked --no-sync pyrefly check
     deps: [sync]
   check:
     inputs: ["@group(sources)"]
     deps: [check-format, lint, typecheck]
 fileGroups:
-  sources: [/e2e/**/*.py, /benchmarks/**/*.py, /tools/**/*.py, /pyproject.toml, /uv.lock, /.python-version]
+  sources:
+    - /**/*.py
+    - "!/external/**"
+    - "!/target/**"
+    - "!/**/node_modules/**"
+    - "!/.venv/**"
+    - /pyproject.toml
+    - /uv.lock
+    - /.python-version
