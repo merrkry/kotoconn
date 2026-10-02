@@ -2,12 +2,16 @@
 
 import json
 import time
+from typing import TYPE_CHECKING
 
 from .environment import NAME, Daemon, Process, configure_routes, ip
 
+if TYPE_CHECKING:
+    from pathlib import Path
+
 
 class SingBox(Process):
-    def __init__(self, binary, directory, mtu, cpus):
+    def __init__(self, binary: Path, directory: Path, mtu: int, cpus: str | None):
         directory.mkdir(parents=True)
         path = directory / "sing-box.json"
         path.write_text(

@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 # Allow the launcher's two 5-second client waits and 15-second container removal,
@@ -18,7 +19,7 @@ CLEANUP_TIMEOUT = 35
 
 
 def snapshot():
-    def stable(value):
+    def stable(value: Any) -> Any:
         if isinstance(value, dict):
             # DHCP/RA lifetimes count down without any network configuration change.
             return {
@@ -53,7 +54,11 @@ def snapshot():
     dns = None
     if shutil.which("resolvectl"):
         result = subprocess.run(
-            ["resolvectl", "status"], capture_output=True, text=True, timeout=10
+            ["resolvectl", "status"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
         )
         if result.returncode == 0:
             dns = result.stdout
@@ -73,7 +78,7 @@ def snapshot():
     }
 
 
-def check_runtime_access(args, directory):
+def check_runtime_access(args: argparse.Namespace, directory: Path):
     binary = args.binary.resolve(strict=True)
     command = [
         "docker",
@@ -132,7 +137,7 @@ def main():
 
     before = snapshot()
     (directory / "parent-before.json").write_text(json.dumps(before, indent=2))
-    parent = os.readlink("/proc/self/ns/net")
+    parent = str(Path("/proc/self/ns/net").readlink())
     children = []
     logs = []
     try:
@@ -230,6 +235,7 @@ def main():
         assert (
             subprocess.run(
                 ["docker", "container", "inspect", identifier],
+                check=False,
                 capture_output=True,
                 timeout=10,
             ).returncode
@@ -242,7 +248,8 @@ def main():
             "host addresses, routes, rules, TCP settings or DNS changed"
         )
         print(
-            f"PASS concurrent containers, cancellation cleanup and unchanged host networking: {directory}"
+            "PASS concurrent containers, cancellation cleanup "
+            f"and unchanged host networking: {directory}"
         )
     finally:
         for child in children:

@@ -3,7 +3,7 @@
 import json
 
 
-def has_event(lines, expected):
+def has_event(lines: list[str], expected: str):
     for line in lines:
         try:
             record = json.loads(line)

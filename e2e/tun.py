@@ -8,6 +8,7 @@ import struct
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from e2e.tun_support.environment import (
@@ -30,7 +31,7 @@ from e2e.tun_support.packets import Injector
 from e2e.tun_support.scenarios import cases
 
 
-def generic_relay(args, summary):
+def generic_relay(args: argparse.Namespace, summary: dict[str, Any]):
     directory = args.output / "generic-relay"
     daemon = Daemon(
         args.binary, directory, 1500, cpus=args.daemon_cpus, outbound="socks5"
@@ -68,7 +69,7 @@ def generic_relay(args, summary):
     print("PASS generic relay: dual-stack TCP and UDP through SOCKS5", flush=True)
 
 
-def lifecycle(args):
+def lifecycle(args: argparse.Namespace):
     echo = TcpEcho()
     try:
         daemon = Daemon(
@@ -133,8 +134,9 @@ def lifecycle(args):
     path = directory / "main.ts"
     policy(path, 1500)
     path.write_text(
-        path.read_text()
-        + "\nk.inbound({implementation: k.tun_inbound({name: 'ktest0', mtu: 1500, addresses: []}), routing_handler: routing, udp_idle_timeout: k.timeout(30000)});\n"
+        path.read_text() + "\nk.inbound({implementation: k.tun_inbound({"
+        "name: 'ktest0', mtu: 1500, addresses: []}), "
+        "routing_handler: routing, udp_idle_timeout: k.timeout(30000)});\n"
     )
     result = subprocess.run(
         [str(args.binary), "run", "--config", str(path)],
@@ -150,13 +152,13 @@ def lifecycle(args):
     print("PASS lifecycle: failed startup releases device", flush=True)
 
 
-def run(args):
+def run(args: argparse.Namespace):
     configure_network()
     summary = {
         "schema_version": 2,
         "suite": "tun-e2e",
         "seed": args.seed,
-        "netns": os.readlink("/proc/self/ns/net"),
+        "netns": str(Path("/proc/self/ns/net").readlink()),
         "parent_netns": os.environ["KOTOCONN_TUN_PARENT_NETNS"],
         "binary_sha256": digest(args.binary),
         "traffic_sha256": digest(args.traffic_binary),
@@ -210,7 +212,8 @@ def run(args):
                                         "no mixed packets injected"
                                     )
                                     assert result["positive_controls"] > 0, (
-                                        "raw injection positive control did not reach outbound"
+                                        "raw injection positive control "
+                                        "did not reach outbound"
                                     )
                                     entry["injected"] = dict(injector.counts)
                                     recovery = directory / "recovery"
@@ -308,7 +311,8 @@ def main():
     if required_ports > len(SERVER_PORTS):
         parser.error(
             f"selected matrix needs {required_ports} traffic server ports; "
-            f"only {len(SERVER_PORTS)} are available; reduce repeat or select fewer cases"
+            f"only {len(SERVER_PORTS)} are available; "
+            "reduce repeat or select fewer cases"
         )
     if not enter(args, Path(__file__).resolve(), "e2e"):
         run(args)

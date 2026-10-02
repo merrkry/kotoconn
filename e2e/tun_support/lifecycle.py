@@ -28,7 +28,7 @@ class TcpEcho:
             thread.start()
             self.threads.append(thread)
 
-    def accept(self, listener):
+    def accept(self, listener: socket.socket):
         while not self.stop.is_set():
             try:
                 conn, _ = listener.accept()
@@ -40,7 +40,7 @@ class TcpEcho:
             thread.start()
             self.threads.append(thread)
 
-    def stream(self, conn):
+    def stream(self, conn: socket.socket):
         forced = self.forced
         with conn:
             try:
@@ -73,7 +73,7 @@ class TcpEcho:
         assert not self.errors, self.errors
 
 
-def client(family, kind):
+def client(family: int, kind: int):
     index = int(family == socket.AF_INET6)
     sock = socket.socket(family, kind)
     sock.settimeout(10)
@@ -82,7 +82,7 @@ def client(family, kind):
     return sock
 
 
-def read_exact(sock, count):
+def read_exact(sock: socket.socket, count: int):
     result = bytearray()
     while len(result) < count:
         data = sock.recv(count - len(result))

@@ -3,14 +3,17 @@
 import json
 from pathlib import Path
 
-IMAGE = "docker.io/tobyxdd/hysteria:v2.12.3@sha256:8e3e46bab28aa9f62a488b81f7e509f70a834914fb2e70a42277c57c165eaa94"
+IMAGE = (
+    "docker.io/tobyxdd/hysteria:v2.12.3@sha256:"
+    "8e3e46bab28aa9f62a488b81f7e509f70a834914fb2e70a42277c57c165eaa94"
+)
 FIXTURES = Path(__file__).resolve().parent / "hysteria2"
 PASSWORD = "hysteria-interop-password"
 OBFS = "salamander-interop-password"
 SUITES = ("hysteria2", "hysteria2-salamander")
 
 
-def policy_options(kind, outbound=False, obfuscated=False):
+def policy_options(kind: str, outbound: bool = False, obfuscated: bool = False):
     if kind != "hysteria2":
         return ""
     values = {"password": PASSWORD}
@@ -31,7 +34,7 @@ def policy_options(kind, outbound=False, obfuscated=False):
     )
 
 
-def override(directory, direction):
+def override(directory: Path, direction: str):
     service = "peer" if direction == "client" else "entry"
     mode = "server" if direction == "client" else "client"
     path = directory / "hysteria-compose.json"
@@ -55,7 +58,7 @@ def override(directory, direction):
     return path
 
 
-def configure(directory, target, obfuscated):
+def configure(directory: Path, target: str, obfuscated: bool):
     for name in ("cert.pem", "key.pem"):
         (directory / name).write_text((FIXTURES / name).read_text())
     server: dict[str, object] = {
@@ -83,7 +86,7 @@ def configure(directory, target, obfuscated):
         (directory / f"hysteria-{mode}.json").write_text(json.dumps(config, indent=2))
 
 
-def ready(logs, direction):
+def ready(logs: str, direction: str):
     if direction == "client":
         return "server up and running" in logs
     # Each TCP and UDP forwarding listener emits its own observable ready event.

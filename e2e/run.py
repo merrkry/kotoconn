@@ -11,10 +11,14 @@ import subprocess
 import time
 import uuid
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import anytls
 import hysteria2
 from lifecycle import has_event
+
+if TYPE_CHECKING:
+    from types import FrameType
 
 LOGGER = logging.getLogger(__name__)
 
@@ -24,8 +28,8 @@ PROTOCOLS = ("http", "socks5", "shadowsocks2022", "naive", "anytls") + hysteria2
 SUITES = (*PROTOCOLS, "naive-nested", "naive-quic", "nested", "typescript")
 
 
-def sing_protocol(kind, server=None):
-    result = {
+def sing_protocol(kind: str, server: str | None = None):
+    result: dict[str, Any] = {
         "type": {"socks5": "socks", "shadowsocks2022": "shadowsocks"}.get(kind, kind)
     }
     if server:
@@ -53,7 +57,7 @@ def sing_protocol(kind, server=None):
     return result
 
 
-def sing_config(inbounds, outbound):
+def sing_config(inbounds: list[dict[str, Any]], outbound: dict[str, Any]):
     return {
         "log": {"level": "info"},
         "dns": {"servers": [{"type": "local", "tag": "local"}]},
@@ -64,7 +68,14 @@ def sing_config(inbounds, outbound):
     }
 
 
-def policy(inbound, chain, rewrite=False, naive=None, quic=False, obfuscated=False):
+def policy(
+    inbound: str,
+    chain: list[tuple[str, str] | tuple[str, str, int]],
+    rewrite: bool = False,
+    naive: dict[str, str] | None = None,
+    quic: bool = False,
+    obfuscated: bool = False,
+):
     source = """import { kotoconn as k } from '@kotoconn/bindings';
 import { destination } from './routing.ts';
 const resolver = k.resolve_handler(async name => await k.lookup(name));
@@ -94,7 +105,11 @@ const listenPort: number = await Promise.resolve(1080);
                 kind, outbound=True, obfuscated=obfuscated
             )
             config += "}"
-        source += f"const d{index} = k.dialer({{dialer: {previous}, outbound: {{resolve_handler: resolver, implementation: k.{kind}_outbound({config})}}}});\n"
+        source += (
+            f"const d{index} = k.dialer({{dialer: {previous}, "
+            "outbound: {resolve_handler: resolver, "
+            f"implementation: k.{kind}_outbound({config})}}}});\n"
+        )
         previous = f"d{index}"
 
     extra = hysteria2.policy_options(inbound, obfuscated=obfuscated)
@@ -105,9 +120,15 @@ const listenPort: number = await Promise.resolve(1080);
     source += f"""const routing = k.routing_handler(async flow => {{
     {"if (flow.dest.port === 9002) return k.reject();" if rewrite else ""}
     const target = await destination(flow.dest);
-    return flow.protocol === 'udp' ? k.route_udp({previous}) : k.route({previous}, target);
+    return flow.protocol === 'udp'
+        ? k.route_udp({previous}) : k.route({previous}, target);
 }});
-k.inbound({{implementation: k.{inbound}_inbound({{listen: {{address: k.ip('0.0.0.0'), port: listenPort}}{extra}}}), routing_handler: routing, udp_idle_timeout: k.timeout(30000)}});
+k.inbound({{
+    implementation: k.{inbound}_inbound({{
+        listen: {{address: k.ip('0.0.0.0'), port: listenPort}}{extra}
+    }}),
+    routing_handler: routing, udp_idle_timeout: k.timeout(30000)
+}});
 """
     # The TypeScript suite changes the TCP destination. UDP cannot rewrite targets.
     routing = """import { kotoconn as k } from '@kotoconn/bindings';
@@ -122,7 +143,13 @@ export async function destination(target: {ip: ReturnType<typeof k.ip>, port: nu
 
 
 def write_policy(
-    directory, inbound, chain, rewrite=False, naive=None, quic=False, obfuscated=False
+    directory: Path,
+    inbound: str,
+    chain: list[tuple[str, str] | tuple[str, str, int]],
+    rewrite: bool = False,
+    naive: dict[str, str] | None = None,
+    quic: bool = False,
+    obfuscated: bool = False,
 ):
     directory.mkdir(parents=True, exist_ok=True)
     main, routing = policy(inbound, chain, rewrite, naive, quic, obfuscated)
@@ -131,7 +158,7 @@ def write_policy(
 
 
 class Scenario:
-    def __init__(self, args, suite, direction):
+    def __init__(self, args: argparse.Namespace, suite: str, direction: str):
         self.suite, self.direction = suite, direction
         self.nested = suite in ("nested", "naive-nested", "naive-quic")
         self.engine = shlex.split(args.engine)
@@ -156,7 +183,7 @@ class Scenario:
             )
             self.command += ["-f", str(override), "--profile", "nested"]
 
-    def compose(self, *args, check=True, timeout=120):
+    def compose(self, *args: str, check: bool = True, timeout: float = 120):
         result = subprocess.run(
             self.command + list(args),
             env=self.env,
@@ -174,7 +201,7 @@ class Scenario:
             )
         return result
 
-    def ready(self, service):
+    def ready(self, service: str):
         deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
             logs = self.compose("logs", "--no-color", "--no-log-prefix", service).stdout
@@ -208,7 +235,7 @@ class Scenario:
             time.sleep(0.1)
         raise TimeoutError(f"{self.name}: {service} did not become ready")
 
-    def configure(self, target):
+    def configure(self, target: str):
         naive = None
         if self.suite.startswith("naive"):
             self.compose(
@@ -255,6 +282,7 @@ class Scenario:
             kind = "socks5"
 
         inbound = kind if self.direction == "server" else "socks5"
+        chain: list[tuple[str, str] | tuple[str, str, int]]
         if self.suite == "nested":
             chain = [("shadowsocks2022", "gateway"), ("socks5", "127.0.0.1", 1081)]
             write_policy(
@@ -467,7 +495,7 @@ def main():
     args.output = args.output.resolve() / args.run_id
     print(f"Artifacts: {args.output}", flush=True)
 
-    def interrupted(signum, frame):
+    def interrupted(signum: int, frame: FrameType | None):
         raise KeyboardInterrupt(f"signal {signum}")
 
     signal.signal(signal.SIGTERM, interrupted)

@@ -2,15 +2,17 @@
 
 import argparse
 import concurrent.futures
+import contextlib
 import socket
 import socketserver
 import threading
+from typing import override
 
 LIMIT = 15
 PAYLOAD = bytes(range(256)) * 1024
 
 
-def receive(stream, length):
+def receive(stream: socket.socket, length: int):
     data = bytearray()
     while len(data) < length:
         part = stream.recv(length - len(data))
@@ -20,11 +22,12 @@ def receive(stream, length):
     return bytes(data)
 
 
-def identity(port, source):
+def identity(port: int, source: str):
     return f"target:{port}\nsource:{source}\n".encode()
 
 
 class TCP(socketserver.BaseRequestHandler):
+    @override
     def handle(self):
         # SAFETY: serve() installs this handler only on TCPServer instances.
         assert isinstance(self.server, socketserver.TCPServer)
@@ -39,6 +42,7 @@ class TCP(socketserver.BaseRequestHandler):
 
 
 class UDP(socketserver.BaseRequestHandler):
+    @override
     def handle(self):
         # SAFETY: serve() installs this handler only on UDPServer instances.
         assert isinstance(self.server, socketserver.UDPServer)
@@ -65,7 +69,7 @@ def serve():
     threading.Event().wait()
 
 
-def tcp(port, target, source):
+def tcp(port: int, target: int, source: str):
     with socket.create_connection(("entry", port), timeout=LIMIT) as stream:
         greeting = identity(target, source)
         assert receive(stream, len(greeting)) == greeting, (
@@ -87,7 +91,7 @@ def tcp(port, target, source):
         assert stream.recv(1) == b"", "missing EOF after completed transfer"
 
 
-def udp(port, target, source, payload_size=8192):
+def udp(port: int, target: int, source: str, payload_size: int = 8192):
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.settimeout(LIMIT)
         sock.connect(("entry", port))
@@ -101,10 +105,10 @@ def udp(port, target, source, payload_size=8192):
             )
 
 
-def check(transport, rewrite, egress, udp_payload_size=8192):
+def check(transport: str, rewrite: bool, egress: str, udp_payload_size: int = 8192):
     source = socket.gethostbyname(egress)
 
-    def udp_operation(port, target, source):
+    def udp_operation(port: int, target: int, source: str):
         return udp(port, target, source, udp_payload_size)
 
     operation = tcp if transport == "tcp" else udp_operation
@@ -141,11 +145,11 @@ if __name__ == "__main__":
                 assert receive(stream, len(expected)) == expected
     elif args.mode == "reject":
         for port in (10082, 10083):
-            with socket.create_connection(("entry", port), timeout=LIMIT) as stream:
-                try:
-                    assert stream.recv(1) == b"", "rejected request returned data"
-                except ConnectionResetError:
-                    pass
+            with (
+                socket.create_connection(("entry", port), timeout=LIMIT) as stream,
+                contextlib.suppress(ConnectionResetError),
+            ):
+                assert stream.recv(1) == b"", "rejected request returned data"
         print("PASS policy rejection and handler exception")
     else:
         check(args.mode, args.rewrite, args.egress, args.udp_payload_size)

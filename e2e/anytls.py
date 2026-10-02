@@ -2,6 +2,10 @@
 
 import shlex
 import subprocess
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import argparse
 
 TESTS = {
     "client": "tests::interop::rust_client_interoperates_with_official_go_server",
@@ -10,7 +14,7 @@ TESTS = {
 
 
 class Scenario:
-    def __init__(self, args, direction):
+    def __init__(self, args: argparse.Namespace, direction: str):
         self.name = f"anytls-{direction}"
         self.test = TESTS[direction]
         self.engine = shlex.split(args.engine)
