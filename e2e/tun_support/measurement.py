@@ -8,11 +8,12 @@ import platform
 import statistics
 from collections import Counter
 from pathlib import Path
+from typing import Any
 
 from .environment import digest
 
 
-def metadata(binaries, traffic_binary):
+def metadata(binaries: dict[str, Path], traffic_binary: Path):
     container = json.loads(Path("/artifacts/container.json").read_text())
     cpu = next(
         (
@@ -27,7 +28,7 @@ def metadata(binaries, traffic_binary):
         "machine": platform.machine(),
         "cpu_model": cpu,
         "cpu_affinity": sorted(os.sched_getaffinity(0)),
-        "netns": os.readlink("/proc/self/ns/net"),
+        "netns": str(Path("/proc/self/ns/net").readlink()),
         "parent_netns": os.environ["KOTOCONN_TUN_PARENT_NETNS"],
         "cpu_max": Path("/sys/fs/cgroup/cpu.max").read_text().strip()
         if Path("/sys/fs/cgroup/cpu.max").exists()
@@ -44,7 +45,7 @@ def metadata(binaries, traffic_binary):
     }
 
 
-def distribution(histograms):
+def distribution(histograms: list[dict[str, list[tuple[int, int]]]]):
     # Merge histogram counts, never average per-flow percentiles.
     buckets: Counter[int] = Counter()
     for histogram in histograms:
@@ -68,7 +69,7 @@ def distribution(histograms):
     return result
 
 
-def metrics(result):
+def metrics(result: dict[str, Any]):
     flows = result["flows"]
     wall = result["wall_seconds"]
     totals = {
@@ -114,7 +115,7 @@ def metrics(result):
     return result
 
 
-def resource_metrics(result):
+def resource_metrics(result: dict[str, Any]):
     metrics = {}
     for name in ("daemon", "generator"):
         before = result["resources"]["before"][name]
@@ -145,7 +146,7 @@ def resource_metrics(result):
     return metrics
 
 
-def comparisons(runs):
+def comparisons(runs: list[dict[str, Any]]):
     result = []
     for case in sorted({run["case"] for run in runs}):
         samples = {}
@@ -171,11 +172,11 @@ def comparisons(runs):
     return result
 
 
-def save(path, value):
+def save(path: Path, value: object):
     path.write_text(json.dumps(value, indent=2) + "\n")
 
 
-def write_csv(path, runs):
+def write_csv(path: Path, runs: list[dict[str, Any]]):
     with path.open("w", newline="") as stream:
         writer = csv.writer(stream)
         writer.writerow(

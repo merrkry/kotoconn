@@ -14,6 +14,12 @@ mise in your shell to omit `mise exec --` from subsequent commands.
 The pinned Go toolchain builds the official AnyTLS peer for e2e tests; moon builds
 it and the Rust test harness before packaging their interoperability container.
 
+The root uv workspace shares one Python 3.14 environment for repository scripts.
+Run `moon run python:sync` to install its locked dependencies, `moon run
+python:format` to format scripts, and `moon run python:check` for Ruff formatting,
+linting, and strict Pyrefly checks. Checks discover Python files across the
+repository and exclude third-party sources under `external` and build artifacts.
+
 Rust TLS, QUIC, and test certificate generation use `aws-lc-rs`, shared with
 Shadowsocks.
 

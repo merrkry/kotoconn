@@ -1,12 +1,23 @@
 """Named workload recipes; execution and correctness decisions live in the runners."""
 
+from typing import TYPE_CHECKING
+
 from .environment import CLIENT, REMOTE
 
+if TYPE_CHECKING:
+    from .spec import TrafficSpec
 
-def cases(mtu, ipv6, *, stress=False):
-    common = {"source": CLIENT[int(ipv6)], "target": REMOTE[int(ipv6)], "mtu": mtu}
+
+def cases(
+    mtu: int, ipv6: bool, *, stress: bool = False
+) -> list[tuple[str, TrafficSpec]]:
+    common: TrafficSpec = {
+        "source": CLIENT[int(ipv6)],
+        "target": REMOTE[int(ipv6)],
+        "mtu": mtu,
+    }
     rounds = 32 if stress else 4
-    specs = []
+    specs: list[tuple[str, TrafficSpec]] = []
     for protocol in ("tcp", "udp"):
         for connections in (1, 16 if stress else 4):
             for workload in ("bulk", "churn", "sparse"):

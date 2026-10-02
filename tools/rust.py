@@ -20,23 +20,23 @@ def host_target():
     )
 
 
-def zig_target(target):
+def zig_target(target: str):
     # Pin the Linux glibc baseline for both C dependencies and the final linker.
     return target + ".2.28" if target.endswith("-linux-gnu") else target
 
 
-def run(args, env=None):
+def run(args: list[str], env: dict[str, str] | None = None):
     subprocess.run(args, cwd=ROOT, env=env, check=True)
 
 
-def linux_target(target):
+def linux_target(target: str):
     architecture = target.split("-", 1)[0]
     if architecture not in {"x86_64", "aarch64"}:
         raise ValueError(f"unsupported container architecture: {architecture}")
     return f"{architecture}-unknown-linux-gnu"
 
 
-def stage_anytls_interop(target):
+def stage_anytls_interop(target: str):
     target = linux_target(target)
     run(["rustup", "target", "add", target])
     result = subprocess.run(

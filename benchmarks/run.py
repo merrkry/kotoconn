@@ -3,7 +3,7 @@
 import argparse
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from e2e.tun_support.comparison import SingBox
@@ -29,9 +29,14 @@ from e2e.tun_support.measurement import (
 )
 from e2e.tun_support.packets import Injector
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
-def cases(args):
-    recipes = [
+    from e2e.tun_support.spec import TrafficSpec
+
+
+def cases(args: argparse.Namespace) -> Iterator[tuple[str, str, TrafficSpec]]:
+    recipes: list[tuple[str, TrafficSpec]] = [
         ("tcp-bulk-1", {"connections": 1, "direction": "duplex"}),
         ("tcp-bulk-4", {"connections": 4, "direction": "duplex"}),
         ("tcp-churn", {"workload": "churn", "connections": 8}),
@@ -133,19 +138,19 @@ def cases(args):
                 )
 
 
-def implementations(args, case_name):
+def implementations(args: argparse.Namespace, case_name: str):
     names = ["candidate"]
     if args.sing_box and case_name != "mixed-malformed":
         names.append("sing-box-go")
     return names
 
 
-def run(args):
+def run(args: argparse.Namespace):
     configure_network()
     binaries = {"candidate": args.binary}
     if args.sing_box:
         binaries["sing-box-go"] = args.sing_box
-    result = {
+    result: dict[str, Any] = {
         "schema_version": 2,
         "suite": "tun-workloads",
         "status": "running",
@@ -180,7 +185,7 @@ def run(args):
                 for implementation in order:
                     directory = args.output / f"{case_id}-{repetition}-{implementation}"
                     directory.mkdir()
-                    # JSON report entries collect heterogeneous metrics and failure details.
+                    # JSON entries contain mixed metrics and failure details.
                     entry: dict[str, Any] = {
                         "case": case_id,
                         "implementation": implementation,
@@ -210,7 +215,10 @@ def run(args):
                                 spec["mtu"],
                                 cpus=args.daemon_cpus,
                             )
-                        sample_spec = {**spec, "seed": args.seed + repetition}
+                        sample_spec: TrafficSpec = {
+                            **spec,
+                            "seed": args.seed + repetition,
+                        }
                         if spec.get("protocol") == "udp":
                             # UDP has no FIN. Warmup associations retain outbound
                             # ports until idle expiry; changing the destination
@@ -252,7 +260,8 @@ def run(args):
                                     or not sample["positive_controls"]
                                 ):
                                     raise RuntimeError(
-                                        "mixed raw input did not reach the traffic server"
+                                        "mixed raw input did not reach "
+                                        "the traffic server"
                                     )
                                 entry["injected"] = dict(injector.counts)
                         finally:
@@ -275,7 +284,8 @@ def run(args):
                         )
                         daemon.finish()
                         print(
-                            f"{case_id} {implementation} {repetition}: {goodput * 8 / 1e9:.3f} Gbit/s, "
+                            f"{case_id} {implementation} {repetition}: "
+                            f"{goodput * 8 / 1e9:.3f} Gbit/s, "
                             f"lost={entry['metrics']['totals']['lost_datagrams']}",
                             flush=True,
                         )
@@ -298,7 +308,7 @@ def run(args):
     print(f"Results: {path}", flush=True)
 
 
-def add_traffic_arguments(parser):
+def add_traffic_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--udp-server-receive-buffer",
         type=int,
@@ -361,7 +371,8 @@ def main():
     if required_ports > len(SERVER_PORTS):
         parser.error(
             f"selected matrix needs {required_ports} traffic server ports; "
-            f"only {len(SERVER_PORTS)} are available; reduce repetitions or select fewer cases"
+            f"only {len(SERVER_PORTS)} are available; "
+            "reduce repetitions or select fewer cases"
         )
     if not enter(args, Path(__file__).resolve(), "benchmarks"):
         if args.sing_box:

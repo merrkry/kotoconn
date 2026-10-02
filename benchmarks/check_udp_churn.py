@@ -4,18 +4,31 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from benchmarks import run as benchmark
 from e2e.tun_support.environment import (
+    Process,
     add_arguments,
     enter,
     traffic,
 )
 
+if TYPE_CHECKING:
+    from e2e.tun_support.packets import Injector
+    from e2e.tun_support.spec import TrafficSpec
 
-def fixed_work(binary, daemon, directory, spec, **kwargs):
+
+def fixed_work(
+    binary: Path,
+    daemon: Process,
+    directory: Path,
+    spec: TrafficSpec,
+    *,
+    inject: Injector | None = None,
+):
     # Complete many port cycles in each phase regardless of machine speed.
     return traffic(
         binary,
@@ -30,7 +43,7 @@ def fixed_work(binary, daemon, directory, spec, **kwargs):
             # Eight disjoint eight-port cycles create exactly 64 associations.
             "udp_source_ports": "50000-50063",
         },
-        **kwargs,
+        inject=inject,
     )
 
 

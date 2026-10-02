@@ -13,6 +13,13 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from types import FrameType
+
+    from e2e.tun_support.packets import Injector
+    from e2e.tun_support.spec import TrafficSpec
 
 ROOT = Path(__file__).resolve().parents[2]
 NAME = "ktest0"
@@ -29,24 +36,31 @@ def isolated():
         not container
         or os.environ.get("KOTOCONN_TUN_CONTAINER") != "1"
         or not parent
-        or os.readlink("/proc/self/ns/net") == parent
+        or str(Path("/proc/self/ns/net").readlink()) == parent
         or Path("/run/dbus/system_bus_socket").exists()
     ):
         raise RuntimeError(
-            "TUN workloads require the Docker launcher, a private network, and no host D-Bus"
+            "TUN workloads require the Docker launcher, "
+            "a private network, and no host D-Bus"
         )
 
 
-def command(*argv, check=True):
+def command(*argv: str, check: bool = True):
     return subprocess.run(argv, check=check, text=True, capture_output=True, timeout=15)
 
 
-def ip(*argv):
+def ip(*argv: str):
     isolated()
     return command("ip", *argv).stdout
 
 
-def enter(args, script, category, *, sysctls=None):
+def enter(
+    args: argparse.Namespace,
+    script: Path,
+    category: str,
+    *,
+    sysctls: dict[str, str] | None = None,
+):
     """Start one container per run; only its unique artifact directory is writable."""
     if args.inside:
         isolated()
@@ -107,7 +121,7 @@ def enter(args, script, category, *, sysctls=None):
         "--env",
         "KOTOCONN_TUN_CONTAINER=1",
         "--env",
-        f"KOTOCONN_TUN_PARENT_NETNS={os.readlink('/proc/self/ns/net')}",
+        f"KOTOCONN_TUN_PARENT_NETNS={Path('/proc/self/ns/net').readlink()!s}",
         "--mount",
         f"type=bind,source={ROOT},target=/workspace,readonly",
         "--mount",
@@ -128,7 +142,7 @@ def enter(args, script, category, *, sysctls=None):
     # Preserve an explicit generator affinity while leaving daemon affinity
     # independently selectable inside the same container CPU allowance.
     generator_cpus = ",".join(map(str, sorted(os.sched_getaffinity(0))))
-    overrides = []
+    overrides: list[str] = []
     for option in ("binary", "traffic_binary", "sing_box"):
         binary = getattr(args, option, None)
         if binary is None:
@@ -163,7 +177,7 @@ def enter(args, script, category, *, sysctls=None):
     print(f"Artifacts: {directory}", flush=True)
     child = subprocess.Popen(argv, start_new_session=True)
 
-    def interrupted(_signal, _frame):
+    def interrupted(_signal: int, _frame: FrameType | None):
         raise KeyboardInterrupt
 
     # SIGTERM must run the same child cleanup as Ctrl-C, including in CI.
@@ -224,21 +238,35 @@ def configure_routes():
         ip(family, "route", "replace", "default", "dev", NAME, "table", "100")
 
 
-def policy(path, mtu, idle_ms=30000, outbound="direct"):
+def policy(path: Path, mtu: int, idle_ms: int = 30000, outbound: str = "direct"):
     path.write_text(f"""import {{ kotoconn as k }} from '@kotoconn/bindings';
 const resolver = k.resolve_handler(name => k.lookup(name));
-const direct = k.dialer({{dialer: null, outbound: {{resolve_handler: resolver, implementation: k.direct_outbound({{}})}}}});
-const routing = k.routing_handler(flow => flow.protocol === 'udp' ? k.route_udp(direct) : k.route(direct, flow.dest));
+const direct = k.dialer({{dialer: null, outbound: {{
+    resolve_handler: resolver, implementation: k.direct_outbound({{}})
+}}}});
+const routing = k.routing_handler(flow => flow.protocol === 'udp'
+    ? k.route_udp(direct) : k.route(direct, flow.dest));
 k.inbound({{implementation: k.tun_inbound({{name: '{NAME}', mtu: {mtu}, addresses: [
-    {{address: k.ip('192.0.2.1'), prefix: 30}}, {{address: k.ip('fd00::1'), prefix: 126}}
+    {{address: k.ip('192.0.2.1'), prefix: 30}},
+    {{address: k.ip('fd00::1'), prefix: 126}}
 ]}}), routing_handler: routing, udp_idle_timeout: k.timeout({idle_ms})}});
 """)
     if outbound == "socks5":
         source = path.read_text()
         point = source.index("k.inbound(")
-        relay = """k.inbound({implementation: k.socks5_inbound({listen: {address: k.ip('127.0.0.1'), port: 9100}}), routing_handler: routing, udp_idle_timeout: k.timeout(30000)});
-const proxy = k.dialer({dialer: null, outbound: {resolve_handler: resolver, implementation: k.socks5_outbound({server: k.ip_target(k.ip('127.0.0.1'), 9100)})}});
-const tunRouting = k.routing_handler(flow => flow.protocol === 'udp' ? k.route_udp(proxy) : k.route(proxy, flow.dest));
+        relay = """k.inbound({
+    implementation: k.socks5_inbound({listen: {
+        address: k.ip('127.0.0.1'), port: 9100
+    }}),
+    routing_handler: routing, udp_idle_timeout: k.timeout(30000)
+});
+const proxy = k.dialer({dialer: null, outbound: {
+    resolve_handler: resolver, implementation: k.socks5_outbound({
+        server: k.ip_target(k.ip('127.0.0.1'), 9100)
+    })
+}});
+const tunRouting = k.routing_handler(flow => flow.protocol === 'udp'
+    ? k.route_udp(proxy) : k.route(proxy, flow.dest));
 """
         path.write_text(
             source[:point]
@@ -250,7 +278,14 @@ const tunRouting = k.routing_handler(flow => flow.protocol === 'udp' ? k.route_u
 
 
 class Process:
-    def __init__(self, argv, log, *, json_output=False, env=None):
+    def __init__(
+        self,
+        argv: list[str],
+        log: Path,
+        *,
+        json_output: bool = False,
+        env: dict[str, str] | None = None,
+    ):
         self.events = queue.Queue()
         self.lines = []
         self.log = log.open("w")
@@ -286,7 +321,7 @@ class Process:
         finally:
             self.events.put(None)
 
-    def event(self, name, timeout=30):
+    def event(self, name: str, timeout: float = 30):
         end = time.monotonic() + timeout
         while True:
             try:
@@ -300,7 +335,7 @@ class Process:
             if value.get("event", value.get("fields", {}).get("event")) == name:
                 return value
 
-    def send(self, value):
+    def send(self, value: str):
         self.stdin.write(value + "\n")
         self.stdin.flush()
 
@@ -318,7 +353,7 @@ class Process:
         self.log.close()
 
 
-def daemon_environment(binary):
+def daemon_environment(binary: Path):
     # Load the native library staged beside the daemon.
     return dict(
         os.environ,
@@ -330,14 +365,14 @@ def daemon_environment(binary):
 class Daemon(Process):
     def __init__(
         self,
-        binary,
-        directory,
-        mtu,
+        binary: Path,
+        directory: Path,
+        mtu: int,
         *,
-        cpus=None,
-        shutdown_timeout=5,
-        idle_ms=30000,
-        outbound="direct",
+        cpus: str | None = None,
+        shutdown_timeout: int = 5,
+        idle_ms: int = 30000,
+        outbound: str = "direct",
     ):
         directory.mkdir(parents=True, exist_ok=False)
         policy(directory / "main.ts", mtu, idle_ms, outbound)
@@ -365,7 +400,7 @@ class Daemon(Process):
             self.close()
             raise
 
-    def finish(self, forced=False):
+    def finish(self, forced: bool = False):
         self.process.send_signal(signal.SIGTERM)
         self.event("daemon_stopping")
         code = self.process.wait(timeout=15)
@@ -381,7 +416,7 @@ class Daemon(Process):
             raise AssertionError("TUN survived daemon exit")
 
 
-def digest(path):
+def digest(path: Path):
     value = hashlib.sha256()
     with path.open("rb") as source:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
@@ -400,7 +435,7 @@ def network_snapshot():
     }
 
 
-def resource(pid):
+def resource(pid: int):
     root = Path(f"/proc/{pid}")
     fields = (root / "stat").read_text().rsplit(")", 1)[1].split()
     status = dict(
@@ -435,10 +470,17 @@ def reserve_server_port():
     return port
 
 
-def traffic(binary, daemon, directory, spec, *, inject=None):
+def traffic(
+    binary: Path,
+    daemon: Process,
+    directory: Path,
+    spec: TrafficSpec,
+    *,
+    inject: Injector | None = None,
+):
     # TCP needs fresh tuple space after TIME_WAIT. UDP warmup and measurement
     # can explicitly share a server port to reuse their live associations.
-    spec = dict(spec)
+    spec = spec.copy()
     if "port" not in spec:
         spec["port"] = reserve_server_port()
     if spec["port"] not in SERVER_PORTS:
@@ -516,7 +558,7 @@ def traffic(binary, daemon, directory, spec, *, inject=None):
         tool.close()
 
 
-def add_arguments(parser, *, release=False):
+def add_arguments(parser: argparse.ArgumentParser, *, release: bool = False):
     profile = "release" if release else "debug"
     parser.add_argument(
         "--binary", type=Path, default=ROOT / "target/tun" / profile / "kotoconn"

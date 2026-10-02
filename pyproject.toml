@@ -7,17 +7,40 @@ dependencies = []
 [tool.uv]
 package = false
 
+[tool.uv.workspace]
+members = []
+
 [dependency-groups]
 dev = ["ruff>=0.16.7", "pyrefly>=1.3.0"]
 
 [tool.ruff]
 target-version = "py314"
-include = ["e2e/**/*.py", "benchmarks/**/*.py", "tools/**/*.py"]
+extend-exclude = ["external"]
 
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F", "I"]
+extend-select = [
+    "F",
+    "W",
+    "E",
+    "I",
+    "UP",
+    "C4",
+    "FA",
+    "ISC",
+    "ICN",
+    "RET",
+    "SIM",
+    "TID",
+    "TC",
+    "PTH",
+    "TD",
+    "NPY",
+    "FURB",
+]
 
 [tool.pyrefly]
-project-includes = ["e2e/**/*.py", "benchmarks/**/*.py", "tools/**/*.py"]
+preset = "strict"
+project-includes = ["**/*.py"]
+project-excludes = ["external/**", "target/**", "**/node_modules/**"]
 search-path = [".", "e2e", "benchmarks", "tools"]
 python-version = "3.14"

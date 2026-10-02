@@ -7,7 +7,7 @@ from collections import Counter
 from .environment import CLIENT, NAME, REMOTE, isolated
 
 
-def checksum(data):
+def checksum(data: bytes):
     if len(data) % 2:
         data += b"\0"
     value = sum(struct.unpack(f"!{len(data) // 2}H", data))
@@ -16,17 +16,17 @@ def checksum(data):
     return (~value) & 0xFFFF
 
 
-def corpus(ipv6, sequence, port):
+def corpus(ipv6: bool, sequence: int, port: int):
     family = socket.AF_INET6 if ipv6 else socket.AF_INET
     source = socket.inet_pton(family, CLIENT[int(ipv6)])
     target = socket.inet_pton(family, REMOTE[int(ipv6)])
 
-    def pseudo(protocol, length):
+    def pseudo(protocol: int, length: int):
         if ipv6:
             return source + target + struct.pack("!I3xB", length, protocol)
         return source + target + struct.pack("!BBH", 0, protocol, length)
 
-    def ip(protocol, payload):
+    def ip(protocol: int, payload: bytes):
         if ipv6:
             return (
                 struct.pack(
@@ -49,7 +49,7 @@ def corpus(ipv6, sequence, port):
         )
         return header[:10] + struct.pack("!H", checksum(header)) + header[12:] + payload
 
-    def udp(payload):
+    def udp(payload: bytes):
         segment = struct.pack("!HHHH", 22222, port, len(payload) + 8, 0) + payload
         value = checksum(pseudo(17, len(segment)) + segment) or 0xFFFF
         return segment[:6] + struct.pack("!H", value) + segment[8:]
@@ -90,7 +90,7 @@ def corpus(ipv6, sequence, port):
 
 
 class Injector:
-    def __init__(self, ipv6, port=9001, seed=1):
+    def __init__(self, ipv6: bool, port: int = 9001, seed: int = 1):
         isolated()
         self.ipv6 = ipv6
         self.port = port
