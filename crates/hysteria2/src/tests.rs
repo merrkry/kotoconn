@@ -16,7 +16,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 struct Handler(Arc<AtomicUsize>);
 
 impl p::Handler for Handler {
-    fn tcp(&self, _: Target, mut stream: p::BoxStream, _: Scope) -> BoxFuture<'_, Result<()>> {
+    fn tcp(
+        &self,
+        _: std::net::SocketAddr,
+        _: Target,
+        mut stream: p::BoxStream,
+        _: Scope,
+    ) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             self.0.fetch_add(1, Ordering::SeqCst);
             stream.write_all(b"hello").await?;
@@ -25,7 +31,7 @@ impl p::Handler for Handler {
         })
     }
 
-    fn udp(&self, _: p::Datagram) -> BoxFuture<'_, Result<()>> {
+    fn udp(&self, _: std::net::SocketAddr, _: p::Datagram) -> BoxFuture<'_, Result<()>> {
         Box::pin(async { anyhow::bail!("unexpected UDP session") })
     }
 }

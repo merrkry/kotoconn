@@ -44,7 +44,7 @@ impl p::Server for Server {
                     let tcp_crypto = crypto.clone();
                     let tcp = async move {
                         let handler = tcp_context.handler.clone();
-                        accept_loop(listener, tcp_context, move |stream, _, _, scope| {
+                        accept_loop(listener, tcp_context, move |stream, peer, _, scope| {
                             let crypto = tcp_crypto.clone();
                             let handler = handler.clone();
                             async move {
@@ -57,7 +57,9 @@ impl p::Server for Server {
                                 let destination = from_address(stream.handshake().await?);
                                 let stream = super::buffered::Buffered::new(stream);
 
-                                handler.tcp(destination, Box::pin(stream), scope).await
+                                handler
+                                    .tcp(peer, destination, Box::pin(stream), scope)
+                                    .await
                             }
                         })
                         .await
@@ -132,7 +134,7 @@ async fn udp(socket: UdpSocket, context: ServerContext, crypto: Arc<Crypto>) -> 
                     let responses = responses.clone();
 
                     scope.spawn(async move {
-                        let work = handler.udp(connection);
+                        let work = handler.udp(peer, connection);
                         tokio::pin!(work);
 
                         let mut batch = Vec::with_capacity(32);

@@ -1,7 +1,7 @@
 //! Native values remain native; TypeScript cannot manufacture resource references.
 
 use kotoconn_config as config;
-use rquickjs::{Ctx, FromJs, Result, Value};
+use rquickjs::{Ctx, FromJs, IntoJs, Result, Value};
 use ts_rs::TS;
 
 #[duplicate::duplicate_item(
@@ -33,9 +33,16 @@ pub(crate) struct Wrapper {
     Clone, rquickjs::class::Trace, rquickjs::JsLifetime, derive_more::From, derive_more::Into, TS,
 )]
 #[rquickjs::class]
-#[ts(
-    type = "({ readonly version: 4 } | { readonly version: 6 }) & { equals(other: IpAddr): boolean; toString(): string; readonly __brand: unique symbol }"
-)]
+#[ts(type = "({ readonly version: 4 } | { readonly version: 6 }) & {
+        equals(other: IpAddr): boolean;
+        is_private(): boolean;
+        is_loopback(): boolean;
+        is_link_local(): boolean;
+        is_multicast(): boolean;
+        is_unspecified(): boolean;
+        toString(): string;
+        readonly __brand: unique symbol;
+    }")]
 pub(crate) struct IpAddr {
     #[qjs(skip_trace)]
     pub value: config::IpAddr,
@@ -50,6 +57,56 @@ impl IpAddr {
 
     pub fn equals(&self, other: Self) -> bool {
         self.value == other.value
+    }
+
+    pub fn is_private(&self) -> bool {
+        match self.value {
+            config::IpAddr::V4(address) => address.is_private(),
+            config::IpAddr::V6(address) => address.is_unique_local(),
+        }
+    }
+
+    pub fn is_loopback(&self) -> bool {
+        self.value.is_loopback()
+    }
+
+    pub fn is_link_local(&self) -> bool {
+        match self.value {
+            config::IpAddr::V4(address) => address.is_link_local(),
+            config::IpAddr::V6(address) => address.is_unicast_link_local(),
+        }
+    }
+
+    pub fn is_multicast(&self) -> bool {
+        self.value.is_multicast()
+    }
+
+    pub fn is_unspecified(&self) -> bool {
+        self.value.is_unspecified()
+    }
+
+    #[qjs(rename = "toString")]
+    pub fn display(&self) -> String {
+        self.value.to_string()
+    }
+}
+
+#[derive(
+    Clone, rquickjs::class::Trace, rquickjs::JsLifetime, derive_more::From, derive_more::Into, TS,
+)]
+#[rquickjs::class]
+#[ts(
+    type = "{ contains(address: IpAddr): boolean; toString(): string; readonly __brand: unique symbol }"
+)]
+pub(crate) struct Cidr {
+    #[qjs(skip_trace)]
+    pub value: ipnet::IpNet,
+}
+
+#[rquickjs::methods]
+impl Cidr {
+    pub fn contains(&self, address: IpAddr) -> bool {
+        self.value.contains(&address.value)
     }
 
     #[qjs(rename = "toString")]
@@ -123,6 +180,19 @@ pub(crate) use checked_number_byte::Byte;
 pub(crate) use checked_number_milliseconds::Milliseconds;
 pub(crate) use checked_number_mtu::Mtu;
 pub(crate) use checked_number_port::Port;
+
+#[rquickjs::methods]
+impl Inbound {
+    pub fn equals(&self, other: Self) -> bool {
+        self.value == other.value
+    }
+}
+
+impl<'js> IntoJs<'js> for Port {
+    fn into_js(self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        self.0.into_js(ctx)
+    }
+}
 
 pub(crate) fn invalid(message: impl Into<String>) -> rquickjs::Error {
     rquickjs::Error::new_from_js_message("value", "native value", message.into())

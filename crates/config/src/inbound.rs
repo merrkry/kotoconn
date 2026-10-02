@@ -21,7 +21,7 @@ pub use tun::{TunAddress, TunInboundConfig};
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ts_rs::TS)]
 #[ts(rename = "Inbound")]
-#[ts(type = "{ readonly __brand: unique symbol }")]
+#[ts(type = "{ equals(other: Inbound): boolean; readonly __brand: unique symbol }")]
 pub struct InboundId(pub NonZeroU64);
 
 #[derive(Debug, Clone, PartialEq, Eq, ts_rs::TS)]

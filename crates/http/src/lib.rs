@@ -79,7 +79,7 @@ impl p::Server for Server {
                 run: Box::pin(async move {
                     let handler = context.handler.clone();
 
-                    accept_loop(listener, context, move |stream, _, _, scope| {
+                    accept_loop(listener, context, move |stream, peer, _, scope| {
                         let handler = handler.clone();
 
                         async move {
@@ -103,7 +103,7 @@ impl p::Server for Server {
                                 .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                                 .await?;
                             stream.flush().await?;
-                            handler.tcp(destination, p::prefix(stream.buffer().to_vec().into(), stream.into_inner()), scope).await
+                            handler.tcp(peer, destination, p::prefix(stream.buffer().to_vec().into(), stream.into_inner()), scope).await
                         }
                     })
                     .await

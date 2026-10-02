@@ -10,6 +10,8 @@ use ts_rs::TS;
 #[convert(from(config::Flow), into(config::Flow))]
 #[ts(as = "config::Flow")]
 pub(crate) struct Flow {
+    pub inbound: Inbound,
+    pub source: SocketAddr,
     pub protocol: TransportProtocol,
     pub dest: Target,
     pub sniff: Option<SniffResult>,
@@ -152,7 +154,7 @@ pub(crate) struct Socks5OutboundConfig {
     pub server: Target,
 }
 
-#[derive(FromJs, TS)]
+#[derive(FromJs, IntoJs, TS)]
 pub(crate) struct SocketAddr {
     pub address: IpAddr,
     pub port: Port,

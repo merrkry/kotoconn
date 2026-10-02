@@ -167,6 +167,7 @@ async fn serve(
                 let handler = context.handler.clone();
                 let scope = tcp_scope.child();
                 let connection_scope = scope.clone();
+                let peer = connection.remote_address();
 
                 scope.spawn(async move {
                     let _close = CloseScope(connection_scope.clone());
@@ -176,7 +177,7 @@ async fn serve(
                         Ok::<_, anyhow::Error>(target)
                     }).await??;
 
-                    handler.tcp(target, Box::pin(stream), connection_scope).await
+                    handler.tcp(peer, target, Box::pin(stream), connection_scope).await
                 })?;
             }
         }

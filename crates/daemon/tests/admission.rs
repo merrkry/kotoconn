@@ -12,6 +12,7 @@ struct Inspect(tokio::sync::mpsc::UnboundedSender<Target>);
 impl Handler for Inspect {
     fn tcp(
         &self,
+        _: std::net::SocketAddr,
         destination: Target,
         mut stream: BoxStream,
         _: Scope,
@@ -27,7 +28,7 @@ impl Handler for Inspect {
         })
     }
 
-    fn udp(&self, _: Datagram) -> BoxFuture<'_, Result<()>> {
+    fn udp(&self, _: std::net::SocketAddr, _: Datagram) -> BoxFuture<'_, Result<()>> {
         unreachable!()
     }
 }

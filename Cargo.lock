@@ -1816,6 +1816,7 @@ dependencies = [
  "derive_more",
  "duplicate",
  "hickory-proto",
+ "ipnet",
  "kotoconn-config",
  "kotoconn-typescript",
  "rquickjs",

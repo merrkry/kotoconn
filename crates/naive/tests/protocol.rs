@@ -75,7 +75,13 @@ impl Resolver for Resolve {
 struct Echo(mpsc::UnboundedSender<Target>);
 
 impl Handler for Echo {
-    fn tcp(&self, target: Target, mut io: BoxStream, _: Scope) -> BoxFuture<'_, Result<()>> {
+    fn tcp(
+        &self,
+        _: std::net::SocketAddr,
+        target: Target,
+        mut io: BoxStream,
+        _: Scope,
+    ) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             self.0.send(target)?;
             io.write_all(b"hello").await?;
@@ -88,7 +94,7 @@ impl Handler for Echo {
         })
     }
 
-    fn udp(&self, _: Datagram) -> BoxFuture<'_, Result<()>> {
+    fn udp(&self, _: std::net::SocketAddr, _: Datagram) -> BoxFuture<'_, Result<()>> {
         Box::pin(async { bail!("no UDP") })
     }
 }

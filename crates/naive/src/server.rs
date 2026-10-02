@@ -122,7 +122,7 @@ impl p::Server for Server {
                 run: Box::pin(async move {
                     let handler = context.handler.clone();
                     let stopping = context.stopping.clone();
-                    p::accept_loop(listener, context, move |io, _, _, scope| {
+                    p::accept_loop(listener, context, move |io, peer, _, scope| {
                         let tls = tls.clone();
                         let authorization = authorization.clone();
                         let handler = handler.clone();
@@ -191,7 +191,9 @@ impl p::Server for Server {
                                 let handler = handler.clone();
                                 let work_scope = session.clone();
                                 session.spawn(async move {
-                                    handler.tcp(destination, Box::pin(io), work_scope).await
+                                    handler
+                                        .tcp(peer, destination, Box::pin(io), work_scope)
+                                        .await
                                 })?;
                             }
                             Ok(())

@@ -7,6 +7,8 @@ publish.workspace = true
 [dependencies]
 derive_more = { workspace = true, features = ["from", "into"] }
 duplicate.workspace = true
+hickory-proto.workspace = true
+ipnet.workspace = true
 kotoconn-config.workspace = true
 kotoconn-typescript.workspace = true
 rquickjs = { workspace = true, features = ["macro", "loader", "futures"] }
@@ -18,6 +20,5 @@ tracing.workspace = true
 ts-rs.workspace = true
 
 [dev-dependencies]
-hickory-proto.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 trybuild.workspace = true
