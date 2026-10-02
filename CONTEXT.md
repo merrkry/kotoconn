@@ -43,7 +43,7 @@ The client's requested endpoint. Routing and resolution do not change it.
 The endpoint used for a connection attempt. TCP routing can replace the destination; UDP always uses the original destination.
 
 **Flow**:
-The traffic described to a routing policy by its transport protocol and destination.
+The traffic described to a routing policy by its transport protocol, destination, and optional sniff result.
 
 **UDP idle timeout**:
 The inactivity period after which an inbound's client UDP session expires. It is distinct from the lifetime of a carrier connection.

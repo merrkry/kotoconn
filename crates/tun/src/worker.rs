@@ -91,7 +91,6 @@ struct TcpEntry {
 
 struct UdpEntry {
     packets: Option<queue::Sender<p::Packet>>,
-    activity: p::Activity,
     scope: Scope,
     generation: u64,
     direct: Option<crate::udp_direct::Direct>,
@@ -152,7 +151,7 @@ impl Worker {
             let progress = if entry.scope.is_closed() {
                 crate::udp_direct::Progress::Closed
             } else {
-                direct.poll(&self.output, &entry.activity)
+                direct.poll(&self.output)
             };
             match progress {
                 crate::udp_direct::Progress::Idle => {}
@@ -470,7 +469,10 @@ impl Worker {
                         .checked_add(1)
                         .expect("TUN connection generation exhausted");
                     let scope = self.context.scope.child();
+                    let lifetime = p::UdpSession::new(scope.clone(), self.context.udp_idle_timeout);
+                    let activity = lifetime.activity();
                     let (mut association, mut driver) = p::packet_pair(scope.clone());
+                    association.session_activity = Some(activity.clone());
                     association.single_target = Some(p::target(flow.destination));
                     association.worker = Some(Arc::new(crate::udp_direct::Handoff {
                         id: (flow, self.generation),
@@ -483,8 +485,6 @@ impl Worker {
                     // reply receiver so native handoff can free the ingress queue.
                     driver.disarm();
                     drop(driver);
-                    let activity = p::Activity::default();
-                    let clock = activity.clone();
                     let handler = self.context.handler.clone();
                     let output = self.output.clone();
                     let completion = Completion {
@@ -493,21 +493,19 @@ impl Worker {
                         generation: self.generation,
                     };
                     let stopping = self.context.stopping.clone();
-                    let idle = self.context.udp_idle_timeout;
                     let reply_activity = activity.clone();
-                    let control = scope.clone();
-
                     scope.spawn(async move {
                         let _completion = completion;
                         let replies = udp_replies(flow, replies, output, reply_activity);
-                        tokio::select! {
-                            _ = stopping.cancelled() => {},
-                            _ = clock.until_idle(idle) => {},
-                            result = handler.udp(association) => result?,
-                            result = replies => result?,
-                        }
-                        control.close();
-                        Ok(())
+                        lifetime
+                            .run(async {
+                                tokio::select! {
+                                    _ = stopping.cancelled() => Ok(()),
+                                    result = handler.udp(association) => result,
+                                    result = replies => result,
+                                }
+                            })
+                            .await
                     })?;
 
                     self.udp.insert(
@@ -516,7 +514,6 @@ impl Worker {
                             packets: Some(packets),
                             direct: None,
                             blocked: false,
-                            activity,
                             scope,
                             generation: self.generation,
                         },
@@ -541,13 +538,10 @@ impl Worker {
                         let payload = backing
                             .and_then(|source| crate::storage::view(source, payload))
                             .unwrap_or_else(|| self.pool.copy(payload));
-                        if !direct.enqueue(
-                            p::Packet {
-                                target: p::target(flow.destination),
-                                payload,
-                            },
-                            &entry.activity,
-                        ) {
+                        if !direct.enqueue(p::Packet {
+                            target: p::target(flow.destination),
+                            payload,
+                        }) {
                             self.stats.capacity_drops += 1;
                         }
                         continue;
@@ -566,7 +560,6 @@ impl Worker {
                         target: p::target(flow.destination),
                         payload,
                     });
-                    entry.activity.record();
                 }
             }
             _ => {}
@@ -801,8 +794,8 @@ async fn udp_replies(
                     payload,
                 })
                 .await?;
+            activity.record();
         }
-        activity.record();
     }
     Ok(())
 }
@@ -811,6 +804,49 @@ async fn udp_replies(
 mod tests {
     use super::*;
     use smoltcp::wire::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_udp_reply_batch_refreshes_idle_before_capacity_wait() {
+        let scope = Scope::new();
+        let lifetime = p::UdpSession::new(scope.clone(), std::time::Duration::from_secs(10));
+        let activity = lifetime.activity();
+        let flow = Flow {
+            source: "192.0.2.2:12345".parse().unwrap(),
+            destination: "198.51.100.1:443".parse().unwrap(),
+        };
+        let (input, replies) =
+            queue::channel(queue::INITIAL_BYTES, |p: &p::Packet| p.payload.len());
+        for port in [443, 444] {
+            input
+                .send(p::Packet {
+                    target: p::target(std::net::SocketAddr::new(flow.destination.ip(), port)),
+                    payload: Bytes::from_static(b"x"),
+                })
+                .await
+                .unwrap();
+        }
+        // One reply fits. The next target starts a separate batch and waits.
+        let (output, mut transmitted) = queue::channel(49, Transmit::size);
+        let mut running = Box::pin(lifetime.run(udp_replies(flow, replies, output, activity)));
+        tokio::time::advance(std::time::Duration::from_secs(9)).await;
+        assert!(futures_util::poll!(running.as_mut()).is_pending());
+
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert!(futures_util::poll!(running.as_mut()).is_pending());
+        tokio::time::advance(std::time::Duration::from_secs(9)).await;
+        running.await.unwrap();
+        assert!(scope.is_closed());
+
+        let Transmit::Datagrams {
+            source, payload, ..
+        } = transmitted.try_recv().unwrap()
+        else {
+            panic!("expected the forwarded reply");
+        };
+        assert_eq!(source.port(), 443);
+        assert_eq!(payload, vec![Bytes::from_static(b"x")]);
+        assert!(matches!(transmitted.try_recv(), Err(queue::Error::Closed)));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn cancelling_a_blocked_handshake_replaces_its_wait_and_releases_it_on_close() {

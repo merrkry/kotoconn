@@ -1734,7 +1734,10 @@ name = "kotoconn-inbounds"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "futures-util",
+ "http",
+ "httparse",
  "kotoconn-anytls",
  "kotoconn-config",
  "kotoconn-http",
@@ -1744,6 +1747,7 @@ dependencies = [
  "kotoconn-shadowsocks2022",
  "kotoconn-socks5",
  "kotoconn-tun",
+ "rustls",
  "tokio",
  "tokio-util",
  "tracing",

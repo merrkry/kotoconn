@@ -7,6 +7,7 @@ mod inbound;
 mod outbound;
 mod resolve;
 mod route;
+mod sniff;
 mod target;
 mod tls;
 
@@ -23,6 +24,7 @@ pub use inbound::{
 pub use outbound::{DirectOutboundConfig, OutboundConfig, OutboundImpl, Socks5OutboundConfig};
 pub use resolve::ResolveHandlerId;
 pub use route::{RouteDecision, RoutingHandlerId};
+pub use sniff::{SniffConfig, SniffProtocol, SniffResult};
 pub use std::net::IpAddr;
 pub use target::Target;
 

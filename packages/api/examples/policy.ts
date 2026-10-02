@@ -11,8 +11,9 @@ const routing = k.routing_handler(async (flow) => {
     // This direct carrier needs an IP. UDP policy cannot rewrite the destination.
     return flow.dest.ip ? k.route_udp(dialer) : k.reject();
   }
-  if (flow.dest.domain) {
-    const addresses = await k.lookup(flow.dest.domain);
+  const domain = flow.sniff?.domain ?? flow.dest.domain;
+  if (domain) {
+    const addresses = await k.lookup(domain);
     const address = addresses[0];
     return address ? k.route(dialer, k.ip_target(address, flow.dest.port)) : k.reject();
   }
@@ -29,6 +30,7 @@ for (const implementation of [
 ]) {
   k.inbound({
     routing_handler: routing,
+    sniff: { timeout: k.timeout(300) },
     udp_idle_timeout: k.timeout(60_000),
     implementation,
   });

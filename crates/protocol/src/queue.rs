@@ -2,6 +2,7 @@
 use crossbeam_queue::SegQueue;
 use futures_util::task::AtomicWaker;
 use std::{
+    collections::VecDeque,
     fmt, io,
     sync::{
         Arc,
@@ -146,6 +147,11 @@ pub struct Sender<T>(Arc<Shared<T>>);
 
 pub struct Receiver<T> {
     shared: Arc<Shared<T>>,
+    #[allow(
+        clippy::box_collection,
+        reason = "Keep unbuffered per-session receivers small"
+    )]
+    prefix: Option<Box<VecDeque<T>>>,
 }
 
 /// Byte credits include outstanding reservations. Completion counters and target
@@ -166,7 +172,13 @@ pub fn channel<T>(initial: usize, size: fn(&T) -> usize) -> (Sender<T>, Receiver
         writable: Notify::new(),
         size,
     });
-    (Sender(shared.clone()), Receiver { shared })
+    (
+        Sender(shared.clone()),
+        Receiver {
+            shared,
+            prefix: None,
+        },
+    )
 }
 
 impl<T> Clone for Sender<T> {
@@ -275,6 +287,28 @@ impl<T> Drop for Permit<'_, T> {
 }
 
 impl<T> Receiver<T> {
+    /// Replay already consumed items before queued ingress. The caller bounds
+    /// this storage; these items have already released their queue credits.
+    pub fn prepend(&mut self, items: Vec<T>) {
+        if items.is_empty() {
+            return;
+        }
+
+        let prefix = self.prefix.get_or_insert_with(Default::default);
+        for item in items.into_iter().rev() {
+            prefix.push_front(item);
+        }
+    }
+
+    fn pop_prefix(&mut self) -> Option<T> {
+        let prefix = self.prefix.as_mut()?;
+        let item = prefix.pop_front();
+        if prefix.is_empty() {
+            self.prefix = None;
+        }
+        item
+    }
+
     fn complete(&mut self, cost: usize) {
         self.shared.release(cost);
         self.shared.refresh();
@@ -284,6 +318,11 @@ impl<T> Receiver<T> {
 
     pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
         let budget = ready!(coop::poll_proceed(cx));
+        if let Some(item) = self.pop_prefix() {
+            budget.made_progress();
+            return Poll::Ready(Some(item));
+        }
+
         self.shared.readable.register(cx.waker());
         if let Some((item, cost)) = self.shared.items.pop() {
             self.complete(cost);
@@ -308,6 +347,10 @@ impl<T> Receiver<T> {
     }
 
     pub fn try_recv(&mut self) -> Result<T, Error> {
+        if let Some(item) = self.pop_prefix() {
+            return Ok(item);
+        }
+
         if let Some((item, cost)) = self.shared.items.pop() {
             self.complete(cost);
             Ok(item)
@@ -340,6 +383,12 @@ impl<T> Receiver<T> {
         let mut count = 1;
         let mut cost = 0;
         while count < limit {
+            if let Some(item) = self.pop_prefix() {
+                out.push(item);
+                count += 1;
+                continue;
+            }
+
             let Some((item, bytes)) = self.shared.items.pop() else {
                 break;
             };
