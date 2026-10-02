@@ -27,6 +27,7 @@ impl Drop for Completion {
 
 pub(super) fn association(
     handler: SessionHandler,
+    source: SocketAddr,
     mut packets: Datagram,
 ) -> BoxFuture<'static, Result<()>> {
     debug_assert!(packets.session_activity.is_none() || packets.single_target.is_some());
@@ -38,11 +39,19 @@ pub(super) fn association(
             let incoming = packets.take_receiver();
             let worker = packets.worker.take();
             let activity = packets.session_activity.take();
+            let flow = Flow {
+                inbound: handler.inbound,
+                source,
+                protocol: TransportProtocol::Udp,
+                dest: target,
+                sniff: None,
+            };
+
             packets
                 .scope
                 .run(session(
                     handler,
-                    target,
+                    flow,
                     incoming,
                     packets.tx.clone(),
                     packets.scope.clone(),
@@ -52,11 +61,15 @@ pub(super) fn association(
                 .await
         })
     } else {
-        Box::pin(route_packets(handler, packets))
+        Box::pin(route_packets(handler, source, packets))
     }
 }
 
-async fn route_packets(handler: SessionHandler, mut packets: Datagram) -> Result<()> {
+async fn route_packets(
+    handler: SessionHandler,
+    source: SocketAddr,
+    mut packets: Datagram,
+) -> Result<()> {
     let mut sessions = HashMap::<Target, Entry>::new();
     let (completed, mut completions) = mpsc::unbounded_channel();
     let mut generation = 0u64;
@@ -108,15 +121,21 @@ async fn route_packets(handler: SessionHandler, mut packets: Datagram) -> Result
                             generation,
                             sender: completed.clone(),
                         };
-                        let destination = target.clone();
+                        let flow = Flow {
+                            inbound: handler.inbound,
+                            source,
+                            protocol: TransportProtocol::Udp,
+                            dest: target.clone(),
+                            sniff: None,
+                        };
                         let control = scope.clone();
 
-                        let span = tracing::info_span!("session", protocol = "udp", ?destination, session_id = tracing::field::Empty);
+                        let span = tracing::info_span!("session", protocol = "udp", destination = ?target, session_id = tracing::field::Empty);
                         scope.spawn(async move {
                             let _completion = completion;
                             let result = session(
                                 instance,
-                                destination,
+                                flow,
                                 rx,
                                 replies,
                                 control,
@@ -144,13 +163,17 @@ async fn route_packets(handler: SessionHandler, mut packets: Datagram) -> Result
 
 async fn session(
     handler: SessionHandler,
-    destination: Target,
+    mut flow: Flow,
     mut incoming: kotoconn_protocol::queue::Receiver<Packet>,
     replies: kotoconn_protocol::queue::Sender<Packet>,
     scope: Scope,
     worker: Option<Arc<dyn p::DatagramWorker>>,
     shared_activity: Option<p::Activity>,
 ) -> Result<()> {
+    debug_assert_eq!(flow.protocol, TransportProtocol::Udp);
+    debug_assert!(flow.sniff.is_none());
+
+    let destination = flow.dest.clone();
     let (lifetime, activity) = match shared_activity {
         Some(activity) => (None, activity),
         None => {
@@ -170,23 +193,13 @@ async fn session(
         tracing::Span::current().record("session_id", registration.id.0);
         tracing::debug!("session started");
 
-        let sniff = if let Some(config) = &handler.sniff {
+        flow.sniff = if let Some(config) = &handler.sniff {
             kotoconn_inbounds::sniff::udp(&mut incoming, config, &scope).await
         } else {
             None
         };
 
-        let decision = handler
-            .policy
-            .route(
-                handler.routing,
-                Flow {
-                    protocol: TransportProtocol::Udp,
-                    dest: destination.clone(),
-                    sniff,
-                },
-            )
-            .await?;
+        let decision = handler.policy.route(handler.routing, flow).await?;
 
         let RouteDecision::Udp { dialer } = decision else {
             bail!("UDP session rejected");

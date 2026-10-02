@@ -6,14 +6,18 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 pub trait Handler: Send + Sync {
+    /// Source is the accepted transport peer, or the original packet source for TUN.
     fn tcp(
         &self,
+        source: SocketAddr,
         destination: Target,
         stream: BoxStream,
         scope: Scope,
     ) -> BoxFuture<'_, Result<()>>;
+
     /// A protocol association can contain multiple destination-specific sessions.
-    fn udp(&self, packets: Datagram) -> BoxFuture<'_, Result<()>>;
+    /// Source is the peer when the association starts, even if its transport later migrates.
+    fn udp(&self, source: SocketAddr, packets: Datagram) -> BoxFuture<'_, Result<()>>;
 }
 
 #[derive(Clone)]

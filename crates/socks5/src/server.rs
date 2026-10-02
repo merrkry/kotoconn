@@ -7,6 +7,24 @@ use tokio::{
     net::{TcpListener, UdpSocket},
 };
 
+async fn receive_packet(
+    socket: &UdpSocket,
+    buffer: &mut [u8],
+    peer: SocketAddr,
+    expected: Option<SocketAddr>,
+) -> Result<(SocketAddr, Packet)> {
+    loop {
+        let (n, source) = socket.recv_from(buffer).await?;
+        if source.ip() != peer.ip() || expected.is_some_and(|client| client != source) {
+            continue;
+        }
+
+        if let Ok(packet) = decode(&buffer[..n]).await {
+            return Ok((source, packet));
+        }
+    }
+}
+
 pub struct Server;
 
 impl p::Server for Server {
@@ -39,23 +57,18 @@ impl p::Server for Server {
                                 Socks5Command::TCPConnect => {
                                     let stream = protocol.reply_success(local).await?;
 
-                                    handler.tcp(from_address(destination), stream, scope).await
+                                    handler.tcp(peer, from_address(destination), stream, scope).await
                                 }
                                 Socks5Command::UDPAssociate => {
                                     let socket =
                                         UdpSocket::bind(SocketAddr::new(local.ip(), 0)).await?;
                                     let mut control = protocol.reply_success(socket.local_addr()?).await?;
-                                    let (association, mut driver) = packet_pair(scope.child());
-                                    let work = handler.udp(association);
-                                    tokio::pin!(work);
-
                                     let mut buffer = vec![0; 65536];
                                     let mut byte = [0];
-                                    let mut batch = Vec::with_capacity(32);
 
                                     // The advertised client endpoint can be unknown. Pin the first
                                     // valid packet's port, while always requiring the TCP peer IP.
-                                    let mut client = match destination {
+                                    let advertised = match destination {
                                         fast_socks5::util::target_addr::TargetAddr::Ip(addr)
                                             if addr.port() != 0 =>
                                         {
@@ -64,37 +77,40 @@ impl p::Server for Server {
                                         _ => None,
                                     };
 
+                                    let (client, packet) = tokio::select! {
+                                        biased;
+                                        _ = stopping.cancelled() => return Ok(()),
+                                        _ = control.read(&mut byte) => return Ok(()),
+                                        received = receive_packet(&socket, &mut buffer, peer, advertised) => received?,
+                                    };
+
+                                    let (association, mut driver) = packet_pair(scope.child());
+                                    driver.tx.send(packet).await?;
+                                    let work = handler.udp(client, association);
+                                    tokio::pin!(work);
+
+                                    let mut batch = Vec::with_capacity(32);
                                     loop {
                                         tokio::select! {
                                             biased;
                                             _ = stopping.cancelled() => return Ok(()),
                                             _ = control.read(&mut byte) => return Ok(()),
                                             result = &mut work => return result,
-                                            received = socket.recv_from(&mut buffer) => {
-                                                let (n, source) = received?;
-
-                                                if source.ip() != peer.ip()
-                                                    || client.is_some_and(|expected| expected != source)
-                                                {
-                                                    continue;
-                                                }
-
-                                                if let Ok(packet) = decode(&buffer[..n]).await {
-                                                    client = Some(source);
-                                                    let _ = driver.tx.try_send(packet);
-                                                }
+                                            received = receive_packet(&socket, &mut buffer, peer, Some(client)) => {
+                                                let (_, packet) = received?;
+                                                let _ = driver.tx.try_send(packet);
                                             }
                                             count = driver.rx.recv_many(&mut batch, 32) => {
-                                                if count == 0 { return Ok(()); }
-                                                for response in batch.drain(..) {
-
-                                                if let (Some(client), Ok(wire)) =
-                                                    (client, encode(response))
-                                                    && let Err(error) =
-                                                        socket.send_to(&wire, client).await
-                                                {
-                                                    tracing::warn!(error = %format_args!("{error:#}"), "SOCKS UDP reply");
+                                                if count == 0 {
+                                                    return Ok(());
                                                 }
+
+                                                for response in batch.drain(..) {
+                                                    if let Ok(wire) = encode(response)
+                                                        && let Err(error) = socket.send_to(&wire, client).await
+                                                    {
+                                                        tracing::warn!(error = %format_args!("{error:#}"), "SOCKS UDP reply");
+                                                    }
                                                 }
                                             }
                                         }

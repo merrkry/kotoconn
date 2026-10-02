@@ -20,6 +20,12 @@ TCP and UDP clients expose independent close handles through `client_control`. `
 
 Shadowsocks uses the single-user AES-128-GCM 2022 method in this version. The example key is public test data, not a deployment credential. HTTP supports CONNECT only; SOCKS5 supports CONNECT and UDP ASSOCIATE without authentication. UDP session routing uses `route_udp` and cannot override the destination. `lookup` uses system DNS; the I/O carrier itself never resolves domain targets.
 
+Routing handlers receive `flow.inbound`, `flow.source.address` and `flow.source.port`.
+Compare an inbound with a registered reference using `flow.inbound.equals(inbound)`.
+Source is the transport peer for proxy listeners and the original packet source for
+TUN. SOCKS5 UDP uses the UDP sender rather than its TCP control connection. UDP
+source metadata stays at the association's initial peer if the transport migrates.
+
 ## Inbound sniffing
 
 Set `sniff: { timeout: k.timeout(300) }` on `k.inbound(...)` to inspect payload before calling the routing handler. Omit `sniff` to disable it. The timeout must be positive and limits the whole inspection, rather than each read.

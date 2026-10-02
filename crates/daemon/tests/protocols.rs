@@ -54,10 +54,15 @@ async fn daemon_with_idle(idle: u32) -> Result<Daemon> {
         import {{ kotoconn as k }} from '@kotoconn/bindings';
         const resolver = k.resolve_handler(name => k.lookup(name));
         const direct = k.dialer({{ dialer: undefined, outbound: {{ resolve_handler: resolver, implementation: k.direct_outbound({{}}) }} }});
-        const routing = k.routing_handler(flow => flow.protocol === 'udp' ? k.route_udp(direct) : k.route(direct, flow.dest));
+        const inbounds = [];
+        const routing = k.routing_handler(flow => {{
+            if (!inbounds.some(inbound => flow.inbound.equals(inbound))) throw Error('unknown inbound');
+            if (!flow.source.address.is_loopback() || flow.source.port === 0) throw Error('missing source');
+            return flow.protocol === 'udp' ? k.route_udp(direct) : k.route(direct, flow.dest);
+        }});
         const listen = {{ address: k.ip('127.0.0.1'), port: 0 }};
         for (const implementation of [k.http_inbound({{listen}}), k.socks5_inbound({{listen}}), k.shadowsocks2022_inbound({{listen, password: '{KEY}'}}), k.hysteria2_inbound({{listen, password: '{KEY}', certificate: {certificate:?}, private_key: {private_key:?}, obfs_password: 'salamander-test'}})]) {{
-            k.inbound({{ implementation, routing_handler: routing, udp_idle_timeout: k.timeout({idle}) }});
+            inbounds.push(k.inbound({{ implementation, routing_handler: routing, udp_idle_timeout: k.timeout({idle}) }}));
         }}
     "#,
         certificate = hysteria_certificate().cert.pem(),
@@ -504,6 +509,8 @@ async fn capability_checks_and_udp_policy_contract_reject_invalid_requests() -> 
             .route(
                 handler,
                 Flow {
+                    inbound: InboundId(std::num::NonZeroU64::new(1).unwrap()),
+                    source: "127.0.0.1:12345".parse()?,
                     protocol: TransportProtocol::Udp,
                     sniff: None,
                     dest: target("127.0.0.1:2".parse()?),
@@ -559,6 +566,80 @@ async fn configured_resolver_only_receives_outbound_server_names() -> Result<()>
         Ok::<_, anyhow::Error>(())
     })
     .await??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routing_metadata_identifies_inbound_and_tcp_udp_sources() -> Result<()> {
+    use fast_socks5::{Socks5Command, client::Socks5Stream, util::target_addr::TargetAddr};
+    use tokio::net::TcpSocket;
+
+    tokio::time::timeout(LIMIT, async {
+        let tcp = TcpSocket::new_v4()?;
+        tcp.bind("127.0.0.1:0".parse()?)?;
+        let tcp_port = tcp.local_addr()?.port();
+        let udp = UdpSocket::bind("127.0.0.1:0").await?;
+        let udp_port = udp.local_addr()?.port();
+        let source = format!(r#"
+            import {{ kotoconn as k }} from '@kotoconn/bindings';
+            const resolve = k.resolve_handler(() => []);
+            const direct = k.dialer({{ dialer: null, outbound: {{
+                resolve_handler: resolve, implementation: k.direct_outbound({{}})
+            }} }});
+            const routing = k.routing_handler(flow => {{
+                if (!flow.inbound.equals(inbound) || flow.inbound.equals(other)) throw Error('wrong inbound');
+                const port = flow.protocol === 'tcp' ? {tcp_port} : {udp_port};
+                if (!flow.source.address.equals(k.ip('127.0.0.1')) || flow.source.port !== port) {{
+                    throw Error('wrong source endpoint');
+                }}
+                return flow.protocol === 'udp' ? k.route_udp(direct) : k.route(direct, flow.dest);
+            }});
+            const listen = {{ address: k.ip('127.0.0.1'), port: 0 }};
+            const inbound = k.inbound({{
+                implementation: k.socks5_inbound({{ listen }}), routing_handler: routing,
+                udp_idle_timeout: k.timeout(10000)
+            }});
+            const other = k.inbound({{
+                implementation: k.http_inbound({{ listen }}), routing_handler: routing,
+                udp_idle_timeout: k.timeout(10000)
+            }});
+        "#);
+        let daemon = Daemon::start_with_sources(
+            "main.ts".into(), HashMap::from([("main.ts".into(), source)]), Duration::from_secs(1),
+        ).await?;
+        let endpoint = socket_addr(&address(&daemon, "socks5"))?;
+        let scope = Scope::new();
+        let (tcp_echo, udp_echo) = echoes(&scope).await?;
+
+        let stream = tcp.connect(endpoint).await?;
+        let mut stream = Socks5Stream::use_stream(stream, None, Default::default()).await?;
+        stream.request(Socks5Command::TCPConnect, TargetAddr::Ip(socket_addr(&tcp_echo)?)).await?;
+        let mut greeting = [0; 5];
+        stream.read_exact(&mut greeting).await?;
+        assert_eq!(&greeting, b"hello");
+        drop(stream);
+
+        let control = TcpStream::connect(endpoint).await?;
+        let mut control = Socks5Stream::use_stream(control, None, Default::default()).await?;
+        let relay = control.request(Socks5Command::UDPAssociate, TargetAddr::Ip("0.0.0.0:0".parse()?)).await?;
+        let TargetAddr::Ip(relay) = relay else {
+            anyhow::bail!("expected IP relay");
+        };
+        udp.connect(relay).await?;
+        let mut wire = fast_socks5::new_udp_header(socket_addr(&udp_echo)?)?;
+        wire.extend(b"metadata");
+        udp.send(&wire).await?;
+        let mut buffer = vec![0; 65536];
+        let n = udp.recv(&mut buffer).await?;
+        let (_, _, payload) = fast_socks5::parse_udp_request(&buffer[..n]).await?;
+        assert_eq!(payload, b"metadata");
+
+        drop(control);
+        scope.close();
+        scope.wait().await;
+        daemon.shutdown().await?;
+        Ok::<_, anyhow::Error>(())
+    }).await??;
     Ok(())
 }
 

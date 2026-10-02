@@ -31,7 +31,7 @@ tasks:
   test:
     inputs: ["@group(sources)"]
     command: pnpm --filter @kotoconn/bindings exec tsc -p tests/tsconfig.json
-    deps: [install, rust:generate-test-bindings]
+    deps: [install, rust:generate-bindings, rust:generate-test-bindings]
   check:
     inputs: ["@group(sources)"]
     deps: [check-format, lint, typecheck, test]

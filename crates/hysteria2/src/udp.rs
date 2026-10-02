@@ -177,6 +177,7 @@ pub async fn client(
 fn associate(
     context: &ServerContext,
     id: u32,
+    source: std::net::SocketAddr,
     responses: queue::Sender<Reply>,
 ) -> Result<Association> {
     let scope = context.scope.child();
@@ -185,7 +186,7 @@ fn associate(
     let handler = context.handler.clone();
     let association = scope.clone();
     scope.spawn(async move {
-        let work = handler.udp(user);
+        let work = handler.udp(source, user);
         tokio::pin!(work);
 
         loop {
@@ -257,7 +258,7 @@ pub async fn server(
                     associations.remove(id);
                 }
                 if !associations.entries.contains_key(&id) {
-                    associations.insert(id, associate(&context, id, responses.clone())?);
+                    associations.insert(id, associate(&context, id, connection.remote_address(), responses.clone())?);
                 }
 
                 // SAFETY: The single owner inserted or found this ID immediately above.

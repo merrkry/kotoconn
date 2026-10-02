@@ -29,10 +29,10 @@ impl p::Server for Server {
 
                     let tcp = async move {
                         let handler = tcp_context.handler.clone();
-                        accept_loop(listener, tcp_context, move |stream, _, _, scope| {
+                        accept_loop(listener, tcp_context, move |stream, peer, _, scope| {
                             let handler = handler.clone();
                             let target = tcp_target.clone();
-                            async move { handler.tcp(target, stream, scope).await }
+                            async move { handler.tcp(peer, target, stream, scope).await }
                         })
                         .await
                     };
@@ -113,7 +113,7 @@ async fn udp(socket: UdpSocket, target: Target, context: ServerContext) -> Resul
                     scope.spawn(async move {
                         let _completion = completion;
                         lifetime.run(async {
-                            let work = handler.udp(association);
+                            let work = handler.udp(peer, association);
                             tokio::pin!(work);
 
                             loop {

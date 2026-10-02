@@ -72,6 +72,7 @@ impl Network {
                 "unknown routing handler"
             );
             let handler = Arc::new(SessionHandler {
+                inbound: *id,
                 policy: policy.clone(),
                 clients: clients.clone(),
                 routing: config.routing_handler,
@@ -241,6 +242,7 @@ fn build_clients(policy: &Policy, scope: Scope) -> Result<HashMap<DialerId, Arc<
 
 #[derive(Clone)]
 struct SessionHandler {
+    inbound: InboundId,
     policy: Policy,
     clients: Arc<HashMap<DialerId, Arc<Clients>>>,
     routing: RoutingHandlerId,
@@ -252,6 +254,7 @@ struct SessionHandler {
 impl p::Handler for SessionHandler {
     fn tcp(
         &self,
+        source: SocketAddr,
         destination: Target,
         mut stream: BoxStream,
         scope: Scope,
@@ -287,6 +290,8 @@ impl p::Handler for SessionHandler {
                             .route(
                                 self.routing,
                                 Flow {
+                                    inbound: self.inbound,
+                                    source,
                                     protocol: TransportProtocol::Tcp,
                                     dest: destination,
                                     sniff,
@@ -324,7 +329,7 @@ impl p::Handler for SessionHandler {
         )
     }
 
-    fn udp(&self, packets: Datagram) -> BoxFuture<'_, Result<()>> {
-        udp::association(self.clone(), packets)
+    fn udp(&self, source: SocketAddr, packets: Datagram) -> BoxFuture<'_, Result<()>> {
+        udp::association(self.clone(), source, packets)
     }
 }

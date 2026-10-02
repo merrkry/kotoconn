@@ -67,7 +67,13 @@ impl Resolver for Network {
 struct Echo(mpsc::UnboundedSender<Target>);
 
 impl Handler for Echo {
-    fn tcp(&self, target: Target, mut stream: BoxStream, _: Scope) -> BoxFuture<'_, Result<()>> {
+    fn tcp(
+        &self,
+        _: std::net::SocketAddr,
+        target: Target,
+        mut stream: BoxStream,
+        _: Scope,
+    ) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             let finish = target.port() == 2;
             self.0.send(target)?;
@@ -82,7 +88,7 @@ impl Handler for Echo {
             Ok(())
         })
     }
-    fn udp(&self, mut packets: Datagram) -> BoxFuture<'_, Result<()>> {
+    fn udp(&self, _: std::net::SocketAddr, mut packets: Datagram) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             while let Some(packet) = packets.rx.recv().await {
                 self.0.send(packet.target.clone())?;

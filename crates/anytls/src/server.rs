@@ -42,7 +42,7 @@ impl p::Server for Server {
                 run: Box::pin(accept_loop(
                     listener,
                     context,
-                    move |stream, _, _, scope| {
+                    move |stream, peer, _, scope| {
                         let acceptor = acceptor.clone();
                         let padding = padding.clone();
                         let context = connection_context.clone();
@@ -90,10 +90,10 @@ impl p::Server for Server {
                                                 udp::start(stream, destination, work_scope)?;
                                             tokio::select! {
                                                 _ = stopping.cancelled() => Ok(()),
-                                                result = handler.udp(association) => result,
+                                                result = handler.udp(peer, association) => result,
                                             }
                                         } else {
-                                            handler.tcp(destination, stream, work_scope).await
+                                            handler.tcp(peer, destination, stream, work_scope).await
                                         }
                                     })
                                 })),

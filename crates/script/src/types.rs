@@ -5,7 +5,15 @@ pub(crate) fn declarations() -> String {
     // These fail compilation when a handwritten native view no longer matches its methods.
     let _: fn(&IpAddr) -> u8 = IpAddr::version;
     let _: fn(&IpAddr, IpAddr) -> bool = IpAddr::equals;
+    let _: fn(&IpAddr) -> bool = IpAddr::is_private;
+    let _: fn(&IpAddr) -> bool = IpAddr::is_loopback;
+    let _: fn(&IpAddr) -> bool = IpAddr::is_link_local;
+    let _: fn(&IpAddr) -> bool = IpAddr::is_multicast;
+    let _: fn(&IpAddr) -> bool = IpAddr::is_unspecified;
     let _: fn(&IpAddr) -> String = IpAddr::display;
+    let _: fn(&Cidr, IpAddr) -> bool = Cidr::contains;
+    let _: fn(&Cidr) -> String = Cidr::display;
+    let _: fn(&Inbound, Inbound) -> bool = Inbound::equals;
     let _: fn(&Target) -> u16 = Target::port;
     let _: fn(&Target) -> Option<String> = Target::domain;
     let _: fn(&Target) -> Option<IpAddr> = Target::ip;
@@ -13,6 +21,7 @@ pub(crate) fn declarations() -> String {
     let cfg = ts_rs::Config::default();
     let declarations = [
         IpAddr::decl(&cfg),
+        Cidr::decl(&cfg),
         Target::decl(&cfg),
         Timeout::decl(&cfg),
         Port::decl(&cfg),

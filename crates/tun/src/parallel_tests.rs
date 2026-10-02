@@ -49,11 +49,17 @@ impl PacketSend for Sender {
 struct Echo;
 
 impl p::Handler for Echo {
-    fn tcp(&self, _: p::Target, _: p::BoxStream, _: Scope) -> BoxFuture<'_, Result<()>> {
+    fn tcp(
+        &self,
+        _: std::net::SocketAddr,
+        _: p::Target,
+        _: p::BoxStream,
+        _: Scope,
+    ) -> BoxFuture<'_, Result<()>> {
         Box::pin(async { bail!("TCP is not used in this test") })
     }
 
-    fn udp(&self, mut packets: p::Datagram) -> BoxFuture<'_, Result<()>> {
+    fn udp(&self, _: std::net::SocketAddr, mut packets: p::Datagram) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             while let Some(packet) = packets.rx.recv().await {
                 packets.tx.send(packet).await?;
@@ -72,15 +78,21 @@ pub(super) fn context() -> ServerContext {
     }
 }
 
-struct TcpAcceptor(mpsc::UnboundedSender<p::BoxStream>);
+struct TcpAcceptor(mpsc::UnboundedSender<(std::net::SocketAddr, p::BoxStream)>);
 
 impl p::Handler for TcpAcceptor {
-    fn tcp(&self, _: p::Target, stream: p::BoxStream, _: Scope) -> BoxFuture<'_, Result<()>> {
-        self.0.send(stream).unwrap();
+    fn tcp(
+        &self,
+        source: std::net::SocketAddr,
+        _: p::Target,
+        stream: p::BoxStream,
+        _: Scope,
+    ) -> BoxFuture<'_, Result<()>> {
+        self.0.send((source, stream)).unwrap();
         Box::pin(async { Ok(()) })
     }
 
-    fn udp(&self, _: p::Datagram) -> BoxFuture<'_, Result<()>> {
+    fn udp(&self, _: std::net::SocketAddr, _: p::Datagram) -> BoxFuture<'_, Result<()>> {
         Box::pin(async { bail!("UDP is not used in this test") })
     }
 }
@@ -138,7 +150,9 @@ async fn tcp_reuses_time_wait_without_losing_old_eof_or_accepting_old_syn() {
             .send(segment(flow, 101, Some((isn + 1).0), TcpControl::None, &[]).bytes)
             .await
             .unwrap();
-        let mut old = streams.recv().await.unwrap();
+        let (source, mut old) = streams.recv().await.unwrap();
+        assert_eq!(source, flow.source);
+
         old.shutdown().await.unwrap();
         let (fin, _) = control(&mut received, TcpControl::Fin).await;
 
@@ -177,7 +191,9 @@ async fn tcp_reuses_time_wait_without_losing_old_eof_or_accepting_old_syn() {
             )
             .await
             .unwrap();
-        let mut new = streams.recv().await.unwrap();
+        let (source, mut new) = streams.recv().await.unwrap();
+        assert_eq!(source, flow.source);
+
         let mut data = [0; 4];
         new.read_exact(&mut data).await.unwrap();
         assert_eq!(&data, b"next");
@@ -351,11 +367,17 @@ async fn aborting_a_dedicated_endpoint_releases_its_queue_after_open() {
 struct SelectiveReader(Arc<Notify>);
 
 impl p::Handler for SelectiveReader {
-    fn tcp(&self, _: p::Target, _: p::BoxStream, _: Scope) -> BoxFuture<'_, Result<()>> {
+    fn tcp(
+        &self,
+        _: std::net::SocketAddr,
+        _: p::Target,
+        _: p::BoxStream,
+        _: Scope,
+    ) -> BoxFuture<'_, Result<()>> {
         Box::pin(async { bail!("TCP is not used in this test") })
     }
 
-    fn udp(&self, mut packets: p::Datagram) -> BoxFuture<'_, Result<()>> {
+    fn udp(&self, _: std::net::SocketAddr, mut packets: p::Datagram) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             while let Some(packet) = packets.rx.recv().await {
                 if p::socket_addr(&packet.target)?.port() == 443 {
@@ -471,16 +493,26 @@ async fn forced_shutdown_interrupts_a_writer_after_receive_workers_have_drained(
     context.scope.wait().await;
 }
 
-struct ObservedSessions(mpsc::UnboundedSender<Scope>);
+struct ObservedSessions(mpsc::UnboundedSender<(std::net::SocketAddr, Scope)>);
 
 impl p::Handler for ObservedSessions {
-    fn tcp(&self, _: p::Target, _: p::BoxStream, _: Scope) -> BoxFuture<'_, Result<()>> {
+    fn tcp(
+        &self,
+        _: std::net::SocketAddr,
+        _: p::Target,
+        _: p::BoxStream,
+        _: Scope,
+    ) -> BoxFuture<'_, Result<()>> {
         Box::pin(async { bail!("TCP is not used in this test") })
     }
 
-    fn udp(&self, mut packets: p::Datagram) -> BoxFuture<'_, Result<()>> {
+    fn udp(
+        &self,
+        source: std::net::SocketAddr,
+        mut packets: p::Datagram,
+    ) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
-            self.0.send(packets.scope.clone()).unwrap();
+            self.0.send((source, packets.scope.clone())).unwrap();
             while let Some(packet) = packets.rx.recv().await {
                 packets.tx.send(packet).await?;
             }
@@ -523,10 +555,14 @@ async fn sparse_udp_activity_preserves_only_its_session_and_expired_flows_can_be
             .unwrap()
             .remove(0);
         input.send(a.to_vec()).await.unwrap();
-        let active = sessions.recv().await.unwrap();
+        let (actual_source, active) = sessions.recv().await.unwrap();
+        assert_eq!(actual_source, source);
+
         received.recv().await.unwrap();
         input.send(b.to_vec()).await.unwrap();
-        let idle = sessions.recv().await.unwrap();
+        let (actual_source, idle) = sessions.recv().await.unwrap();
+        assert_eq!(actual_source, source);
+
         received.recv().await.unwrap();
 
         tokio::time::advance(Duration::from_secs(9)).await;
@@ -542,7 +578,9 @@ async fn sparse_udp_activity_preserves_only_its_session_and_expired_flows_can_be
         );
 
         input.send(b.to_vec()).await.unwrap();
-        let replacement = sessions.recv().await.unwrap();
+        let (actual_source, replacement) = sessions.recv().await.unwrap();
+        assert_eq!(actual_source, source);
+
         let (_, reply) = received.recv().await.unwrap();
         assert_eq!(
             packet::Decoder::default()

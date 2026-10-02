@@ -405,6 +405,7 @@ impl Worker {
                         let stream = accepted.await?;
                         handler
                             .tcp(
+                                flow.source,
                                 p::target(flow.destination),
                                 Box::pin(stream),
                                 admission_scope,
@@ -501,7 +502,7 @@ impl Worker {
                             .run(async {
                                 tokio::select! {
                                     _ = stopping.cancelled() => Ok(()),
-                                    result = handler.udp(association) => result,
+                                    result = handler.udp(flow.source, association) => result,
                                     result = replies => result,
                                 }
                             })

@@ -73,12 +73,44 @@ fn next_id(len: usize) -> Result<NonZeroU64> {
         .ok_or_else(|| invalid("too many resources"))
 }
 
+fn matches_domain_suffix(name: &str, suffix: &str, include_self: bool) -> Result<bool> {
+    if name.is_empty() || suffix.is_empty() {
+        return Err(invalid("domain and suffix must not be empty"));
+    }
+
+    let name = name
+        .parse::<hickory_proto::rr::Name>()
+        .map_err(|e| invalid(format!("invalid domain: {e}")))?;
+    let suffix = suffix
+        .parse::<hickory_proto::rr::Name>()
+        .map_err(|e| invalid(format!("invalid domain suffix: {e}")))?;
+
+    let matches_suffix = suffix.zone_of(&name);
+    let has_extra_label = name.iter().count() > suffix.iter().count();
+
+    Ok(matches_suffix && (include_self || has_extra_label))
+}
+
 api! {
     Host as Kotoconn {
         fn ip(self, text: String) -> IpAddr {
             text.parse::<config::IpAddr>()
                 .map(Into::into)
                 .map_err(|e| invalid(format!("invalid IP address: {e}")))
+        }
+
+        fn cidr(self, text: String) -> Cidr {
+            text.parse::<ipnet::IpNet>()
+                .map(Into::into)
+                .map_err(|e| invalid(format!("invalid CIDR: {e}")))
+        }
+
+        fn domain_suffix(self, name: String, suffix: String) -> bool {
+            matches_domain_suffix(&name, &suffix, true)
+        }
+
+        fn is_subdomain(self, name: String, parent: String) -> bool {
+            matches_domain_suffix(&name, &parent, false)
         }
 
         fn timeout(self, milliseconds: Milliseconds) -> Timeout {
