@@ -4,6 +4,7 @@ members = [
     "crates/cli",
     "crates/config",
     "crates/daemon",
+    "crates/dns",
     "crates/http",
     "crates/hysteria2",
     "crates/inbounds",
@@ -27,6 +28,7 @@ publish = false
 
 [workspace.dependencies]
 anyhow = "1.0.104"
+async-trait = "0.1.92"
 anytls = { version = "0.3.17", default-features = false, features = ["core"] }
 base64 = "0.22.1"
 bytes = "1.12.1"
@@ -42,12 +44,15 @@ h3-quinn = "0.0.10"
 h2 = "0.4.19"
 
 hickory-proto = { version = "0.26.3", default-features = false }
+hickory-net = { version = "0.26.3", default-features = false, features = ["tokio"] }
+hickory-server = { version = "0.26.3", default-features = false }
 http = "1.5.0"
 httparse = "1.10.1"
 ipnet = "2.12.2"
 kotoconn-config = { path = "crates/config" }
 kotoconn-anytls = { path = "crates/anytls" }
 kotoconn-daemon = { path = "crates/daemon" }
+kotoconn-dns = { path = "crates/dns" }
 kotoconn-http = { path = "crates/http" }
 kotoconn-hysteria2 = { path = "crates/hysteria2" }
 kotoconn-inbounds = { path = "crates/inbounds" }
@@ -59,6 +64,7 @@ kotoconn-shadowsocks2022 = { path = "crates/shadowsocks2022" }
 kotoconn-socks5 = { path = "crates/socks5" }
 kotoconn-tun = { path = "crates/tun" }
 kotoconn-typescript = { path = "crates/typescript" }
+moka = { version = "0.12.16", default-features = false, features = ["sync"] }
 oxc = { version = "0.149.0", default-features = false }
 parking_lot = "0.12.5"
 rand = "0.9.5"

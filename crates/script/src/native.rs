@@ -57,7 +57,14 @@ impl Request {
 
         let view = rquickjs::Object::new(ctx.clone())?;
         let name = query.name.to_lowercase().to_utf8();
-        view.prop("name", name.trim_end_matches('.'))?;
+        view.prop(
+            "name",
+            if name == "." {
+                name.as_str()
+            } else {
+                name.trim_end_matches('.')
+            },
+        )?;
         match query.query_type {
             hickory_proto::rr::RecordType::Unknown(code) => view.prop("type", code)?,
             record_type => view.prop("type", record_type.to_string())?,

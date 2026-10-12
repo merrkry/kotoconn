@@ -4,6 +4,7 @@ fileGroups:
     - /Cargo.toml
     - /Cargo.lock
     - /crates/**/*
+    - /packages/api/src/**/*
     - /e2e/anytls/**/*.rs
     - /external/smoltcp/**/*
     - /tools/rust.py

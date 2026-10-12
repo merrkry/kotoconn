@@ -16,7 +16,8 @@ mod source;
 pub use kotoconn_inbounds::InboundAddress;
 pub use network::{SessionHandle, SessionId};
 
-// Bound both queued and executing calls. Awaiting admission provides backpressure.
+// Bound queued calls. Native I/O may call resolve policy again, so pending calls
+// must not consume a global execution budget and block their own dependencies.
 const CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -50,7 +51,13 @@ type Reply<T> = oneshot::Sender<Result<T, Error>>;
 enum Command {
     Route(RoutingHandlerId, Flow, Reply<RouteDecision>),
     Resolve(ResolveHandlerId, String, Reply<Vec<IpAddr>>),
-    Dns(DnsHandlerId, Box<DnsRequest>, Reply<DnsHandlerResult>),
+    Dns(
+        DnsHandlerId,
+        Box<DnsRequest>,
+        Option<DnsRequestInfo>,
+        Reply<DnsHandlerResult>,
+    ),
+    InstallDns(Arc<dyn kotoconn_script::DnsServices>, Reply<()>),
 }
 
 /// Cloneable shared reference. Only owned Rust values cross the JS thread boundary.
@@ -86,9 +93,27 @@ impl Policy {
         id: DnsHandlerId,
         request: DnsRequest,
     ) -> Result<DnsHandlerResult, Error> {
+        self.dns_with_info(id, request, None).await
+    }
+
+    async fn dns_with_info(
+        &self,
+        id: DnsHandlerId,
+        request: DnsRequest,
+        info: Option<DnsRequestInfo>,
+    ) -> Result<DnsHandlerResult, Error> {
         let (reply, result) = oneshot::channel();
-        self.send(Command::Dns(id, Box::new(request), reply))
+        self.send(Command::Dns(id, Box::new(request), info, reply))
             .await?;
+        result.await.map_err(|_| Error::Closed)?
+    }
+
+    async fn install_dns_services(
+        &self,
+        services: Arc<dyn kotoconn_script::DnsServices>,
+    ) -> Result<(), Error> {
+        let (reply, result) = oneshot::channel();
+        self.send(Command::InstallDns(services, reply)).await?;
         result.await.map_err(|_| Error::Closed)?
     }
 
@@ -327,7 +352,7 @@ async fn serve(
                 commands.close();
             }
             _ = calls.next(), if !calls.is_empty() => {}
-            command = commands.recv(), if !exhausted && calls.len() < CAPACITY => {
+            command = commands.recv(), if !exhausted => {
                 match command {
                     Some((span, command)) => {
                         calls.push(dispatch(script, command).instrument(span));
@@ -350,8 +375,21 @@ async fn dispatch(script: &Script, command: Command) {
         Command::Resolve(id, name, reply) => {
             let _ = reply.send(script.resolve(id, &name).await.map_err(Into::into));
         }
-        Command::Dns(id, request, reply) => {
-            let _ = reply.send(script.dns(id, *request).await.map_err(Into::into));
+        Command::Dns(id, request, info, reply) => {
+            let _ = reply.send(
+                script
+                    .dns_with_info(id, *request, info)
+                    .await
+                    .map_err(Into::into),
+            );
+        }
+        Command::InstallDns(services, reply) => {
+            let _ = reply.send(
+                script
+                    .install_dns_services(services)
+                    .await
+                    .map_err(Into::into),
+            );
         }
     }
 }

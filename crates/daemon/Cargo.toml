@@ -8,6 +8,7 @@ publish.workspace = true
 anyhow.workspace = true
 futures-util.workspace = true
 kotoconn-config.workspace = true
+kotoconn-dns.workspace = true
 kotoconn-inbounds.workspace = true
 kotoconn-outbounds.workspace = true
 kotoconn-protocol.workspace = true
@@ -20,6 +21,7 @@ tracing.workspace = true
 [dev-dependencies]
 bytes.workspace = true
 fast-socks5.workspace = true
+hickory-proto.workspace = true
 rcgen.workspace = true
 serde_json.workspace = true
 shadowsocks.workspace = true
