@@ -411,3 +411,68 @@ async fn tun_configuration_preserves_native_addresses_and_checks_numeric_ranges(
         );
     }
 }
+
+#[tokio::test]
+async fn dns_helpers_register_shared_services_and_validate_cache_options() {
+    let script = load(r#"
+        import { kotoconn as k } from '@kotoconn/bindings';
+        import { dns_service } from '@kotoconn/api';
+        const dialer = k.dialer({dialer: null, outbound: {
+            resolve_handler: k.resolve_handler(() => []), implementation: k.direct_outbound({})
+        }});
+        const options = {dialer, upstream: {protocol: 'tcp', server: {address: k.ip('192.0.2.53'), port: 53}}};
+        const service = dns_service(options);
+        dns_service({...options, cache: false, timeout: k.timeout(1234)});
+        for (const capacity of [0, -1, 1.5, 4294967296, NaN, Infinity]) {
+            let rejected = false;
+            try { dns_service({...options, cache: {capacity}}); } catch (error) {
+                rejected = String(error).includes('cache capacity');
+            }
+            if (!rejected) throw Error('accepted invalid capacity');
+        }
+        const dns = k.dns_handler(service.handler);
+        const listener = k.dns_listener({listen: {address: k.ip('127.0.0.1'), port: 1053}, protocols: ['udp', 'tcp'], dns_handler: dns});
+        k.inbound({implementation: k.http_inbound({listen: {address: k.ip('127.0.0.1'), port: 0}}), routing_handler: k.routing_handler(() => k.reject()), udp_idle_timeout: k.timeout(1000)});
+        k.resolve_handler(name => {
+            if (name === 'service') dns_service(options);
+            else k.dns_listener({listen: {address: k.ip('127.0.0.1'), port: 0}, protocols: ['udp'], dns_handler: dns});
+            return [];
+        });
+    "#).await;
+
+    let config = script.config().await.unwrap();
+    assert_eq!(config.dns_services.len(), 2);
+    let cached = config
+        .dns_services
+        .values()
+        .find(|config| config.cache_capacity > 0)
+        .unwrap();
+    assert_eq!(cached.cache_capacity, 4096);
+    assert_eq!(cached.timeout, std::time::Duration::from_secs(5));
+    let uncached = config
+        .dns_services
+        .values()
+        .find(|config| config.cache_capacity == 0)
+        .unwrap();
+    assert_eq!(uncached.timeout, std::time::Duration::from_millis(1234));
+    assert_eq!(config.dns_listeners.len(), 1);
+    assert_ne!(
+        config.inbounds.keys().next(),
+        config.dns_listeners.keys().next()
+    );
+    let resolver = *config
+        .resolve_handlers
+        .iter()
+        .max_by_key(|id| id.0)
+        .unwrap();
+    for name in ["service", "listener"] {
+        assert!(
+            script
+                .resolve(resolver, name)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("registration has finished")
+        );
+    }
+}

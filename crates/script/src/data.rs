@@ -118,6 +118,43 @@ pub(crate) struct InboundConfig {
 }
 
 #[derive(FromJs, TS, StructuralConvert)]
+#[convert(from(config::DnsUpstreamConfig), into(config::DnsUpstreamConfig))]
+#[ts(as = "config::DnsUpstreamConfig")]
+pub(crate) struct DnsUpstreamConfig {
+    pub protocol: TransportProtocol,
+    pub server: SocketAddr,
+}
+
+#[derive(FromJs, TS)]
+#[ts(as = "config::DnsServiceConfig")]
+pub(crate) struct DnsServiceConfig {
+    pub upstream: DnsUpstreamConfig,
+    pub dialer: Dialer,
+    pub cache_capacity: Capacity,
+    pub timeout: Timeout,
+}
+
+impl From<DnsServiceConfig> for config::DnsServiceConfig {
+    fn from(value: DnsServiceConfig) -> Self {
+        Self {
+            upstream: value.upstream.into(),
+            dialer: value.dialer.value,
+            cache_capacity: value.cache_capacity.0,
+            timeout: value.timeout.value,
+        }
+    }
+}
+
+#[derive(FromJs, TS, StructuralConvert)]
+#[convert(from(config::DnsListenerConfig), into(config::DnsListenerConfig))]
+#[ts(as = "config::DnsListenerConfig")]
+pub(crate) struct DnsListenerConfig {
+    pub listen: SocketAddr,
+    pub protocols: Vec<TransportProtocol>,
+    pub dns_handler: Dns,
+}
+
+#[derive(FromJs, TS, StructuralConvert)]
 #[convert(from(config::DirectInboundConfig), into(config::DirectInboundConfig))]
 #[ts(as = "config::DirectInboundConfig")]
 pub(crate) struct DirectInboundConfig {

@@ -10,6 +10,8 @@ use std::{
 
 pub(crate) const MODULE_NAME: &str = "@kotoconn/bindings";
 
+const API_MODULE_NAME: &str = "@kotoconn/api";
+
 pub(crate) struct Native;
 
 impl ModuleDef for Native {
@@ -40,7 +42,7 @@ impl rquickjs::loader::Resolver for Resolver {
         name: &str,
         _attributes: Option<rquickjs::loader::ImportAttributes<'js>>,
     ) -> Result<String> {
-        if name == MODULE_NAME {
+        if name == MODULE_NAME || name == API_MODULE_NAME {
             return Ok(name.into());
         }
 
@@ -97,10 +99,13 @@ impl<S: ModuleSource> rquickjs::loader::Loader for Loader<S> {
         name: &str,
         _attributes: Option<rquickjs::loader::ImportAttributes<'js>>,
     ) -> Result<Module<'js>> {
-        let source = self
-            .0
-            .read(name)
-            .map_err(|error| rquickjs::Error::new_loading_message(name, error.to_string()))?;
+        let source = if name == API_MODULE_NAME {
+            include_str!("../../../packages/api/src/index.ts").to_owned()
+        } else {
+            self.0
+                .read(name)
+                .map_err(|error| rquickjs::Error::new_loading_message(name, error.to_string()))?
+        };
 
         let source = kotoconn_typescript::transpile(name, &source)
             .map_err(|error| rquickjs::Error::new_loading_message(name, error.to_string()))?;

@@ -16,7 +16,10 @@ pub use tls::{TlsClientConfig, TlsServerConfig};
 
 pub use config::Config;
 pub use dialer::{DialerConfig, DialerId};
-pub use dns::{DnsHandlerId, DnsHandlerResult, DnsRequest, DnsResponse};
+pub use dns::{
+    DnsHandlerId, DnsHandlerResult, DnsListenerConfig, DnsRequest, DnsRequestInfo, DnsResponse,
+    DnsServiceConfig, DnsServiceId, DnsUpstreamConfig,
+};
 pub use flow::{Flow, TransportProtocol};
 pub use inbound::{
     DirectInboundConfig, InboundConfig, InboundId, InboundImpl, TunAddress, TunInboundConfig,

@@ -13,7 +13,16 @@ pub use loader::ModuleSource;
 
 use kotoconn_config::*;
 use rquickjs::{AsyncContext, AsyncRuntime, CatchResultExt, Function, Module};
-use std::{collections::HashMap, num::NonZeroU64};
+use std::{collections::HashMap, future::Future, num::NonZeroU64, pin::Pin, sync::Arc};
+
+/// Native DNS services are installed after configuration and dialer construction.
+pub trait DnsServices: Send + Sync {
+    fn query(
+        &self,
+        id: DnsServiceId,
+        request: DnsRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<DnsResponse, String>> + Send + 'static>>;
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -121,11 +130,31 @@ impl Script {
         id: DnsHandlerId,
         request: DnsRequest,
     ) -> Result<DnsHandlerResult, Error> {
+        self.dns_with_info(id, request, None).await
+    }
+
+    pub async fn install_dns_services(&self, services: Arc<dyn DnsServices>) -> Result<(), Error> {
+        self.with(async |ctx| {
+            *loader::host(&ctx)?.borrow().services.borrow_mut() = Some(services);
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn dns_with_info(
+        &self,
+        id: DnsHandlerId,
+        request: DnsRequest,
+        info: Option<DnsRequestInfo>,
+    ) -> Result<DnsHandlerResult, Error> {
         self.with(async |ctx| {
             let function = get(&loader::host(&ctx)?.borrow().dns.borrow(), id.0)?;
 
             Ok(host::DnsHandler::new(function)
-                .call(native::Request::from(request))
+                .call(native::Request {
+                    value: request,
+                    info,
+                })
                 .await?
                 .value)
         })
