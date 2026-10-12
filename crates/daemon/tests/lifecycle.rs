@@ -5,6 +5,47 @@ use std::{collections::HashMap, time::Duration};
 
 const TIMEOUT: Duration = Duration::from_secs(3);
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_policy_calls_do_not_block_the_policy_that_releases_them() {
+    let daemon = start(
+        r#"
+        import {kotoconn as k} from '@kotoconn/bindings';
+        let entered = 0;
+        let ready, release;
+        const allEntered = new Promise(resolve => ready = resolve);
+        const gate = new Promise(resolve => release = resolve);
+        k.resolve_handler(async name => {
+            if (name === 'release') {
+                await allEntered;
+                release();
+                return [];
+            }
+            if (++entered === 80) ready();
+            await gate;
+            return [k.ip('192.0.2.1')];
+        });
+    "#,
+        TIMEOUT,
+    )
+    .await;
+    let policy = daemon.policy().clone();
+    let id = handler(&policy);
+    tokio::time::timeout(TIMEOUT, async {
+        let mut calls = tokio::task::JoinSet::new();
+        for _ in 0..80 {
+            let policy = policy.clone();
+            calls.spawn(async move { policy.resolve(id, "wait".into()).await });
+        }
+        policy.resolve(id, "release".into()).await.unwrap();
+        while let Some(result) = calls.join_next().await {
+            assert_eq!(result.unwrap().unwrap()[0].to_string(), "192.0.2.1");
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(daemon.shutdown().await.unwrap(), Shutdown::Drained);
+}
+
 async fn start(source: &str, grace: Duration) -> Daemon {
     tokio::time::timeout(
         TIMEOUT,
