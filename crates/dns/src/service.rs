@@ -90,19 +90,17 @@ impl Service {
             return Ok(response);
         }
 
-        let mut response = tokio::time::timeout(self.config.timeout, async {
-            let response = self
-                .exchange(request.clone(), self.config.upstream.protocol)
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.config.timeout)
+            .context("DNS timeout is out of range")?;
+        let mut response = self
+            .exchange(request.clone(), self.config.upstream.protocol, deadline)
+            .await?;
+        if response.metadata.truncation && self.config.upstream.protocol == TransportProtocol::Udp {
+            response = self
+                .exchange(request.clone(), TransportProtocol::Tcp, deadline)
                 .await?;
-            if response.metadata.truncation
-                && self.config.upstream.protocol == TransportProtocol::Udp
-            {
-                return self.exchange(request.clone(), TransportProtocol::Tcp).await;
-            }
-            Ok::<_, anyhow::Error>(response)
-        })
-        .await
-        .context("DNS upstream deadline exceeded")??;
+        }
         ensure!(
             response.metadata.message_type == MessageType::Response
                 && response.queries == request.queries,
@@ -123,6 +121,7 @@ impl Service {
         &self,
         request: DnsRequest,
         protocol: TransportProtocol,
+        deadline: tokio::time::Instant,
     ) -> Result<DnsResponse> {
         let slot = match protocol {
             TransportProtocol::Tcp => 0,
@@ -130,7 +129,7 @@ impl Service {
         };
         let mut reconnected = false;
         loop {
-            let (connection, reused) = {
+            let (connection, reused) = tokio::time::timeout_at(deadline, async {
                 let mut cached = self.connections[slot].lock().await;
                 if cached
                     .as_ref()
@@ -172,18 +171,26 @@ impl Service {
                     });
                 }
                 // SAFETY: the branch above installs a connection before this access.
-                (
+                Ok::<_, NetError>((
                     cached.as_ref().expect("DNS connection initialized").clone(),
                     reused,
-                )
-            };
+                ))
+            })
+            .await
+            .context("DNS upstream deadline exceeded")??;
 
-            let result = match connection.handle.send(request.clone()).next().await {
-                Some(result) => result,
-                None => Err(NetError::from(std::io::Error::new(
+            let result = match tokio::time::timeout_at(
+                deadline,
+                connection.handle.send(request.clone()).next(),
+            )
+            .await
+            {
+                Ok(Some(result)) => result,
+                Ok(None) => Err(NetError::from(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "DNS upstream closed without a response",
                 ))),
+                Err(_) => Err(NetError::Timeout),
             };
             if let Err(error) = &result {
                 let mut cached = self.connections[slot].lock().await;

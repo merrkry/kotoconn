@@ -62,7 +62,7 @@ impl Request {
             if name == "." {
                 name.as_str()
             } else {
-                name.trim_end_matches('.')
+                name.strip_suffix('.').unwrap_or(name.as_str())
             },
         )?;
         match query.query_type {

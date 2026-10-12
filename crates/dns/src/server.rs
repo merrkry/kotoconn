@@ -1,4 +1,4 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use futures_util::future::BoxFuture;
 use hickory_server::{
     Server,
@@ -44,17 +44,13 @@ pub async fn bind(
         "duplicate DNS listener protocol"
     );
 
-    let mut address = config.listen;
+    let (address, tcp, udp) = bind_sockets(config).await?;
     let mut server = Server::new(Adapter { id, handler });
-    if config.protocols.contains(&TransportProtocol::Tcp) {
-        let listener = TcpListener::bind(address).await?;
-        address = listener.local_addr()?;
+    if let Some(listener) = tcp {
         // This bounds buffered replies for one TCP client, not executing policy calls.
         server.register_listener(listener, Duration::from_secs(30), 32);
     }
-    if config.protocols.contains(&TransportProtocol::Udp) {
-        let socket = UdpSocket::bind(address).await?;
-        address = socket.local_addr()?;
+    if let Some(socket) = udp {
         server.register_socket(socket);
     }
 
@@ -72,6 +68,50 @@ pub async fn bind(
         Ok(())
     });
     Ok(BoundListener { address, run })
+}
+
+async fn bind_sockets(
+    config: &DnsListenerConfig,
+) -> Result<(SocketAddr, Option<TcpListener>, Option<UdpSocket>)> {
+    for attempt in 0..8 {
+        let mut address = config.listen;
+        let tcp = if config.protocols.contains(&TransportProtocol::Tcp) {
+            let listener = TcpListener::bind(address)
+                .await
+                .with_context(|| format!("DNS TCP listener {address}"))?;
+            address = listener.local_addr()?;
+            Some(listener)
+        } else {
+            None
+        };
+        let udp = if config.protocols.contains(&TransportProtocol::Udp) {
+            match UdpSocket::bind(address).await {
+                Ok(socket) => {
+                    address = socket.local_addr()?;
+                    Some(socket)
+                }
+                // TCP port-zero allocation cannot see UDP reservations. A new
+                // allocation may resolve that collision; explicit ports fail.
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::AddrInUse
+                        && config.listen.port() == 0
+                        && tcp.is_some()
+                        && attempt < 7 =>
+                {
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("DNS UDP listener {address}"));
+                }
+            }
+        } else {
+            None
+        };
+        return Ok((address, tcp, udp));
+    }
+    // SAFETY: every iteration returns except retryable collisions, and the last
+    // iteration does not allow a retry.
+    unreachable!("final bind attempt returns its result")
 }
 
 struct Adapter {

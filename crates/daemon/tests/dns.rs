@@ -420,7 +420,7 @@ async fn policy_errors_drop_and_udp_size_limits_have_distinct_results() -> Resul
         "192.0.2.53:53".parse()?,
         "tcp",
         "",
-        100,
+        1000,
     ))
     .await?;
     let address = listen(&daemon);
