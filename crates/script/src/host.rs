@@ -6,6 +6,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     num::NonZeroU64,
+    sync::Arc,
     time::Duration,
 };
 use ts_rs::TS;
@@ -24,6 +25,7 @@ pub(crate) struct Host<'js> {
     pub resolving: RefCell<Vec<Function<'js>>>,
     pub dns: RefCell<Vec<Function<'js>>>,
     sealed: Cell<bool>,
+    pub services: RefCell<Option<Arc<dyn crate::DnsServices>>>,
 }
 
 // Registration never calls JS while these cells are borrowed.
@@ -41,6 +43,8 @@ impl<'js> Host<'js> {
             config: RefCell::new(config::Config {
                 inbounds: HashMap::new(),
                 dialers: HashMap::new(),
+                dns_services: HashMap::new(),
+                dns_listeners: HashMap::new(),
                 routing_handlers: Default::default(),
                 resolve_handlers: Default::default(),
                 dns_handlers: Default::default(),
@@ -49,6 +53,7 @@ impl<'js> Host<'js> {
             resolving: RefCell::new(Vec::new()),
             dns: RefCell::new(Vec::new()),
             sealed: Cell::new(false),
+            services: RefCell::new(None),
         }
     }
 
@@ -256,9 +261,27 @@ api! {
         fn inbound(self, options: InboundConfig) -> Inbound {
             self.mutable()?;
 
-            let id = config::InboundId(next_id(self.config.borrow().inbounds.len())?);
+            let config = self.config.borrow();
+            let id = config::InboundId(next_id(config.inbounds.len() + config.dns_listeners.len())?);
+            drop(config);
             self.config.borrow_mut().inbounds.insert(id, options.into());
 
+            Ok(id.into())
+        }
+
+        fn dns_service(self, options: DnsServiceConfig) -> DnsServiceRef {
+            self.mutable()?;
+            let mut config = self.config.borrow_mut();
+            let id = config::DnsServiceId(next_id(config.dns_services.len())?);
+            config.dns_services.insert(id, options.into());
+            Ok(id.into())
+        }
+
+        fn dns_listener(self, options: DnsListenerConfig) -> Inbound {
+            self.mutable()?;
+            let mut config = self.config.borrow_mut();
+            let id = config::InboundId(next_id(config.inbounds.len() + config.dns_listeners.len())?);
+            config.dns_listeners.insert(id, options.into());
             Ok(id.into())
         }
 
@@ -278,6 +301,15 @@ api! {
     }
 
     async {
+        fn dns_query(self, service: DnsServiceRef, request: Request) -> Response {
+            let services = self.services.borrow().clone()
+                .ok_or_else(|| invalid("DNS services are unavailable during configuration evaluation"))?;
+            let response = crate::task::run(services.query(service.value, request.value))
+                .await?
+                .map_err(invalid)?;
+            Ok(response.into())
+        }
+
         fn lookup(self, name: String) -> Vec<IpAddr> {
             let addresses = crate::task::run(async move {
                 let addresses = tokio::net::lookup_host((name.as_str(), 0)).await?;

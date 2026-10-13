@@ -1,4 +1,5 @@
 //! Native protocol execution. Each session progresses independently of supervision.
+mod dns;
 mod sessions;
 mod udp;
 
@@ -50,6 +51,7 @@ impl Network {
         // still register with their inbound caller through Carrier::tcp_scoped.
         let outbound_scope = Scope::new();
         let clients = Arc::new(build_clients(&policy, outbound_scope.clone())?);
+        dns::install(&policy, &clients, &outbound_scope).await?;
 
         let (sessions, registry) = sessions::Sessions::new();
         let mut bound = Vec::new();
@@ -97,6 +99,18 @@ impl Network {
             }
             inbound_addresses.insert(*id, server.address.clone());
             tracing::info!(inbound_id = id.0.get(), address = ?server.address, "inbound bound");
+            bound.push((*id, server));
+        }
+
+        for (id, config) in &policy.config().dns_listeners {
+            let server = dns::bind(*id, config, &policy, stopping.clone()).await?;
+            // SAFETY: dns::bind constructs only socket listeners.
+            let kotoconn_inbounds::InboundAddress::Socket(address) = server.address else {
+                unreachable!("DNS listeners bind sockets");
+            };
+            addresses.insert(*id, address);
+            inbound_addresses.insert(*id, server.address.clone());
+            tracing::info!(inbound_id = id.0.get(), %address, "DNS listener bound");
             bound.push((*id, server));
         }
 
