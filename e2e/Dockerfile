@@ -1,4 +1,4 @@
-FROM docker.io/library/debian:bookworm-slim@sha256:a4672c0cb26fbdde88e38fa2dfb6c681942306680e41e4378b28770b6e79ee91 AS runtime
+FROM docker.io/library/debian:bookworm-slim@sha256:ec31d744f83f4a73447ba045aaab9409997efe5cc706eca4890c1be36cc1606a AS runtime
 
 # Rust compilation is a moon dependency. This image only packages its outputs.
 FROM runtime AS app
