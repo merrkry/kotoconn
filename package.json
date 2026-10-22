@@ -13,7 +13,7 @@
     "generate-bindings": "moon run rust:generate-bindings"
   },
   "devDependencies": {
-    "oxfmt": "^0.66.0",
+    "oxfmt": "^0.73.0",
     "oxlint": "^1.81.0",
     "typescript": "^7.0.2"
   }
