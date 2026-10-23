@@ -9,7 +9,7 @@ runs:
   steps:
     - uses: jdx/mise-action@v4
       with:
-        version: 2026.9.9
+        version: 2026.10.18
     - name: Locate dependency stores
       id: stores
       shell: bash
