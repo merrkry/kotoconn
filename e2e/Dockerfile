@@ -14,7 +14,7 @@ COPY target/anytls-interop/anytls-tests /usr/local/bin/anytls-tests
 COPY target/anytls-interop/anytls-go-peer /usr/local/bin/anytls-go-peer
 ENTRYPOINT ["anytls-tests"]
 
-FROM ghcr.io/astral-sh/uv:0.12.5 AS uv
+FROM ghcr.io/astral-sh/uv:0.13.6 AS uv
 
 FROM runtime AS test-runtime
 COPY --from=uv /uv /usr/local/bin/uv
