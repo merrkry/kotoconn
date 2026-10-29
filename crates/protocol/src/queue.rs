@@ -210,24 +210,28 @@ impl<T> Sender<T> {
         if self.is_closed() {
             return Err(Error::Closed);
         }
+
         let cost = bytes
             .checked_add(std::mem::size_of::<(T, usize)>().max(1))
             .ok_or(Error::Full)?;
+
         self.0.refresh();
         let target = self.0.target.load(Ordering::Acquire);
         self.0
             .bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 if used != 0 && cost > target.saturating_sub(used) {
                     return None;
                 }
                 used.checked_add(cost)
             })
             .map_err(|_| Error::Full)?;
+
         let permit = Permit { sender: self, cost };
         if self.is_closed() {
             return Err(Error::Closed);
         }
+
         Ok(permit)
     }
 
