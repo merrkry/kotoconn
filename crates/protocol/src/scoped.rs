@@ -49,10 +49,11 @@ impl<T: Send> Shared<T> {
     fn take(&self) -> Option<Box<Value<T>>> {
         let pointer = self
             .value
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pointer| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |pointer| {
                 (!pointer.is_null() && pointer != Self::closed_pointer()).then_some(ptr::null_mut())
             })
             .ok()?;
+
         // SAFETY: The successful CAS takes the slot's sole live Box. The closed
         // sentinel is excluded and remains installed permanently once observed.
         Some(unsafe { Box::from_raw(pointer) })
