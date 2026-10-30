@@ -319,6 +319,7 @@ impl Worker {
             .wait_for(|result| result.is_some())
             .await
             .map_err(|_| Error::Worker("thread exited without a result".into()))?;
+        // SAFETY: wait_for returns the value its predicate accepted, so it is Some.
         result.as_ref().expect("completion was checked").clone()
     }
 }
