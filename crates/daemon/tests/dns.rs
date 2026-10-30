@@ -546,10 +546,10 @@ fn resolving_source(gateway: SocketAddr) -> String {
         import {{kotoconn as k}} from '@kotoconn/bindings';
         import {{dns_service}} from '@kotoconn/api';
         const unused = k.resolve_handler(() => {{ throw Error('IP servers need no resolution'); }});
-        const proxy = k.dialer({{dialer: null, outbound: {{resolve_handler: unused, implementation: k.socks5_outbound({{server: k.ip_target(k.ip('{}'), {})}})}}}});
+        const proxy = k.dialer({{carrier: k.host_network({{}}), outbound: {{resolve_handler: unused, implementation: k.socks5_outbound({{server: k.ip_target(k.ip('{}'), {})}})}}}});
         const service = dns_service({{dialer: proxy, upstream: {{protocol: 'tcp', server: {upstream}}}}});
         const resolve = k.resolve_handler(service.resolve);
-        const named = k.dialer({{dialer: null, outbound: {{resolve_handler: resolve, implementation: k.socks5_outbound({{server: k.domain('gateway.test', {})}})}}}});
+        const named = k.dialer({{carrier: k.host_network({{}}), outbound: {{resolve_handler: resolve, implementation: k.socks5_outbound({{server: k.domain('gateway.test', {})}})}}}});
         const by_name = dns_service({{dialer: named, upstream: {{protocol: 'tcp', server: {upstream}}}, cache: false}});
         k.dns_listener({{listen: {{address: k.ip('127.0.0.1'), port: 0}}, protocols: ['udp'], dns_handler: k.dns_handler(by_name.handler)}});
     "#,

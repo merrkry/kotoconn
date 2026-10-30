@@ -52,7 +52,7 @@ resolve handler:
 
 ```ts
 const remote = k.dialer({
-  dialer: null,
+  carrier: k.host_network({}),
   outbound: {
     resolve_handler: k.resolve_handler(service.resolve),
     implementation: k.http_outbound({ server: k.domain("proxy.example.com", 8080) }),

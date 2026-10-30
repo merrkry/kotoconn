@@ -20,7 +20,7 @@ const upstream = dns_service({
 // The service resolves this server name through `proxy`, so its connections never
 // depend on themselves.
 export const remote = k.dialer({
-  dialer: null,
+  carrier: k.host_network({}),
   outbound: {
     resolve_handler: k.resolve_handler(upstream.resolve),
     implementation: k.http_outbound({ server: k.domain("proxy.example.com", 8080) }),
