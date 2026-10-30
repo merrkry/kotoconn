@@ -232,7 +232,13 @@ async fn udp_over_tcp_supports_empty_and_large_datagrams() -> Result<()> {
     tokio::time::timeout(LIMIT, async {
         let mut fixture = Fixture::new(None).await?;
         let client = fixture.client()?;
-        assert_eq!(p::Client::capabilities(&client), Capabilities::BOTH);
+        assert_eq!(
+            p::Client::capabilities(&client),
+            Capabilities {
+                domain_targets: true,
+                ..Capabilities::BOTH
+            }
+        );
         for destination in [
             target("127.0.0.1:53".parse()?),
             target("[::1]:53".parse()?),

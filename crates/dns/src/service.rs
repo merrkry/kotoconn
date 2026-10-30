@@ -10,7 +10,7 @@ use hickory_net::{
     xfer::{DnsExchange, DnsHandle},
 };
 use kotoconn_config::{DnsServiceConfig, TransportProtocol};
-use kotoconn_protocol::{Capabilities, Carrier, Scope};
+use kotoconn_protocol::{Carrier, Scope, target};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -39,13 +39,7 @@ impl Service {
         );
         carrier
             .capabilities()
-            .require(match config.upstream.protocol {
-                TransportProtocol::Tcp => Capabilities::TCP,
-                TransportProtocol::Udp => Capabilities {
-                    tcp: false,
-                    udp: true,
-                },
-            })?;
+            .require_for(config.upstream.protocol, &target(config.upstream.server))?;
 
         let cache = (config.cache_capacity > 0).then(|| ResponseCache::new(config.cache_capacity));
         Ok(Self {

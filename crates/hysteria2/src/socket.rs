@@ -1,6 +1,6 @@
 use blake2::{Blake2b, Digest, digest::consts::U32};
 use bytes::Bytes;
-use kotoconn_protocol::{Datagram, Packet, queue, target};
+use kotoconn_protocol::{Datagram, Packet, Target, from_server, queue};
 use quinn::{
     AsyncUdpSocket, UdpPoller,
     udp::{RecvMeta, Transmit},
@@ -19,15 +19,32 @@ use std::{
 /// Quinn remains responsible for congestion feedback and reliable retransmission.
 pub struct CarrierSocket {
     transport: Mutex<Datagram>,
+    server: Target,
     peer: SocketAddr,
 }
 
 impl CarrierSocket {
-    pub fn new(transport: Datagram, peer: SocketAddr) -> Self {
+    pub fn new(transport: Datagram, server: Target) -> Self {
+        let peer = match &server {
+            Target::Ip { address, port } => SocketAddr::new(*address, *port),
+            // Quinn identifies its peer by socket address only. A domain server
+            // stays a domain for the carrier; Quinn sees a reserved stand-in
+            // (RFC 5737) that never leaves this socket.
+            Target::Domain { port, .. } => {
+                SocketAddr::new(std::net::Ipv4Addr::new(192, 0, 2, 1).into(), *port)
+            }
+        };
+
         Self {
             transport: Mutex::new(transport),
+            server,
             peer,
         }
+    }
+
+    /// The address Quinn uses for the server.
+    pub fn peer(&self) -> SocketAddr {
+        self.peer
     }
 }
 
@@ -68,7 +85,7 @@ impl AsyncUdpSocket for CarrierSocket {
             return Err(io::ErrorKind::BrokenPipe.into());
         }
         match transport.tx.try_send(Packet {
-            target: target(self.peer),
+            target: self.server.clone(),
             payload: Bytes::copy_from_slice(transmit.contents),
         }) {
             Ok(()) | Err(queue::Error::Full) => Ok(()),
@@ -93,7 +110,7 @@ impl AsyncUdpSocket for CarrierSocket {
             let Some(packet) = ready!(transport.rx.poll_recv(cx)) else {
                 return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
             };
-            if packet.target != target(self.peer) || packet.payload.len() > bufs[0].len() {
+            if !from_server(&self.server, &packet.target) || packet.payload.len() > bufs[0].len() {
                 continue;
             }
             let length = packet.payload.len();
@@ -243,7 +260,7 @@ mod tests {
         let socket = Salamander {
             inner: Arc::new(CarrierSocket::new(
                 transport,
-                "127.0.0.1:443".parse().unwrap(),
+                kotoconn_protocol::target("127.0.0.1:443".parse().unwrap()),
             )),
             password: b"password".to_vec(),
             send_buffer: Mutex::new(Vec::new()),
@@ -267,7 +284,10 @@ mod tests {
         let (transport, mut peer) = kotoconn_protocol::packet_pair(scope);
         let address = "127.0.0.1:443".parse().unwrap();
         let socket = Salamander {
-            inner: Arc::new(CarrierSocket::new(transport, address)),
+            inner: Arc::new(CarrierSocket::new(
+                transport,
+                kotoconn_protocol::target(address),
+            )),
             password: b"password".to_vec(),
             send_buffer: Mutex::new(Vec::new()),
             receive_buffer: Mutex::new(Vec::new()),

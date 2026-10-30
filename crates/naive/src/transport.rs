@@ -2,7 +2,7 @@
 //! immediately; policy resolution and carrier I/O run on the Tokio executor.
 use anyhow::{Result, ensure};
 use cronet::{NetworkHooks, UdpDialResult};
-use kotoconn_protocol::{Carrier, Endpoint, Packet, Scope};
+use kotoconn_protocol::{Carrier, Endpoint, Packet, Scope, from_server};
 use std::{
     io,
     net::{TcpListener, TcpStream, UdpSocket},
@@ -59,7 +59,8 @@ pub(crate) fn hooks(
             let work_scope = connection.clone();
 
             connection.spawn(async move {
-                let mut remote = carrier.tcp_scoped(endpoint.resolve().await?, work_scope).await?;
+                let target = endpoint.target(carrier.capabilities()).await?;
+                let mut remote = carrier.tcp_scoped(target, work_scope).await?;
                 tokio::io::copy_bidirectional_with_sizes(&mut local, &mut remote, 65536, 65536).await?;
                 Ok(())
             })?;
@@ -90,7 +91,7 @@ pub(crate) fn hooks(
             let work_scope = connection.clone();
 
             connection.spawn(async move {
-                let target = endpoint.resolve().await?;
+                let target = endpoint.target(carrier.capabilities()).await?;
                 let mut remote = carrier.udp_scoped(target.clone(), work_scope).await?;
                 let mut buffer = vec![0; 65536];
                 loop {
@@ -101,7 +102,7 @@ pub(crate) fn hooks(
                         }
                         packet = remote.rx.recv() => {
                             let Some(packet) = packet else { return Ok(()); };
-                            if packet.target == target {
+                            if from_server(&target, &packet.target) {
                                 let n = local.send(&packet.payload).await?;
                                 if n != packet.payload.len() {
                                     return Err(io::Error::from(io::ErrorKind::WriteZero).into());

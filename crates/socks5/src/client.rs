@@ -17,15 +17,17 @@ impl p::Client for Client {
         Capabilities {
             tcp: lower.tcp,
             udp: lower.tcp && lower.udp,
+            domain_targets: true,
         }
     }
 
     fn tcp(&self, destination: Target, scope: Scope) -> BoxFuture<'_, Result<BoxStream>> {
         Box::pin(async move {
-            self.carrier.capabilities().require(Capabilities::TCP)?;
+            let carrier = self.carrier.capabilities();
+            carrier.require(Capabilities::TCP)?;
             let stream = self
                 .carrier
-                .tcp_scoped(self.endpoint.resolve().await?, scope.clone())
+                .tcp_scoped(self.endpoint.target(carrier).await?, scope.clone())
                 .await?;
             let mut protocol = Socks5Stream::use_stream(stream, None, Default::default()).await?;
             protocol
@@ -37,8 +39,9 @@ impl p::Client for Client {
 
     fn udp(&self, _: Target, scope: Scope) -> BoxFuture<'_, Result<Datagram>> {
         Box::pin(async move {
-            self.carrier.capabilities().require(Capabilities::BOTH)?;
-            let endpoint = self.endpoint.resolve().await?;
+            let carrier = self.carrier.capabilities();
+            carrier.require(Capabilities::BOTH)?;
+            let endpoint = self.endpoint.target(carrier).await?;
             let stream = self
                 .carrier
                 .tcp_scoped(endpoint.clone(), scope.clone())
@@ -50,10 +53,14 @@ impl p::Client for Client {
                     address(p::target("0.0.0.0:0".parse()?)),
                 )
                 .await?;
+            // An unspecified relay address means the server's own address.
             let relay = match from_address(relay) {
                 Target::Ip { address, port } if address.is_unspecified() => match endpoint {
                     Target::Ip { address, .. } => Target::Ip { address, port },
-                    _ => unreachable!("endpoint resolved"),
+                    Target::Domain { ref name, .. } => Target::Domain {
+                        name: name.clone(),
+                        port,
+                    },
                 },
                 other => other,
             };

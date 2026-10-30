@@ -25,14 +25,18 @@ impl Client {
 
 impl p::Client for Client {
     fn capabilities(&self) -> Capabilities {
-        self.carrier.capabilities()
+        Capabilities {
+            domain_targets: true,
+            ..self.carrier.capabilities()
+        }
     }
 
     fn tcp(&self, target: Target, scope: Scope) -> BoxFuture<'_, Result<BoxStream>> {
         Box::pin(async move {
+            let carrier = self.carrier.capabilities();
             let stream = self
                 .carrier
-                .tcp_scoped(self.endpoint.resolve().await?, scope.clone())
+                .tcp_scoped(self.endpoint.target(carrier).await?, scope.clone())
                 .await?;
             super::tcp::connect(stream, target, &self.crypto).await
         })
@@ -40,7 +44,7 @@ impl p::Client for Client {
 
     fn udp(&self, _: Target, scope: Scope) -> BoxFuture<'_, Result<Datagram>> {
         Box::pin(async move {
-            let endpoint = self.endpoint.resolve().await?;
+            let endpoint = self.endpoint.target(self.carrier.capabilities()).await?;
             let mut transport = self
                 .carrier
                 .udp_scoped(endpoint.clone(), scope.clone())

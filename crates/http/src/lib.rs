@@ -18,17 +18,19 @@ impl p::Client for Client {
         Capabilities {
             tcp: self.carrier.capabilities().tcp,
             udp: false,
+            domain_targets: true,
         }
     }
 
     fn tcp(&self, target: Target, scope: Scope) -> BoxFuture<'_, Result<BoxStream>> {
         Box::pin(async move {
-            self.carrier.capabilities().require(Capabilities::TCP)?;
+            let carrier = self.carrier.capabilities();
+            carrier.require(Capabilities::TCP)?;
             let authority = authority(&target)?;
 
             let mut stream = BufReader::new(
                 self.carrier
-                    .tcp_scoped(self.endpoint.resolve().await?, scope.clone())
+                    .tcp_scoped(self.endpoint.target(carrier).await?, scope.clone())
                     .await?,
             );
             stream

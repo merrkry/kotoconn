@@ -21,10 +21,6 @@ fn hysteria_certificate() -> &'static rcgen::CertifiedKey<rcgen::KeyPair> {
     &CERTIFICATE
 }
 
-fn direct() -> OutboundImpl {
-    OutboundImpl::Direct(DirectOutboundConfig {})
-}
-
 fn outbound(kind: &str, server: Target) -> OutboundImpl {
     match kind {
         "hysteria2" => OutboundImpl::Hysteria2(Hysteria2OutboundConfig {
@@ -221,16 +217,6 @@ async fn protocols_and_nested_carriers_preserve_tcp_and_udp() -> Result<()> {
         )?;
         tcp_roundtrip(&hysteria, tcp.clone()).await?;
         udp_roundtrip(&hysteria, udp.clone()).await?;
-
-        // A domain user target cannot accidentally fall through to OS DNS.
-        let direct = Clients::new(direct(), system, Arc::new(SystemResolver))?;
-        let mut rejected = direct
-            .tcp(Target::Domain {
-                name: "localhost".into(),
-                port: 80,
-            })
-            .await?;
-        assert_eq!(rejected.read(&mut [0]).await?, 0);
         scope.close();
         scope.wait().await;
         daemon.shutdown().await?;
