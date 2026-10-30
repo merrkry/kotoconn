@@ -1,6 +1,6 @@
 # Compose dialers from carriers and self-contained protocol adapters
 
-A dialer pairs an outbound with an optional carrier dialer. Without a carrier, it reaches the host network directly.
+A dialer pairs an outbound with its carrier: another dialer, or the host network. Host network options, such as a socket mark, belong to that carrier, so they reach every socket the dialer opens.
 
 Each protocol is one adapter that wraps an established library in both directions. Cryptography, authentication and replay protection come from that library. Protocol-native state, multiplexing and session reuse stay inside the adapter. The core never converts protocols, adds multiplexing, or synthesizes features a protocol lacks, such as UDP over a TCP-only protocol.
 

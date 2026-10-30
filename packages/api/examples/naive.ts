@@ -2,7 +2,7 @@ import { kotoconn as k } from "@kotoconn/bindings";
 
 const resolver = k.resolve_handler((name) => k.lookup(name));
 const naive = k.dialer({
-  dialer: null,
+  carrier: k.host_network({}),
   outbound: {
     resolve_handler: resolver,
     implementation: k.naive_outbound({

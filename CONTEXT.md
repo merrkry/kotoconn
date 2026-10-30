@@ -18,13 +18,13 @@ A client-side protocol configuration used to carry traffic, including direct for
 _Avoid_: Dialer, when referring only to protocol-specific settings.
 
 **Dialer**:
-A connection configuration combining an outbound with its carrier and address-resolution policy. A chain ends at the I/O layer.
+A connection configuration combining an outbound with its carrier and address-resolution policy. A chain of carriers ends at the host network.
 
 **Client**:
 A stateful runtime entry that provides TCP or UDP outbound connections. The entries for one dialer can share a protocol instance and can be closed independently.
 
 **Carrier**:
-The relationship through which a dialer uses another dialer to carry its connections. At runtime, one carrier entry supplies the lower-layer transport capabilities required by a protocol adapter.
+What carries a dialer's connections: another dialer, or the host network with its socket options. A carrier offers TCP, UDP or both, and either accepts domain targets or requires IP targets.
 
 **Session**:
 A logical connection established through an inbound and routed independently. A multiplexed inbound connection can carry multiple sessions. UDP sessions are separated by association and original destination, and keep one routing decision until they end.

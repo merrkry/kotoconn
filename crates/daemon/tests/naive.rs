@@ -20,7 +20,7 @@ async fn daemon(implementation: String, outbound: String) -> Result<Daemon> {
         r#"
         import {{ kotoconn as k }} from '@kotoconn/bindings';
         const resolver = k.resolve_handler(name => k.lookup(name));
-        const dialer = k.dialer({{ dialer: null, outbound: {{ resolve_handler: resolver, implementation: {outbound} }} }});
+        const dialer = k.dialer({{ carrier: k.host_network({{}}), outbound: {{ resolve_handler: resolver, implementation: {outbound} }} }});
         const routing = k.routing_handler(flow => k.route(dialer, flow.dest));
         const listen = {{ address: k.ip('127.0.0.1'), port: 0 }};
         k.inbound({{ implementation: {implementation}, routing_handler: routing, udp_idle_timeout: k.timeout(1000) }});
@@ -67,7 +67,7 @@ async fn shutdown_drains_active_h2_streams_then_closes_idle_pools() -> Result<()
 
         let entry = Clients::new(
             OutboundImpl::Socks5(Socks5OutboundConfig { server: target(*client.listen_addresses().values().next().unwrap()) }),
-            Arc::new(System::new(scope.clone())), Arc::new(SystemResolver),
+            Arc::new(System::new(scope.clone(), Default::default()).unwrap()), Arc::new(SystemResolver),
         )?;
         let mut stream = entry.tcp(destination).await?;
         let mut greeting = [0; 5];

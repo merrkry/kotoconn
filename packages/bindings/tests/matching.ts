@@ -16,7 +16,7 @@ export function matches(flow: Flow, inbound: Inbound, domain: string): boolean {
   network.contains("192.168.0.1");
 
   const dialer = k.dialer({
-    dialer: null,
+    carrier: k.host_network({}),
     outbound: {
       resolve_handler: k.resolve_handler(() => []),
       implementation: k.direct_outbound({}),

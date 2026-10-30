@@ -214,14 +214,13 @@ fn build_clients(policy: &Policy, scope: Scope) -> Result<HashMap<DialerId, Arc<
             "unknown resolve handler"
         );
         let mut seen = HashSet::from([*id]);
-        let mut next = config.dialer;
-        while let Some(id) = next {
-            ensure!(seen.insert(id), "carrier cycle");
-            next = definitions.get(&id).context("unknown carrier")?.dialer;
+        let mut next = &config.carrier;
+        while let CarrierConfig::Dialer(id) = next {
+            ensure!(seen.insert(*id), "carrier cycle");
+            next = &definitions.get(id).context("unknown carrier")?.carrier;
         }
     }
 
-    let system: Arc<dyn Carrier> = Arc::new(System::new(scope));
     let mut clients = HashMap::<DialerId, Arc<Clients>>::new();
 
     while clients.len() < definitions.len() {
@@ -229,12 +228,15 @@ fn build_clients(policy: &Policy, scope: Scope) -> Result<HashMap<DialerId, Arc<
             if clients.contains_key(id) {
                 continue;
             }
-            let carrier: Arc<dyn Carrier> = match config.dialer {
-                Some(id) => match clients.get(&id) {
+            // Each host network dialer has its own carrier for its socket options.
+            let carrier: Arc<dyn Carrier> = match &config.carrier {
+                CarrierConfig::Dialer(id) => match clients.get(id) {
                     Some(client) => client.clone(),
                     None => continue,
                 },
-                None => system.clone(),
+                CarrierConfig::Host(options) => {
+                    Arc::new(System::new(scope.clone(), options.clone())?)
+                }
             };
             let resolver = Arc::new(PolicyResolver {
                 policy: policy.clone(),

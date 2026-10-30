@@ -85,7 +85,7 @@ const listenPort: number = await Promise.resolve(1080);
         shared = {key: value for key, value in naive.items() if key != "private_key"}
         source += f"const naive = {json.dumps(shared)};\n"
 
-    previous = "null"
+    previous = "k.host_network({})"
     for index, hop in enumerate(chain):
         kind, server = hop[:2]
         port = hop[2] if len(hop) == 3 else 1080
@@ -106,7 +106,7 @@ const listenPort: number = await Promise.resolve(1080);
             )
             config += "}"
         source += (
-            f"const d{index} = k.dialer({{dialer: {previous}, "
+            f"const d{index} = k.dialer({{carrier: {previous}, "
             "outbound: {resolve_handler: resolver, "
             f"implementation: k.{kind}_outbound({config})}}}});\n"
         )

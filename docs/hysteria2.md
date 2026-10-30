@@ -45,8 +45,9 @@ Set the same nonempty `obfs_password` at both ends to enable Salamander. The
 password used for HTTP/3 authentication is independent of the obfuscation key.
 Register these implementations through the usual `k.dialer` and `k.inbound`
 configuration. An outbound's carrier must provide UDP even for TCP proxying.
-A TCP-only carrier is rejected at construction. Server resolution uses the
-configured resolver; user destinations retain their domain/IP metadata.
+A TCP-only carrier is rejected at construction. The configured resolver
+resolves the server only when the carrier requires IP targets; user destinations
+retain their domain/IP metadata.
 
 ## Connections and limits
 

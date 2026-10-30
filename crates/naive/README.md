@@ -7,7 +7,7 @@ by its tunnels and verifies the proxy certificate and hostname.
 
 ```ts
 const naive = k.dialer({
-  dialer: null,
+  carrier: k.host_network({}),
   outbound: {
     resolve_handler: resolver,
     implementation: k.naive_outbound({

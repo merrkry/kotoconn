@@ -2,7 +2,7 @@ import { kotoconn as k } from "@kotoconn/bindings";
 import { dns_service } from "@kotoconn/api";
 
 const proxy = k.dialer({
-  dialer: null,
+  carrier: k.host_network({}),
   outbound: {
     resolve_handler: k.resolve_handler((name) => k.lookup(name)),
     implementation: k.socks5_outbound({

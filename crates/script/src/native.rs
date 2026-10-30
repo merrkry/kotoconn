@@ -16,6 +16,7 @@ use ts_rs::TS;
     [Response] [config::DnsResponse] [ts(type = "{ readonly __brand: unique symbol }")];
     [InboundImpl] [config::InboundImpl] [ts(as = "config::InboundImpl")];
     [OutboundImpl] [config::OutboundImpl] [ts(as = "config::OutboundImpl")];
+    [HostNetwork] [config::HostNetworkConfig] [ts(type = "{ readonly __brand: unique symbol }")];
     [Decision] [config::RouteDecision] [ts(as = "config::RouteDecision")];
     [DnsResult] [config::DnsHandlerResult] [ts(as = "config::DnsHandlerResult")];
 )]
@@ -210,7 +211,7 @@ impl Target {
 }
 
 // QuickJS integer conversions truncate, so validate configuration numbers first.
-#[duplicate::duplicate_item(Wrapper Native; [Port] [u16]; [Milliseconds] [u32]; [Byte] [u8]; [Mtu] [u16]; [Capacity] [u32];)]
+#[duplicate::duplicate_item(Wrapper Native; [Port] [u16]; [Milliseconds] [u32]; [Byte] [u8]; [Mtu] [u16]; [Capacity] [u32]; [Mark] [u32];)]
 mod checked_number {
     use super::*;
 
@@ -238,6 +239,7 @@ mod checked_number {
 
 pub(crate) use checked_number_byte::Byte;
 pub(crate) use checked_number_capacity::Capacity;
+pub(crate) use checked_number_mark::Mark;
 pub(crate) use checked_number_milliseconds::Milliseconds;
 pub(crate) use checked_number_mtu::Mtu;
 pub(crate) use checked_number_port::Port;

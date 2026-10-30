@@ -62,7 +62,7 @@ async fn inbound_admission_allows_inspection_and_preserves_domain_target() -> Re
             kotoconn_config::OutboundImpl::Http(kotoconn_config::HttpOutboundConfig {
                 server: address,
             }),
-            Arc::new(System::new(scope.clone())),
+            Arc::new(System::new(scope.clone(), Default::default()).unwrap()),
             Arc::new(SystemResolver),
         )?;
         let destination = Target::Domain {
@@ -107,7 +107,7 @@ async fn sniff_metadata_reaches_policy_and_tcp_routing_preserves_payload() -> Re
         let source = format!(r#"
             import {{ kotoconn as k }} from '@kotoconn/bindings';
             const resolve = k.resolve_handler(() => []);
-            const direct = k.dialer({{ dialer: null, outbound: {{
+            const direct = k.dialer({{ carrier: k.host_network({{}}), outbound: {{
                 resolve_handler: resolve, implementation: k.direct_outbound({{}})
             }} }});
             const routing = k.routing_handler(flow => {{
@@ -132,7 +132,7 @@ async fn sniff_metadata_reaches_policy_and_tcp_routing_preserves_payload() -> Re
         let address = *daemon.listen_addresses().values().next().unwrap();
         let client = Clients::new(
             kotoconn_config::OutboundImpl::Http(kotoconn_config::HttpOutboundConfig { server: target(address) }),
-            Arc::new(System::new(scope.clone())), Arc::new(SystemResolver),
+            Arc::new(System::new(scope.clone(), Default::default()).unwrap()), Arc::new(SystemResolver),
         )?;
         let mut stream = client.tcp(Target::Domain { name: "original.invalid".into(), port: 443 }).await?;
         stream.write_all(payload).await?;

@@ -147,7 +147,7 @@ async fn domain_targets_pass_through_direct_only_when_its_carrier_accepts_them()
 
     let host = Clients::new(
         direct(),
-        Arc::new(System::new(Scope::new())),
+        Arc::new(System::new(Scope::new(), Default::default()).unwrap()),
         Arc::new(SystemResolver),
     )
     .unwrap();
@@ -179,4 +179,41 @@ async fn domain_targets_pass_through_direct_only_when_its_carrier_accepts_them()
         *carrier.requests.lock().unwrap(),
         [target("192.0.2.1:1080".parse().unwrap())]
     );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn host_network_options_apply_to_every_socket_kind() {
+    let destination = target("127.0.0.1:9".parse().unwrap());
+    let missing = System::new(
+        Scope::new(),
+        HostNetworkConfig {
+            mark: None,
+            interface: Some("kotoconn-none".into()),
+        },
+    )
+    .unwrap();
+
+    // Binding to a missing interface fails, so each path must have applied it.
+    let errors = [
+        missing.tcp(destination.clone()).await.err(),
+        missing.udp(destination.clone()).await.err(),
+        missing
+            .udp_native_scoped(destination, Scope::new())
+            .await
+            .err(),
+    ];
+    for error in errors {
+        let error = error.unwrap();
+        let error = error.downcast_ref::<std::io::Error>().unwrap();
+        assert_eq!(error.raw_os_error(), Some(libc::ENODEV), "{error}");
+    }
+
+    for interface in ["", "sixteen-bytes-xx", "nul\0"] {
+        let options = HostNetworkConfig {
+            mark: None,
+            interface: Some(interface.into()),
+        };
+        assert!(System::new(Scope::new(), options).is_err(), "{interface:?}");
+    }
 }

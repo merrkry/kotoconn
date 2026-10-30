@@ -157,7 +157,7 @@ async fn gateway(upstream: SocketAddr) -> Result<Daemon> {
         import {{kotoconn as k}} from '@kotoconn/bindings';
         let calls = 0;
         const resolve = k.resolve_handler(() => [k.ip(`192.0.2.${{calls}}`)]);
-        const direct = k.dialer({{dialer: null, outbound: {{resolve_handler: resolve, implementation: k.direct_outbound({{}})}}}});
+        const direct = k.dialer({{carrier: k.host_network({{}}), outbound: {{resolve_handler: resolve, implementation: k.direct_outbound({{}})}}}});
         k.inbound({{implementation: k.socks5_inbound({{listen: {{address: k.ip('127.0.0.1'), port: 0}}}}), udp_idle_timeout: k.timeout(10000), routing_handler: k.routing_handler(flow => {{
             calls++;
             return flow.protocol === 'udp' ? k.route_udp(direct) : k.route(direct, k.ip_target(k.ip('{}'), {}));
@@ -200,7 +200,7 @@ fn source(
             if (name === 'stats') return [k.ip(`192.0.2.${{calls}}`)];
             return k.lookup(name);
         }});
-        const proxy = k.dialer({{dialer: null, outbound: {{resolve_handler: resolve, implementation: k.socks5_outbound({{server: k.ip_target(k.ip('{}'), {})}})}}}});
+        const proxy = k.dialer({{carrier: k.host_network({{}}), outbound: {{resolve_handler: resolve, implementation: k.socks5_outbound({{server: k.ip_target(k.ip('{}'), {})}})}}}});
         const service = dns_service({{dialer: proxy, upstream: {{protocol: '{protocol}', server: {server}}}, {cache} timeout: k.timeout({timeout})}});
         const policy = k.dns_handler(async request => {{
             calls++;

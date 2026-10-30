@@ -244,6 +244,10 @@ api! {
             Ok(config::OutboundImpl::Socks5(options.into()).into())
         }
 
+        fn host_network(self, options: HostNetworkConfig) -> HostNetwork {
+            Ok(config::HostNetworkConfig::from(options).into())
+        }
+
         fn routing_handler(self, handler: RoutingHandler<'js>) -> Routing {
             self.mutable()?;
 
