@@ -63,7 +63,7 @@ using the inbound `udp_idle_timeout`, with a minimum retention of one second.
 
 Quinn's endpoint and connection drivers participate in scope cancellation and
 completion. Inbound TCP acknowledges admission before routing, consistently with
-[the admission contract](adr/0005-independent-protocol-admission-and-session-execution.md).
+[the admission contract](adr/0006-independent-inbound-admission.md).
 Listener shutdown stops new admission and drains accepted TCP sessions. UDP
 sessions remain separated by association and destination.
 

@@ -7,6 +7,9 @@ Kotoconn is a programmable proxy. User policy controls routing and name resoluti
 **Policy**:
 The user's resource registrations and handlers that control routing, name resolution, and DNS responses. Its handlers share the same user state.
 
+**Resource**:
+An inbound, dialer, DNS service, or DNS listener registered by policy. Handlers are not resources.
+
 **Inbound**:
 An entry point for client traffic, such as a proxy server, TUN interface, or direct listener.
 

@@ -1,6 +1,6 @@
 # TUN buffering
 
-TUN admits TCP connections and UDP associations without fixed count quotas. Queues constrain accumulated work using local consumption feedback. Transport independence follows [ADR 0005](adr/0005-independent-protocol-admission-and-session-execution.md); ownership and shutdown follow [ADR 0009](adr/0009-independent-tun-connection-drivers.md).
+TUN admits TCP connections and UDP associations without fixed count quotas. Queues constrain accumulated work using local consumption feedback. Transport independence follows [ADR 0006](adr/0006-independent-inbound-admission.md); ownership and shutdown follow [ADR 0010](adr/0010-user-space-tun.md).
 
 ## TCP storage
 
