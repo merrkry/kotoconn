@@ -2,12 +2,18 @@ use anyhow::Result;
 use hickory_proto::{
     op::{Edns, Message, Query, ResponseCode},
     rr::{
-        Name, RData, Record, RecordType,
-        rdata::{A, SOA, TXT, opt::EdnsOption},
+        DNSClass, Name, RData, Record, RecordType,
+        rdata::{A, AAAA, CNAME, SOA, TXT, opt::EdnsOption},
     },
 };
+use kotoconn_config::ResolveHandlerId;
 use kotoconn_daemon::{Daemon, Shutdown};
-use std::{collections::HashMap, net::SocketAddr, time::Duration};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    num::NonZeroU64,
+    time::Duration,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
@@ -55,17 +61,31 @@ fn answer(request: &Message) -> Message {
                 RData::TXT(TXT::new(vec!["x".repeat(100)])),
             ));
         }
+    } else if name == "servfail.example." {
+        response.metadata.response_code = ResponseCode::ServFail;
     } else {
-        let address = if request.metadata.checking_disabled {
-            [192, 0, 2, 2]
-        } else {
-            [192, 0, 2, 1]
+        let mut owner = question.name.clone();
+        if name == "alias.example." {
+            owner = Name::from_ascii("target.example.").unwrap();
+            response.answers.push(Record::from_rdata(
+                question.name.clone(),
+                60,
+                RData::CNAME(CNAME(owner.clone())),
+            ));
+        }
+
+        let data = match question.query_type {
+            // The gateway has no IPv6 address: NODATA.
+            RecordType::AAAA if name == "gateway.test." => None,
+            RecordType::AAAA => Some(RData::AAAA(AAAA("2001:db8::1".parse().unwrap()))),
+            _ if name == "gateway.test." => Some(RData::A(A([127, 0, 0, 1].into()))),
+            _ if request.metadata.checking_disabled => Some(RData::A(A([192, 0, 2, 2].into()))),
+            _ => Some(RData::A(A([192, 0, 2, 1].into()))),
         };
-        response.answers.push(Record::from_rdata(
-            question.name.clone(),
-            if name == "zero.example." { 0 } else { 60 },
-            RData::A(A(address.into())),
-        ));
+        if let Some(data) = data {
+            let ttl = if name == "zero.example." { 0 } else { 60 };
+            response.answers.push(Record::from_rdata(owner, ttl, data));
+        }
     }
     response
 }
@@ -513,6 +533,97 @@ async fn cached_tcp_connection_reconnects_after_the_upstream_closes_it() -> Resu
     }
     assert_eq!(gateway_calls(&gateway).await, 2);
     daemon.shutdown().await?;
+    gateway.shutdown().await?;
+    Ok(())
+}
+
+// `service` reaches the gateway by IP. `named` reaches the same gateway by a name that
+// `service` resolves, and serves the listener.
+fn resolving_source(gateway: SocketAddr) -> String {
+    let upstream = ip_endpoint("192.0.2.53:53".parse().unwrap());
+    format!(
+        r#"
+        import {{kotoconn as k}} from '@kotoconn/bindings';
+        import {{dns_service}} from '@kotoconn/api';
+        const unused = k.resolve_handler(() => {{ throw Error('IP servers need no resolution'); }});
+        const proxy = k.dialer({{dialer: null, outbound: {{resolve_handler: unused, implementation: k.socks5_outbound({{server: k.ip_target(k.ip('{}'), {})}})}}}});
+        const service = dns_service({{dialer: proxy, upstream: {{protocol: 'tcp', server: {upstream}}}}});
+        const resolve = k.resolve_handler(service.resolve);
+        const named = k.dialer({{dialer: null, outbound: {{resolve_handler: resolve, implementation: k.socks5_outbound({{server: k.domain('gateway.test', {})}})}}}});
+        const by_name = dns_service({{dialer: named, upstream: {{protocol: 'tcp', server: {upstream}}}, cache: false}});
+        k.dns_listener({{listen: {{address: k.ip('127.0.0.1'), port: 0}}, protocols: ['udp'], dns_handler: k.dns_handler(by_name.handler)}});
+    "#,
+        gateway.ip(),
+        gateway.port(),
+        gateway.port(),
+    )
+}
+
+async fn questions(upstream: &mut Upstream, count: usize) -> Vec<(String, RecordType)> {
+    let mut questions = Vec::new();
+    for _ in 0..count {
+        let request = seen(upstream).await;
+        let [question] = request.queries.as_slice() else {
+            panic!("one question")
+        };
+        assert!(request.metadata.recursion_desired);
+        assert_eq!(question.query_class, DNSClass::IN);
+        questions.push((question.name.to_utf8(), question.query_type));
+    }
+    questions.sort();
+    questions
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn service_resolve_answers_resolve_handlers_and_dialer_server_names() -> Result<()> {
+    let mut upstream = upstream(false).await?;
+    let gateway = gateway(upstream.address).await?;
+    let daemon = start(resolving_source(listen(&gateway))).await?;
+    // Registration order assigns IDs; `resolve` is the second resolve handler.
+    let resolve = |name: &str| {
+        daemon
+            .policy()
+            .resolve(ResolveHandlerId(NonZeroU64::new(2).unwrap()), name.into())
+    };
+    let both: Vec<IpAddr> = vec!["192.0.2.1".parse()?, "2001:db8::1".parse()?];
+
+    assert_eq!(resolve("Example").await?, both);
+    assert_eq!(
+        questions(&mut upstream, 2).await,
+        [
+            ("example.".into(), RecordType::A),
+            ("example.".into(), RecordType::AAAA)
+        ]
+    );
+    assert_eq!(resolve("Example").await?, both);
+    assert!(upstream.requests.try_recv().is_err(), "cached answers");
+
+    assert_eq!(resolve("alias.example").await?, both);
+    questions(&mut upstream, 2).await;
+    assert!(resolve("missing.example").await?.is_empty());
+    questions(&mut upstream, 2).await;
+    let error = resolve("servfail.example").await.unwrap_err();
+    assert!(error.to_string().contains("SERVFAIL"), "{error}");
+    questions(&mut upstream, 2).await;
+
+    let response = udp_query(listen(&daemon), &query("example.", 1)).await?;
+    assert_eq!(response.answers[0].data, RData::A(A([192, 0, 2, 1].into())));
+    let mut forwarded = questions(&mut upstream, 3).await;
+    forwarded.retain(|(name, _)| name == "gateway.test.");
+    assert_eq!(
+        forwarded,
+        [
+            ("gateway.test.".into(), RecordType::A),
+            ("gateway.test.".into(), RecordType::AAAA)
+        ]
+    );
+    assert_eq!(
+        gateway_calls(&gateway).await,
+        2,
+        "one connection per dialer"
+    );
+
+    assert_eq!(daemon.shutdown().await?, Shutdown::Drained);
     gateway.shutdown().await?;
     Ok(())
 }

@@ -17,11 +17,27 @@ const upstream = dns_service({
   cache: { capacity: 4096 },
 });
 
-const policy = k.dns_handler((request) => {
+// The service resolves this server name through `proxy`, so its connections never
+// depend on themselves.
+export const remote = k.dialer({
+  dialer: null,
+  outbound: {
+    resolve_handler: k.resolve_handler(upstream.resolve),
+    implementation: k.http_outbound({ server: k.domain("proxy.example.com", 8080) }),
+  },
+});
+
+const policy = k.dns_handler(async (request) => {
   if (k.domain_suffix(request.query.name, "blocked.example")) {
     return k.drop();
   }
-  return upstream.handler(request);
+
+  const response = await upstream.query(request);
+  // Drop answers that point at private networks, such as DNS rebinding attempts.
+  const rebinding = response.answers.some(
+    (record) => (record.type === "A" || record.type === "AAAA") && record.data.is_private(),
+  );
+  return rebinding ? k.drop() : k.respond(response);
 });
 
 k.dns_listener({

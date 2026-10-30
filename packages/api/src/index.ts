@@ -3,6 +3,7 @@ import type {
   Dialer,
   DnsHandler,
   DnsUpstreamConfig,
+  IpAddr,
   Request,
   Response,
   Timeout,
@@ -20,6 +21,11 @@ export interface DnsServiceOptions {
 export interface DnsService {
   readonly query: (request: Request) => Promise<Response>;
   readonly handler: DnsHandler;
+  /**
+   * A and AAAA addresses of a name. NXDOMAIN and NODATA give an empty list; other response
+   * codes reject. Usable directly as a resolve handler.
+   */
+  readonly resolve: (name: string) => Promise<IpAddr[]>;
 }
 
 /** Register one upstream service. Querying is available after configuration loads. */
@@ -41,5 +47,24 @@ export function dns_service(options: DnsServiceOptions): DnsService {
   const query = (request: Request) => k.dns_query(service, request);
   const handler: DnsHandler = async (request) => k.respond(await query(request));
 
-  return Object.freeze({ query, handler });
+  const resolve = async (name: string) => {
+    const responses = await Promise.all(
+      (["A", "AAAA"] as const).map((type) => query(k.dns_request(name, type))),
+    );
+
+    const addresses: IpAddr[] = [];
+    for (const response of responses) {
+      if (response.code !== "NOERROR" && response.code !== "NXDOMAIN") {
+        throw new Error(`DNS resolution of ${name} failed with ${response.code}`);
+      }
+      for (const record of response.answers) {
+        if (record.type === "A" || record.type === "AAAA") {
+          addresses.push(record.data);
+        }
+      }
+    }
+    return addresses;
+  };
+
+  return Object.freeze({ query, handler, resolve });
 }

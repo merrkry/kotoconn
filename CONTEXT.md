@@ -40,7 +40,7 @@ _Avoid_: DNS server, DNS handler.
 A user policy function that answers a received DNS request with a DNS response or drops it without responding.
 
 **DNS service**:
-A reusable query service configured with an upstream and a dialer. DNS handlers can call and compose services, each with its own forwarding and caching behavior.
+A reusable query service configured with an upstream and a dialer. DNS handlers and resolve handlers can call and compose services, each with its own forwarding and caching behavior.
 
 **Destination**:
 The client's requested endpoint. Routing and resolution do not change it.
