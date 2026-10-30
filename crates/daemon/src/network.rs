@@ -4,7 +4,7 @@ mod sessions;
 mod udp;
 
 use crate::{Error, Policy, Shutdown};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use futures_util::future::BoxFuture;
 use kotoconn_config::*;
 use kotoconn_outbounds::{Clients, System};
@@ -314,8 +314,17 @@ impl p::Handler for SessionHandler {
                                 },
                             )
                             .await?;
-                        let RouteDecision::Route { dialer, target } = decision else {
-                            bail!("TCP session rejected");
+                        let (dialer, target) = match decision {
+                            RouteDecision::Route { dialer, target } => (dialer, target),
+                            // Rejection is a policy outcome, not a session failure.
+                            RouteDecision::Reject => {
+                                tracing::debug!("TCP session rejected");
+                                return Ok(());
+                            }
+                            // SAFETY: Policy::route rejects UDP decisions for TCP flows.
+                            RouteDecision::Udp { .. } => {
+                                unreachable!("UDP decision for a TCP flow")
+                            }
                         };
                         tracing::debug!(dialer_id = dialer.0.get(), ?target, "TCP route selected");
 

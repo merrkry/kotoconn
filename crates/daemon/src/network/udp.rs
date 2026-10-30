@@ -201,8 +201,15 @@ async fn session(
 
         let decision = handler.policy.route(handler.routing, flow).await?;
 
-        let RouteDecision::Udp { dialer } = decision else {
-            bail!("UDP session rejected");
+        let dialer = match decision {
+            RouteDecision::Udp { dialer } => dialer,
+            // Rejection is a policy outcome, not a session failure.
+            RouteDecision::Reject => {
+                tracing::debug!("UDP session rejected");
+                return Ok(());
+            }
+            // SAFETY: Policy::route rejects TCP decisions for UDP flows.
+            RouteDecision::Route { .. } => unreachable!("TCP decision for a UDP flow"),
         };
 
         tracing::debug!(dialer_id = dialer.0.get(), "UDP route selected");
