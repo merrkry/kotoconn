@@ -22,7 +22,7 @@ macro_rules! api {
             pub(crate) fn declaration(cfg: &ts_rs::Config) -> String {
                 let methods = vec![$({
                     let args: Vec<String> = vec![$(
-                        format!("{}: {}", stringify!($arg), <$ty as TS>::name(cfg))
+                        <$ty as Parameter>::declaration(stringify!($arg), cfg)
                     ),*];
 
                     format!(
@@ -33,7 +33,7 @@ macro_rules! api {
                     )
                 }),* $(, $({
                     let args: Vec<String> = vec![$(
-                        format!("{}: {}", stringify!($async_arg), <$async_ty as TS>::name(cfg))
+                        <$async_ty as Parameter>::declaration(stringify!($async_arg), cfg)
                     ),*];
                     format!(
                         "{}({}): Promise<{}>;",
@@ -52,3 +52,59 @@ macro_rules! api {
 }
 
 pub(crate) use api;
+
+use rquickjs::function::{FromParam, Opt, ParamRequirement, ParamsAccessor};
+use ts_rs::TS;
+
+/// A trailing argument that JS callers may omit.
+pub(crate) struct Optional<T>(pub Option<T>);
+
+impl<'js, T: rquickjs::FromJs<'js>> FromParam<'js> for Optional<T> {
+    fn param_requirement() -> ParamRequirement {
+        Opt::<T>::param_requirement()
+    }
+
+    fn from_param<'a>(params: &mut ParamsAccessor<'a, 'js>) -> rquickjs::Result<Self> {
+        Opt::from_param(params).map(|Opt(value)| Self(value))
+    }
+}
+
+/// The result of a method that returns no value.
+pub(crate) struct Void;
+
+// Named only inline: a declared alias would export a `Void` type.
+impl TS for Void {
+    type WithoutGenerics = Self;
+    type OptionInnerType = Self;
+
+    fn name(_: &ts_rs::Config) -> String {
+        "void".into()
+    }
+
+    fn inline(cfg: &ts_rs::Config) -> String {
+        Self::name(cfg)
+    }
+}
+
+impl<'js> rquickjs::IntoJs<'js> for Void {
+    fn into_js(self, ctx: &rquickjs::Ctx<'js>) -> rquickjs::Result<rquickjs::Value<'js>> {
+        Ok(rquickjs::Value::new_undefined(ctx.clone()))
+    }
+}
+
+/// Declares one method parameter; omittable arguments become optional parameters.
+pub(crate) trait Parameter {
+    fn declaration(name: &str, cfg: &ts_rs::Config) -> String;
+}
+
+impl<T: TS> Parameter for T {
+    fn declaration(name: &str, cfg: &ts_rs::Config) -> String {
+        format!("{name}: {}", T::name(cfg))
+    }
+}
+
+impl<T: TS> Parameter for Optional<T> {
+    fn declaration(name: &str, cfg: &ts_rs::Config) -> String {
+        format!("{name}?: {}", T::name(cfg))
+    }
+}

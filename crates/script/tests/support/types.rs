@@ -18,7 +18,7 @@ pub mod handler;
 #[path = "../../src/task.rs"]
 pub mod task;
 
-use api::api;
+use api::{Parameter, api};
 use handler::Handler;
 
 pub mod model {

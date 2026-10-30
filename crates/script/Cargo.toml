@@ -14,11 +14,12 @@ kotoconn-typescript.workspace = true
 rquickjs = { workspace = true, features = ["macro", "loader", "futures"] }
 structural-convert.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "time"] }
 tokio-util = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 ts-rs.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 trybuild.workspace = true

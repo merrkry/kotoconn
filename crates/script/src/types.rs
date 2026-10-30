@@ -71,6 +71,8 @@ pub(crate) fn declarations() -> String {
         OutboundConfig::decl(&cfg),
         DialerConfig::decl(&cfg),
         crate::handler::Handler::<(), ()>::decl(&cfg),
+        crate::process::ExecOptions::decl(&cfg),
+        crate::process::ExecResult::decl(&cfg),
     ];
 
     format!(

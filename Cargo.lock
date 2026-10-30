@@ -1911,6 +1911,7 @@ dependencies = [
  "kotoconn-typescript",
  "rquickjs",
  "structural-convert",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",

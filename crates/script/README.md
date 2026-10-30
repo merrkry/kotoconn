@@ -18,6 +18,14 @@ names, compare labels without regard to case and ignore an optional trailing roo
 dot. A leading dot, an empty name or a malformed name raises an error. Exact,
 keyword and regex matching use JavaScript's existing string and regex methods.
 
+## Timers, subprocesses and shutdown hooks
+
+`kotoconn.sleep(timeout)` resolves after the timeout. Once shutdown starts, pending and later sleeps reject, so scheduled work such as a refresh loop cannot hold shutdown open. Catch the rejection to end the loop quietly.
+
+`kotoconn.exec(argv, { timeout?, input? })` runs `argv[0]` with the remaining arguments, without a shell. The program inherits the daemon's environment, working directory and privileges; policy is trusted, so this is a general capability. `input` is written to stdin, which is otherwise empty. The promise resolves to `{ status, signal, stdout, stderr }` with output decoded as lossy UTF-8. `status` is the exit code, or `undefined` when a signal ended the program; a nonzero status is a result, not a rejection. An empty `argv`, a spawn failure or the timeout rejects. On timeout, or when the waiting call is cancelled, the child is killed; its own children are not.
+
+`kotoconn.on_shutdown(handler)` registers a shutdown hook at any time, unlike resource registration. `Script::shutdown()` rejects sleeps, then runs the hooks one at a time, newest first, awaiting each result. A thrown error or rejection is logged and the next hook still runs. Hooks may call native operations such as `exec`, and a hook registered while hooks run also runs. Registration fails once all hooks have run.
+
 ## Type declarations and tests
 
 `ts-rs` derives configuration declarations. QuickJS adapters use `structural-convert` in both directions to detect mismatched fields. The `api!` macro emits methods and declarations from the same signatures, and `Handler` ties callback execution to its declared input and output. Native IP and target views have compile-time signature checks and runtime tests for their JS properties.
