@@ -2,6 +2,7 @@
 
 mod api;
 mod data;
+mod dns;
 mod handler;
 mod host;
 mod loader;
@@ -152,7 +153,7 @@ impl Script {
             let function = get(&loader::host(&ctx)?.borrow().dns.borrow(), id.0)?;
 
             Ok(host::DnsHandler::new(function)
-                .call(native::Request {
+                .call(dns::Request {
                     value: request,
                     info,
                 })

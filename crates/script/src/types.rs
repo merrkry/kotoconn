@@ -1,4 +1,4 @@
-use crate::{data::*, host, native::*};
+use crate::{data::*, dns::*, host, native::*};
 use ts_rs::TS;
 
 pub(crate) fn declarations() -> String {
@@ -37,6 +37,9 @@ pub(crate) fn declarations() -> String {
         DnsServiceConfig::decl(&cfg),
         DnsUpstreamConfig::decl(&cfg),
         DnsListenerConfig::decl(&cfg),
+        RecordType::decl(&cfg),
+        ResponseCode::decl(&cfg),
+        DnsRecord::decl(&cfg),
         Request::decl(&cfg),
         Response::decl(&cfg),
         Decision::decl(&cfg),

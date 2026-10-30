@@ -1,7 +1,7 @@
 use crate::api::{Optional, Parameter, Void, api};
 use crate::handler::{Handler, Hook};
 use crate::process::{ExecOptions, ExecResult};
-use crate::{data::*, native::*};
+use crate::{data::*, dns::*, native::*};
 use kotoconn_config as config;
 use rquickjs::{Function, Result};
 use std::{
@@ -319,6 +319,10 @@ api! {
             config::DnsResponse::from_buffer(bytes.into_iter().map(|b| b.0).collect())
                 .map(Into::into)
                 .map_err(|e| invalid(e.to_string()))
+        }
+
+        fn dns_request(self, name: String, record_type: RecordType) -> Request {
+            crate::dns::request(&name, record_type).map(Into::into)
         }
 
         fn request_bytes(self, request: Request) -> Vec<u8> {

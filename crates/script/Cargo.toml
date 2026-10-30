@@ -7,7 +7,7 @@ publish.workspace = true
 [dependencies]
 derive_more = { workspace = true, features = ["from", "into"] }
 duplicate.workspace = true
-hickory-proto.workspace = true
+hickory-proto = { workspace = true, features = ["std"] }
 ipnet.workspace = true
 kotoconn-config.workspace = true
 kotoconn-typescript.workspace = true
