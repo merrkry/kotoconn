@@ -112,10 +112,6 @@ async fn shutdown_drains_accepted_calls_and_closes_existing_handles() {
         result = &mut shutdown => panic!("shutdown skipped an active call: {result:?}"),
         _ = std::future::ready(()) => {}
     }
-    assert!(matches!(
-        policy.resolve(id, "work".into()).await,
-        Err(Error::Closed)
-    ));
 
     release.send(()).unwrap();
     assert_eq!(
@@ -131,6 +127,52 @@ async fn shutdown_drains_accepted_calls_and_closes_existing_handles() {
         Err(Error::Closed)
     ));
     assert_eq!(daemon.shutdown().await.unwrap(), Shutdown::Drained);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_hooks_run_before_admission_closes_and_release_pending_sleeps() {
+    let directory = tempfile::tempdir().unwrap();
+    let cleaned = directory.path().join("cleaned");
+    let source = format!(
+        r#"
+        import {{ kotoconn as k }} from '@kotoconn/bindings';
+        // A refresh loop keeps a native sleep pending until shutdown rejects it.
+        (async () => {{ while (true) await k.sleep(k.timeout(3_600_000)); }})().catch(() => {{}});
+        let served;
+        const handled = new Promise(resolve => served = resolve);
+        k.resolve_handler(() => {{ served(); return [k.ip('192.0.2.1')]; }});
+        k.on_shutdown(async () => {{
+            await handled;
+            await k.exec(['sh', '-c', 'cat > "$1"', 'sh', {path:?}], {{ input: 'cleaned' }});
+        }});
+    "#,
+        path = cleaned.to_str().unwrap(),
+    );
+    // The deadline equals the test timeout, so a sleep that holds the drain reports TimedOut.
+    let daemon = start(&source, TIMEOUT).await;
+    let policy = daemon.policy().clone();
+    let id = handler(&policy);
+
+    daemon.stop();
+    // The hook waits for this call, so admission is still open after the shutdown request.
+    let addresses = tokio::time::timeout(TIMEOUT, policy.resolve(id, "during hooks".into()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(addresses.len(), 1);
+
+    assert_eq!(
+        tokio::time::timeout(2 * TIMEOUT, daemon.wait())
+            .await
+            .unwrap()
+            .unwrap(),
+        Shutdown::Drained
+    );
+    assert_eq!(std::fs::read_to_string(&cleaned).unwrap(), "cleaned");
+    assert!(matches!(
+        policy.resolve(id, "after hooks".into()).await,
+        Err(Error::Closed)
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
