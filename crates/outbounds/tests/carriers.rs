@@ -217,3 +217,30 @@ async fn host_network_options_apply_to_every_socket_kind() {
         assert!(System::new(Scope::new(), options).is_err(), "{interface:?}");
     }
 }
+
+// A carrier can be another open dialer, so rejected options must leave no work on it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn rejected_options_leave_no_work_on_the_carrier() {
+    let scope = Scope::new();
+    let result = Clients::new(
+        OutboundImpl::Naive(NaiveOutboundConfig {
+            server: target("127.0.0.1:443".parse().unwrap()),
+            username: String::new(),
+            password: "password".into(),
+            server_name: None,
+            certificate: None,
+            quic: None,
+        }),
+        Arc::new(System::new(scope.clone(), Default::default()).unwrap()),
+        Arc::new(SystemResolver),
+    );
+    assert!(result.is_err());
+
+    let released = tokio::select! {
+        biased;
+        _ = scope.wait() => true,
+        _ = std::future::ready(()) => false,
+    };
+    assert!(released, "rejected options left work on the carrier");
+}

@@ -6,7 +6,6 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-async-trait.workspace = true
 bytes.workspace = true
 futures-util = { workspace = true, features = ["io"] }
 hickory-net.workspace = true
@@ -15,7 +14,7 @@ kotoconn-config.workspace = true
 kotoconn-protocol.workspace = true
 moka.workspace = true
 parking_lot.workspace = true
-tokio = { workspace = true, features = ["net", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "sync", "time"] }
 tokio-util = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 

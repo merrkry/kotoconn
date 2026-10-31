@@ -1,7 +1,52 @@
-use crate::{Script, task};
+use crate::{NativeFuture, Resources, Script, loader, task};
+use kotoconn_config as config;
 use rquickjs::{Function, function::Async};
-use std::{cell::Cell, collections::HashMap, time::Duration};
+use std::{cell::Cell, collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::oneshot;
+
+/// Runtime tests need no resources.
+struct Unavailable;
+
+impl Resources for Unavailable {
+    fn create(
+        &self,
+        _: config::ResourceConfig,
+    ) -> NativeFuture<Result<config::ResourceId, String>> {
+        Box::pin(async { Err("unavailable".to_owned()) })
+    }
+
+    fn close(&self, _: config::ResourceId) -> Result<(), String> {
+        Err("unavailable".to_owned())
+    }
+
+    fn drain(&self, _: config::ResourceId, _: Duration) -> Result<(), String> {
+        Err("unavailable".to_owned())
+    }
+
+    fn released(&self, _: config::ResourceId) -> NativeFuture<()> {
+        Box::pin(async {})
+    }
+
+    fn dns_query(
+        &self,
+        _: config::DnsServiceId,
+        _: config::DnsRequest,
+    ) -> NativeFuture<Result<config::DnsResponse, String>> {
+        Box::pin(async { Err("unavailable".to_owned()) })
+    }
+}
+
+async fn load() -> Script {
+    let script = Script::new(
+        HashMap::from([("main.ts".into(), "export {};".into())]),
+        Arc::new(Unavailable),
+        || false,
+    )
+    .await
+    .unwrap();
+    script.evaluate("main.ts").await.unwrap();
+    script
+}
 
 struct Pending {
     script: Script,
@@ -21,12 +66,7 @@ impl Drop for OnDrop {
 
 // Install a sample operation without any application resources or daemon code.
 async fn pending() -> Pending {
-    let script = Script::load(
-        "main.ts",
-        HashMap::from([("main.ts".into(), "export {};".into())]),
-    )
-    .await
-    .unwrap();
+    let script = load().await;
     let (started, start) = oneshot::channel();
     let (release, released) = oneshot::channel();
     let (finish, finished) = oneshot::channel();
@@ -136,6 +176,43 @@ async fn dropping_script_cancels_pending_native_tasks() {
         dropped.await.unwrap();
         // Hold the release sender until cancellation is observed.
         drop(release);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handlers_are_released_once_their_last_reference_drops() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let script = load().await;
+        let (dropped, released) = oneshot::channel();
+        let capture = OnDrop(Some(dropped));
+        let (first, second) = script
+            .context
+            .with(|ctx| {
+                let function = Function::new(ctx.clone(), move |_: String| {
+                    let _capture = &capture;
+                    Vec::<String>::new()
+                })
+                .unwrap();
+                let handler: config::ResolveHandler = loader::host(&ctx)
+                    .unwrap()
+                    .borrow()
+                    .register(function)
+                    .unwrap();
+                (handler.clone(), handler)
+            })
+            .await;
+
+        drop(first);
+        assert!(script.resolve(&second, "name").await.unwrap().is_empty());
+
+        // The driver unregisters the function, which frees what it captured.
+        drop(second);
+        tokio::select! {
+            _ = script.drive() => panic!("driver exited while its runtime was alive"),
+            result = released => result.unwrap(),
+        }
     })
     .await
     .unwrap();

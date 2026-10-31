@@ -22,7 +22,7 @@ pub use io::{
 };
 pub use kotoconn_config::{Target, TransportProtocol};
 pub use packet_io::{BoxPacketIo, NativeDatagram, PacketIo, packet_io_task};
-pub use server::{BoundServer, Handler, Server, ServerContext, accept_loop};
+pub use server::{BoundServer, Handler, Server, ServerContext, accept, accept_loop};
 pub use session::UdpSession;
 use std::{net::SocketAddr, sync::Arc};
 

@@ -8,7 +8,7 @@ mod tun;
 
 use std::{num::NonZeroU64, time::Duration};
 
-use crate::RoutingHandlerId;
+use crate::RoutingHandler;
 
 pub use direct::DirectInboundConfig;
 pub use http::HttpInboundConfig;
@@ -21,12 +21,13 @@ pub use tun::{TunAddress, TunInboundConfig};
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ts_rs::TS)]
 #[ts(rename = "Inbound")]
-#[ts(type = "{ equals(other: Inbound): boolean; readonly __brand: unique symbol }")]
+#[ts(type = "Resource & { equals(other: Inbound): boolean; readonly __brand: unique symbol }")]
 pub struct InboundId(pub NonZeroU64);
 
 #[derive(Debug, Clone, PartialEq, Eq, ts_rs::TS)]
 pub struct InboundConfig {
-    pub routing_handler: RoutingHandlerId,
+    #[ts(type = "RoutingHandler")]
+    pub routing_handler: RoutingHandler,
     #[ts(optional)]
     pub sniff: Option<crate::SniffConfig>,
     #[ts(type = "Timeout")]

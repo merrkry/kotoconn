@@ -5,7 +5,7 @@ mod naive;
 mod shadowsocks2022;
 mod socks5;
 
-use crate::ResolveHandlerId;
+use crate::ResolveHandler;
 
 pub use direct::DirectOutboundConfig;
 pub use http::HttpOutboundConfig;
@@ -16,7 +16,8 @@ pub use socks5::Socks5OutboundConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq, ts_rs::TS)]
 pub struct OutboundConfig {
-    pub resolve_handler: ResolveHandlerId,
+    #[ts(type = "ResolveHandler")]
+    pub resolve_handler: ResolveHandler,
     pub implementation: OutboundImpl,
 }
 

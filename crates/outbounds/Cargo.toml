@@ -15,7 +15,7 @@ kotoconn-naive.workspace = true
 kotoconn-protocol.workspace = true
 kotoconn-shadowsocks2022.workspace = true
 kotoconn-socks5.workspace = true
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["macros", "net"] }
 tokio-util = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 

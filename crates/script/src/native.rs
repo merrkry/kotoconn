@@ -8,9 +8,6 @@ use ts_rs::TS;
     Wrapper Native TypeScript;
     [Dialer] [config::DialerId] [ts(as = "config::DialerId")];
     [Inbound] [config::InboundId] [ts(as = "config::InboundId")];
-    [Routing] [config::RoutingHandlerId] [ts(as = "config::RoutingHandlerId")];
-    [Resolve] [config::ResolveHandlerId] [ts(as = "config::ResolveHandlerId")];
-    [Dns] [config::DnsHandlerId] [ts(as = "config::DnsHandlerId")];
     [DnsServiceRef] [config::DnsServiceId] [ts(as = "config::DnsServiceId")];
     [Timeout] [std::time::Duration] [ts(type = "{ readonly __brand: unique symbol }")];
     [InboundImpl] [config::InboundImpl] [ts(as = "config::InboundImpl")];
@@ -208,10 +205,36 @@ impl<'js> IntoJs<'js> for Bytes {
     }
 }
 
+/// Options for draining a resource.
+#[derive(rquickjs::FromJs, TS)]
+pub(crate) struct DrainOptions {
+    /// Accepted work that has not finished by then is aborted.
+    pub timeout: Timeout,
+}
+
+#[duplicate::duplicate_item(Kind; [Dialer]; [Inbound]; [DnsServiceRef];)]
 #[rquickjs::methods]
-impl Inbound {
+impl Kind {
     pub fn equals(&self, other: Self) -> bool {
         self.value == other.value
+    }
+
+    pub fn close<'js>(&self, ctx: Ctx<'js>) -> Result<()> {
+        let resources = crate::loader::host(&ctx)?.borrow().resources.clone();
+        resources.close(self.value.into()).map_err(invalid)
+    }
+
+    pub fn drain<'js>(&self, ctx: Ctx<'js>, options: DrainOptions) -> Result<()> {
+        let resources = crate::loader::host(&ctx)?.borrow().resources.clone();
+        resources
+            .drain(self.value.into(), options.timeout.value)
+            .map_err(invalid)
+    }
+
+    pub fn wait<'js>(&self, ctx: Ctx<'js>) -> Result<rquickjs::Promise<'js>> {
+        let resources = crate::loader::host(&ctx)?.borrow().resources.clone();
+        let released = resources.released(self.value.into());
+        rquickjs::Promise::wrap_future(&ctx, crate::task::run(released))
     }
 }
 

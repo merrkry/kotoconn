@@ -38,28 +38,30 @@ async fn concurrent_calls_and_spawned_work_keep_their_parent_spans() {
         .unwrap();
     let daemon = Daemon::start_with_sources(
         "main.ts".into(),
-        HashMap::from([("main.ts".into(),
-            "import { kotoconn as k } from '@kotoconn/bindings'; k.resolve_handler(async () => []);".into())]),
+        HashMap::from([(
+            "main.ts".into(),
+            "import { kotoconn as k } from '@kotoconn/bindings';
+            await k.dialer({carrier: k.host_network({}), outbound: {
+                resolve_handler: async () => [], implementation: k.direct_outbound({}),
+            }});"
+                .into(),
+        )]),
         Duration::from_secs(3),
-    ).await.unwrap();
-    let id = *daemon
-        .policy()
-        .config()
-        .resolve_handlers
-        .iter()
-        .next()
-        .unwrap();
+    )
+    .await
+    .unwrap();
+    let id = resolve_handler(&daemon);
 
     let first = tracing::info_span!("first_request");
     let second = tracing::info_span!("second_request");
     let (a, b) = tokio::join!(
         daemon
             .policy()
-            .resolve(id, "first.example".into())
+            .resolve(&id, "first.example".into())
             .instrument(first.clone()),
         daemon
             .policy()
-            .resolve(id, "second.example".into())
+            .resolve(&id, "second.example".into())
             .instrument(second.clone()),
     );
     a.unwrap();
@@ -93,4 +95,17 @@ async fn concurrent_calls_and_spawned_work_keep_their_parent_spans() {
             "{events:?}"
         );
     }
+}
+
+fn resolve_handler(daemon: &Daemon) -> kotoconn_config::ResolveHandler {
+    daemon
+        .resources()
+        .into_iter()
+        .find_map(|(_, config)| match config {
+            kotoconn_config::ResourceConfig::Dialer(dialer) => {
+                Some(dialer.outbound.resolve_handler)
+            }
+            _ => None,
+        })
+        .unwrap()
 }

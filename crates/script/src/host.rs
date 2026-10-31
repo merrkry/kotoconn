@@ -1,4 +1,5 @@
-use crate::api::{Optional, Parameter, Void, api};
+use crate::Resources;
+use crate::api::{Optional, Parameter, Started, Void, api};
 use crate::handler::{Handler, Hook};
 use crate::log::LogLevel;
 use crate::process::{ExecOptions, ExecResult};
@@ -8,8 +9,11 @@ use rquickjs::{Function, Result};
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
+    future::poll_fn,
     num::NonZeroU64,
-    sync::Arc,
+    rc::Rc,
+    sync::{Arc, Mutex},
+    task::{Poll, Waker},
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
@@ -24,12 +28,12 @@ pub(crate) type DnsHandler<'js> = Handler<'js, Request, DnsResult>;
 #[derive(rquickjs::JsLifetime)]
 #[rquickjs::class]
 pub(crate) struct Host<'js> {
-    pub config: RefCell<config::Config>,
-    pub routing: RefCell<Vec<Function<'js>>>,
-    pub resolving: RefCell<Vec<Function<'js>>>,
-    pub dns: RefCell<Vec<Function<'js>>>,
-    sealed: Cell<bool>,
-    pub services: RefCell<Option<Arc<dyn crate::DnsServices>>>,
+    pub resources: Arc<dyn Resources>,
+    /// Functions that native references keep registered.
+    handlers: RefCell<HashMap<u64, Function<'js>>>,
+    next_handler: Cell<u64>,
+    pub released: Arc<Released>,
+    pub creations: Rc<Creations>,
     /// Cancelled when shutdown starts; pending and later sleeps reject.
     pub shutdown: CancellationToken,
     /// Shutdown hooks in registration order; `None` once they have all run.
@@ -39,33 +43,158 @@ pub(crate) struct Host<'js> {
 // Registration never calls JS while these cells are borrowed.
 impl<'js> rquickjs::class::Trace<'js> for Host<'js> {
     fn trace<'a>(&self, tracer: rquickjs::class::Tracer<'a, 'js>) {
-        self.routing.borrow().trace(tracer);
-        self.resolving.borrow().trace(tracer);
-        self.dns.borrow().trace(tracer);
+        for function in self.handlers.borrow().values() {
+            function.trace(tracer);
+        }
         self.shutdown_hooks.borrow().trace(tracer);
     }
 }
 
+/// Keeps a handler registered until the last native reference drops.
+struct Registration {
+    id: NonZeroU64,
+    released: Arc<Released>,
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        // A poisoned list still holds valid IDs; a panic elsewhere must not leak handlers.
+        self.released
+            .ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(self.id);
+        self.released.notify.notify_one();
+    }
+}
+
+/// Handlers whose last native reference has dropped, possibly on another thread.
+#[derive(Default)]
+pub(crate) struct Released {
+    ids: Mutex<Vec<NonZeroU64>>,
+    /// Wakes the JS thread to unregister them.
+    pub notify: tokio::sync::Notify,
+}
+
+/// Counts resource creations that have not settled, so startup can wait for them.
+#[derive(Default)]
+pub(crate) struct Creations {
+    pending: Cell<usize>,
+    settled: RefCell<Vec<Waker>>,
+}
+
+pub(crate) struct Creation(Rc<Creations>);
+
+impl Drop for Creation {
+    fn drop(&mut self) {
+        let pending = self.0.pending.get();
+        debug_assert!(pending > 0, "each creation is counted once");
+        self.0.pending.set(pending - 1);
+
+        if pending == 1 {
+            for waker in self.0.settled.take() {
+                waker.wake();
+            }
+        }
+    }
+}
+
+impl Creations {
+    pub fn start(self: &Rc<Self>) -> Creation {
+        self.pending.set(self.pending.get() + 1);
+        Creation(self.clone())
+    }
+
+    pub fn is_settled(&self) -> bool {
+        self.pending.get() == 0
+    }
+
+    pub async fn settled(&self) {
+        poll_fn(|cx| {
+            if self.is_settled() {
+                Poll::Ready(())
+            } else {
+                self.settled.borrow_mut().push(cx.waker().clone());
+                Poll::Pending
+            }
+        })
+        .await;
+    }
+}
+
 impl<'js> Host<'js> {
-    pub fn new() -> Self {
+    pub fn new(resources: Arc<dyn Resources>) -> Self {
         Self {
-            config: RefCell::new(config::Config {
-                inbounds: HashMap::new(),
-                dialers: HashMap::new(),
-                dns_services: HashMap::new(),
-                dns_listeners: HashMap::new(),
-                routing_handlers: Default::default(),
-                resolve_handlers: Default::default(),
-                dns_handlers: Default::default(),
-            }),
-            routing: RefCell::new(Vec::new()),
-            resolving: RefCell::new(Vec::new()),
-            dns: RefCell::new(Vec::new()),
-            sealed: Cell::new(false),
-            services: RefCell::new(None),
+            resources,
+            handlers: RefCell::default(),
+            next_handler: Cell::new(0),
+            released: Arc::default(),
+            creations: Rc::default(),
             shutdown: CancellationToken::new(),
             shutdown_hooks: RefCell::new(Some(Vec::new())),
         }
+    }
+
+    /// Registers a function for native calls until the returned reference and all
+    /// its clones drop.
+    pub fn register<K>(&self, function: Function<'js>) -> Result<config::Handler<K>> {
+        let id = self
+            .next_handler
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .ok_or_else(|| invalid("too many handlers"))?;
+        self.next_handler.set(id.get());
+        self.handlers.borrow_mut().insert(id.get(), function);
+
+        let registration = Registration {
+            id,
+            released: self.released.clone(),
+        };
+        Ok(config::Handler::new(id, Arc::new(registration)))
+    }
+
+    /// Native callers hold a reference for the whole call, so a called handler is
+    /// still registered.
+    pub fn handler(&self, id: NonZeroU64) -> Result<Function<'js>> {
+        self.handlers
+            .borrow()
+            .get(&id.get())
+            .cloned()
+            .ok_or_else(|| invalid("handler is no longer registered"))
+    }
+
+    /// Unregisters the handlers whose last native reference has dropped.
+    pub fn collect_released(&self) {
+        let released = std::mem::take(
+            &mut *self
+                .released
+                .ids
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+
+        let mut handlers = self.handlers.borrow_mut();
+        for id in released {
+            let removed = handlers.remove(&id.get());
+            debug_assert!(removed.is_some(), "each handler is released once");
+        }
+    }
+
+    /// Starts creation immediately, so startup counts it before the promise is polled.
+    fn create<T: 'js>(
+        &self,
+        config: config::ResourceConfig,
+        reference: fn(config::ResourceId) -> T,
+    ) -> Started<'js, T> {
+        let creation = self.creations.start();
+        let created = self.resources.create(config);
+
+        Started::new(async move {
+            let _creation = creation;
+            let id = crate::task::run(created).await?.map_err(invalid)?;
+            Ok(reference(id))
+        })
     }
 
     /// Takes the most recently registered hook that has not run yet. Once none
@@ -83,26 +212,6 @@ impl<'js> Host<'js> {
         }
         next
     }
-
-    fn mutable(&self) -> Result<()> {
-        if self.sealed.get() {
-            Err(invalid("configuration registration has finished"))
-        } else {
-            Ok(())
-        }
-    }
-
-    pub fn seal(&self) {
-        self.sealed.set(true);
-    }
-}
-
-fn next_id(len: usize) -> Result<NonZeroU64> {
-    u64::try_from(len)
-        .ok()
-        .and_then(|n| n.checked_add(1))
-        .and_then(NonZeroU64::new)
-        .ok_or_else(|| invalid("too many resources"))
 }
 
 fn matches_domain_suffix(name: &str, suffix: &str, include_self: bool) -> Result<bool> {
@@ -249,73 +358,6 @@ api! {
             Ok(config::HostNetworkConfig::from(options).into())
         }
 
-        fn routing_handler(self, handler: RoutingHandler<'js>) -> Routing {
-            self.mutable()?;
-
-            let id = config::RoutingHandlerId(next_id(self.routing.borrow().len())?);
-            self.routing.borrow_mut().push(handler.function);
-            self.config.borrow_mut().routing_handlers.insert(id);
-
-            Ok(id.into())
-        }
-
-        fn resolve_handler(self, handler: ResolveHandler<'js>) -> Resolve {
-            self.mutable()?;
-
-            let id = config::ResolveHandlerId(next_id(self.resolving.borrow().len())?);
-            self.resolving.borrow_mut().push(handler.function);
-            self.config.borrow_mut().resolve_handlers.insert(id);
-
-            Ok(id.into())
-        }
-
-        fn dns_handler(self, handler: DnsHandler<'js>) -> Dns {
-            self.mutable()?;
-
-            let id = config::DnsHandlerId(next_id(self.dns.borrow().len())?);
-            self.dns.borrow_mut().push(handler.function);
-            self.config.borrow_mut().dns_handlers.insert(id);
-
-            Ok(id.into())
-        }
-
-        fn dialer(self, options: DialerConfig) -> Dialer {
-            self.mutable()?;
-
-            let options: config::DialerConfig = options.into();
-            let id = config::DialerId(next_id(self.config.borrow().dialers.len())?);
-            self.config.borrow_mut().dialers.insert(id, options);
-
-            Ok(id.into())
-        }
-
-        fn inbound(self, options: InboundConfig) -> Inbound {
-            self.mutable()?;
-
-            let config = self.config.borrow();
-            let id = config::InboundId(next_id(config.inbounds.len() + config.dns_listeners.len())?);
-            drop(config);
-            self.config.borrow_mut().inbounds.insert(id, options.into());
-
-            Ok(id.into())
-        }
-
-        fn dns_service(self, options: DnsServiceConfig) -> DnsServiceRef {
-            self.mutable()?;
-            let mut config = self.config.borrow_mut();
-            let id = config::DnsServiceId(next_id(config.dns_services.len())?);
-            config.dns_services.insert(id, options.into());
-            Ok(id.into())
-        }
-
-        fn dns_listener(self, options: DnsListenerConfig) -> Inbound {
-            self.mutable()?;
-            let mut config = self.config.borrow_mut();
-            let id = config::InboundId(next_id(config.inbounds.len() + config.dns_listeners.len())?);
-            config.dns_listeners.insert(id, options.into());
-            Ok(id.into())
-        }
-
         fn dns_response(self, bytes: Bytes) -> Response {
             config::DnsResponse::from_buffer(bytes.0)
                 .map(Into::into)
@@ -332,6 +374,26 @@ api! {
 
         fn response_bytes(self, response: Response) -> Bytes {
             response.value.to_vec().map(Bytes).map_err(|e| invalid(e.to_string()))
+        }
+
+        fn dialer(self, options: DialerConfig<'js>) -> Started<'js, Dialer> {
+            let config = config::ResourceConfig::Dialer(options.register(self)?);
+            Ok(self.create(config, |id| config::DialerId(id.0).into()))
+        }
+
+        fn inbound(self, options: InboundConfig<'js>) -> Started<'js, Inbound> {
+            let config = config::ResourceConfig::Inbound(options.register(self)?);
+            Ok(self.create(config, |id| config::InboundId(id.0).into()))
+        }
+
+        fn dns_service(self, options: DnsServiceConfig) -> Started<'js, DnsServiceRef> {
+            let config = config::ResourceConfig::DnsService(options.into());
+            Ok(self.create(config, |id| config::DnsServiceId(id.0).into()))
+        }
+
+        fn dns_listener(self, options: DnsListenerConfig<'js>) -> Started<'js, Inbound> {
+            let config = config::ResourceConfig::DnsListener(options.register(self)?);
+            Ok(self.create(config, |id| config::InboundId(id.0).into()))
         }
 
         fn log(self, level: LogLevel, message: String) -> Void {
@@ -352,9 +414,7 @@ api! {
 
     async {
         fn dns_query(self, service: DnsServiceRef, request: Request) -> Response {
-            let services = self.services.borrow().clone()
-                .ok_or_else(|| invalid("DNS services are unavailable during configuration evaluation"))?;
-            let response = crate::task::run(services.query(service.value, request.value))
+            let response = crate::task::run(self.resources.dns_query(service.value, request.value))
                 .await?
                 .map_err(invalid)?;
             Ok(response.into())

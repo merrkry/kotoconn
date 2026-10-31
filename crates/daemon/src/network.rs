@@ -1,289 +1,49 @@
 //! Native protocol execution. Each session progresses independently of supervision.
-mod dns;
-mod sessions;
+pub(crate) mod dns;
+pub(crate) mod sessions;
 mod udp;
 
-use crate::{Error, Policy, Shutdown};
-use anyhow::{Context, Result, ensure};
-use futures_util::{FutureExt, future::BoxFuture};
+use crate::{Policy, resources::Manager};
+use anyhow::{Context, Result};
+use futures_util::future::BoxFuture;
 use kotoconn_config::*;
-use kotoconn_outbounds::{Clients, System};
 use kotoconn_protocol::{self as p, *};
 pub use sessions::{SessionHandle, SessionId};
 use std::{
-    any::Any,
-    collections::{HashMap, HashSet},
     net::SocketAddr,
-    panic::AssertUnwindSafe,
-    sync::Arc,
+    sync::{Arc, Weak},
 };
-use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use tracing::Instrument;
 
-pub(crate) struct Network {
-    pub addresses: HashMap<InboundId, SocketAddr>,
-    pub inbound_addresses: HashMap<InboundId, kotoconn_inbounds::InboundAddress>,
-    pub clients: Arc<HashMap<DialerId, Arc<Clients>>>,
-    pub sessions: sessions::Sessions,
-    scope: Scope,
-    outbound_scope: Scope,
-    force: CancellationToken,
-    failure: tokio::sync::watch::Receiver<Option<String>>,
-    _registry: AbortOnDropHandle<()>,
-}
-
-impl Network {
-    pub async fn start(
-        policy: Policy,
-        shutdown: CancellationToken,
-        stopping: CancellationToken,
-        force: CancellationToken,
-    ) -> Result<Self, Error> {
-        Self::build(policy, shutdown, stopping, force)
-            .await
-            .map_err(|e| Error::Config(e.to_string()))
-    }
-
-    async fn build(
-        policy: Policy,
-        shutdown: CancellationToken,
-        stopping: CancellationToken,
-        force: CancellationToken,
-    ) -> Result<Self> {
-        let scope = Scope::new();
-        // Idle protocol pools outlive individual sessions. Connection attempts
-        // still register with their inbound caller through Carrier::tcp_scoped.
-        let outbound_scope = Scope::new();
-        let clients = Arc::new(build_clients(&policy, outbound_scope.clone())?);
-        dns::install(&policy, &clients, &outbound_scope).await?;
-
-        let (sessions, registry) = sessions::Sessions::new();
-        let mut bound = Vec::new();
-        let mut addresses = HashMap::new();
-        let mut inbound_addresses = HashMap::new();
-
-        for (id, config) in &policy.config().inbounds {
-            ensure!(
-                !config.udp_idle_timeout.is_zero(),
-                "UDP idle timeout must be positive"
-            );
-            if let Some(sniff) = &config.sniff {
-                ensure!(!sniff.timeout.is_zero(), "sniff timeout must be positive");
-            }
-            ensure!(
-                policy
-                    .config()
-                    .routing_handlers
-                    .contains(&config.routing_handler),
-                "unknown routing handler"
-            );
-            let handler = Arc::new(SessionHandler {
-                inbound: *id,
-                policy: policy.clone(),
-                clients: clients.clone(),
-                routing: config.routing_handler,
-                sessions: sessions.clone(),
-                idle: config.udp_idle_timeout,
-                sniff: config.sniff.clone(),
-            });
-
-            let server = kotoconn_inbounds::bind(
-                config.implementation.clone(),
-                ServerContext {
-                    handler,
-                    scope: scope.clone(),
-                    stopping: stopping.clone(),
-                    udp_idle_timeout: config.udp_idle_timeout,
-                },
-            )
-            .await?;
-
-            if let kotoconn_inbounds::InboundAddress::Socket(address) = &server.address {
-                addresses.insert(*id, *address);
-            }
-            inbound_addresses.insert(*id, server.address.clone());
-            tracing::info!(inbound_id = id.0.get(), address = ?server.address, "inbound bound");
-            bound.push((*id, server));
-        }
-
-        for (id, config) in &policy.config().dns_listeners {
-            let server = dns::bind(*id, config, &policy, stopping.clone()).await?;
-            // SAFETY: dns::bind constructs only socket listeners.
-            let kotoconn_inbounds::InboundAddress::Socket(address) = server.address else {
-                unreachable!("DNS listeners bind sockets");
-            };
-            addresses.insert(*id, address);
-            inbound_addresses.insert(*id, server.address.clone());
-            tracing::info!(inbound_id = id.0.get(), %address, "DNS listener bound");
-            bound.push((*id, server));
-        }
-
-        let (failed, failure) = tokio::sync::watch::channel(None);
-        let draining = clients.clone();
-        let stop = stopping.clone();
-        scope.spawn(async move {
-            stop.cancelled().await;
-            for client in draining.values() {
-                client.drain();
-            }
-            Ok(())
-        })?;
-
-        for (id, server) in bound {
-            let failed = failed.clone();
-            let shutdown = shutdown.clone();
-            let span = tracing::info_span!("inbound", inbound_id = id.0.get());
-            span.in_scope(|| {
-                scope.spawn(async move {
-                    // A panic ends the inbound like an error instead of silently stopping it.
-                    let result = match AssertUnwindSafe(server.run).catch_unwind().await {
-                        Ok(result) => result,
-                        Err(panic) => Err(anyhow::anyhow!("inbound panicked: {}", panic_message(&*panic))),
-                    };
-                    if let Err(error) = &result {
-                        tracing::error!(error = %format_args!("{error:#}"), "inbound failed; shutting down");
-                        failed.send_replace(Some(format!("{error:#}")));
-                        // A full shutdown runs the policy hooks, which may need to
-                        // undo host configuration that depended on this inbound.
-                        shutdown.cancel();
-                    }
-                    result
-                })
-            })?;
-        }
-
-        let close = scope.clone();
-        let outbound = outbound_scope.clone();
-        let force_signal = force.clone();
-        // This supervisor is not part of the sessions it waits for.
-        let registry = AbortOnDropHandle::new(tokio::spawn(async move {
-            tokio::select! {
-                _ = force_signal.cancelled() => {
-                    close.close();
-                    outbound.close();
-                },
-                _ = registry => {},
-            }
-        }));
-        Ok(Self {
-            addresses,
-            inbound_addresses,
-            clients,
-            sessions,
-            scope,
-            outbound_scope,
-            force,
-            failure,
-            _registry: registry,
-        })
-    }
-
-    /// Wait for inbound work and for `policy`, whose calls may still use outbound
-    /// connections, then close those connections.
-    pub async fn wait<T>(&self, policy: impl Future<Output = T>) -> (T, Result<Shutdown, Error>) {
-        let (policy, ()) = tokio::join!(policy, self.scope.wait());
-        self.outbound_scope.close();
-        self.outbound_scope.wait().await;
-
-        let network = match self.failure.borrow().as_ref() {
-            Some(error) => Err(Error::Network(error.clone())),
-            None if self.force.is_cancelled() => Ok(Shutdown::TimedOut),
-            None => Ok(Shutdown::Drained),
-        };
-        (policy, network)
-    }
-}
-
-fn panic_message(panic: &(dyn Any + Send)) -> &str {
-    if let Some(message) = panic.downcast_ref::<&str>() {
-        message
-    } else if let Some(message) = panic.downcast_ref::<String>() {
-        message
-    } else {
-        "unknown payload"
-    }
-}
-
-impl Drop for Network {
-    fn drop(&mut self) {
-        self.scope.close();
-        self.outbound_scope.close();
-    }
-}
-
-struct PolicyResolver {
-    policy: Policy,
-    id: ResolveHandlerId,
+pub(crate) struct PolicyResolver {
+    pub policy: Policy,
+    pub handler: ResolveHandler,
 }
 
 impl Resolver for PolicyResolver {
     fn resolve(&self, name: String) -> BoxFuture<'_, Result<Vec<IpAddr>>> {
-        Box::pin(async move { Ok(self.policy.resolve(self.id, name).await?) })
+        Box::pin(async move { Ok(self.policy.resolve(&self.handler, name).await?) })
     }
-}
-
-fn build_clients(policy: &Policy, scope: Scope) -> Result<HashMap<DialerId, Arc<Clients>>> {
-    let definitions = &policy.config().dialers;
-    for (id, config) in definitions {
-        ensure!(
-            policy
-                .config()
-                .resolve_handlers
-                .contains(&config.outbound.resolve_handler),
-            "unknown resolve handler"
-        );
-        let mut seen = HashSet::from([*id]);
-        let mut next = &config.carrier;
-        while let CarrierConfig::Dialer(id) = next {
-            ensure!(seen.insert(*id), "carrier cycle");
-            next = &definitions.get(id).context("unknown carrier")?.carrier;
-        }
-    }
-
-    let mut clients = HashMap::<DialerId, Arc<Clients>>::new();
-
-    while clients.len() < definitions.len() {
-        for (id, config) in definitions {
-            if clients.contains_key(id) {
-                continue;
-            }
-            // Each host network dialer has its own carrier for its socket options.
-            let carrier: Arc<dyn Carrier> = match &config.carrier {
-                CarrierConfig::Dialer(id) => match clients.get(id) {
-                    Some(client) => client.clone(),
-                    None => continue,
-                },
-                CarrierConfig::Host(options) => {
-                    Arc::new(System::new(scope.clone(), options.clone())?)
-                }
-            };
-            let resolver = Arc::new(PolicyResolver {
-                policy: policy.clone(),
-                id: config.outbound.resolve_handler,
-            });
-
-            clients.insert(
-                *id,
-                Arc::new(Clients::new(
-                    config.outbound.implementation.clone(),
-                    carrier,
-                    resolver,
-                )?),
-            );
-        }
-    }
-    Ok(clients)
 }
 
 #[derive(Clone)]
-struct SessionHandler {
-    inbound: InboundId,
-    policy: Policy,
-    clients: Arc<HashMap<DialerId, Arc<Clients>>>,
-    routing: RoutingHandlerId,
-    sessions: sessions::Sessions,
-    idle: std::time::Duration,
-    sniff: Option<SniffConfig>,
+pub(crate) struct SessionHandler {
+    pub inbound: InboundId,
+    pub policy: Policy,
+    pub manager: Weak<Manager>,
+    pub routing: RoutingHandler,
+    pub sessions: sessions::Sessions,
+    pub idle: std::time::Duration,
+    pub sniff: Option<SniffConfig>,
+}
+
+impl SessionHandler {
+    fn dialer(&self, id: DialerId) -> Result<Arc<kotoconn_outbounds::Clients>> {
+        self.manager
+            .upgrade()
+            .context("the daemon has stopped")?
+            .dialer(id)
+    }
 }
 
 impl p::Handler for SessionHandler {
@@ -323,7 +83,7 @@ impl p::Handler for SessionHandler {
                         let decision = self
                             .policy
                             .route(
-                                self.routing,
+                                &self.routing,
                                 Flow {
                                     inbound: self.inbound,
                                     source,
@@ -347,7 +107,7 @@ impl p::Handler for SessionHandler {
                         };
                         tracing::debug!(dialer_id = dialer.0.get(), ?target, "TCP route selected");
 
-                        let client = self.clients.get(&dialer).context("unknown dialer")?;
+                        let client = self.dialer(dialer)?;
                         let control = client.control(TransportProtocol::Tcp);
 
                         control

@@ -19,11 +19,11 @@ async fn daemon(implementation: String, outbound: String) -> Result<Daemon> {
     let source = format!(
         r#"
         import {{ kotoconn as k }} from '@kotoconn/bindings';
-        const resolver = k.resolve_handler(name => k.lookup(name));
-        const dialer = k.dialer({{ carrier: k.host_network({{}}), outbound: {{ resolve_handler: resolver, implementation: {outbound} }} }});
-        const routing = k.routing_handler(flow => k.route(dialer, flow.dest));
+        const resolver = name => k.lookup(name);
+        const dialer = await k.dialer({{ carrier: k.host_network({{}}), outbound: {{ resolve_handler: resolver, implementation: {outbound} }} }});
+        const routing = flow => k.route(dialer, flow.dest);
         const listen = {{ address: k.ip('127.0.0.1'), port: 0 }};
-        k.inbound({{ implementation: {implementation}, routing_handler: routing, udp_idle_timeout: k.timeout(1000) }});
+        await k.inbound({{ implementation: {implementation}, routing_handler: routing, udp_idle_timeout: k.timeout(1000) }});
     "#
     );
     Ok(Daemon::start_with_sources(

@@ -28,7 +28,6 @@ publish = false
 
 [workspace.dependencies]
 anyhow = "1.0.104"
-async-trait = "0.1.92"
 anytls = { version = "0.3.17", default-features = false, features = ["core"] }
 base64 = "0.22.1"
 bytes = "1.12.1"

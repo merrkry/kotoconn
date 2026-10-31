@@ -48,17 +48,17 @@ async fn daemon_with_idle(idle: u32) -> Result<Daemon> {
     let source = format!(
         r#"
         import {{ kotoconn as k }} from '@kotoconn/bindings';
-        const resolver = k.resolve_handler(name => k.lookup(name));
-        const direct = k.dialer({{ carrier: k.host_network({{}}), outbound: {{ resolve_handler: resolver, implementation: k.direct_outbound({{}}) }} }});
+        const resolver = name => k.lookup(name);
+        const direct = await k.dialer({{ carrier: k.host_network({{}}), outbound: {{ resolve_handler: resolver, implementation: k.direct_outbound({{}}) }} }});
         const inbounds = [];
-        const routing = k.routing_handler(flow => {{
+        const routing = flow => {{
             if (!inbounds.some(inbound => flow.inbound.equals(inbound))) throw Error('unknown inbound');
             if (!flow.source.address.is_loopback() || flow.source.port === 0) throw Error('missing source');
             return flow.protocol === 'udp' ? k.route_udp(direct) : k.route(direct, flow.dest);
-        }});
+        }};
         const listen = {{ address: k.ip('127.0.0.1'), port: 0 }};
         for (const implementation of [k.http_inbound({{listen}}), k.socks5_inbound({{listen}}), k.shadowsocks2022_inbound({{listen, password: '{KEY}'}}), k.hysteria2_inbound({{listen, password: '{KEY}', certificate: {certificate:?}, private_key: {private_key:?}, obfs_password: 'salamander-test'}})]) {{
-            inbounds.push(k.inbound({{ implementation, routing_handler: routing, udp_idle_timeout: k.timeout({idle}) }}));
+            inbounds.push(await k.inbound({{ implementation, routing_handler: routing, udp_idle_timeout: k.timeout({idle}) }}));
         }}
     "#,
         certificate = hysteria_certificate().cert.pem(),
@@ -74,22 +74,24 @@ async fn daemon_with_idle(idle: u32) -> Result<Daemon> {
 
 fn address(daemon: &Daemon, kind: &str) -> Target {
     let id = daemon
-        .policy()
-        .config()
-        .inbounds
-        .iter()
-        .find(|(_, c)| {
-            matches!(
-                (kind, &c.implementation),
-                ("hysteria2", InboundImpl::Hysteria2(_))
-                    | ("http", InboundImpl::Http(_))
-                    | ("socks5", InboundImpl::Socks5(_))
-                    | ("shadowsocks2022", InboundImpl::Shadowsocks2022(_))
-            )
+        .resources()
+        .into_iter()
+        .find_map(|(id, config)| match config {
+            ResourceConfig::Inbound(config)
+                if matches!(
+                    (kind, &config.implementation),
+                    ("hysteria2", InboundImpl::Hysteria2(_))
+                        | ("http", InboundImpl::Http(_))
+                        | ("socks5", InboundImpl::Socks5(_))
+                        | ("shadowsocks2022", InboundImpl::Shadowsocks2022(_))
+                ) =>
+            {
+                Some(InboundId(id.0))
+            }
+            _ => None,
         })
-        .unwrap()
-        .0;
-    target(daemon.listen_addresses()[id])
+        .unwrap();
+    target(daemon.listen_addresses()[&id])
 }
 
 async fn echoes(scope: &Scope) -> Result<(Target, Target)> {
@@ -480,9 +482,12 @@ async fn capability_checks_and_udp_policy_contract_reject_invalid_requests() -> 
         assert!(error.to_string().contains("carrier lacks required capabilities"), "{error:#}");
         let source = r#"
             import { kotoconn as k } from '@kotoconn/bindings';
-            const resolver = k.resolve_handler(name => k.lookup(name));
-            const d = k.dialer({carrier: k.host_network({}), outbound: {resolve_handler: resolver, implementation: k.direct_outbound({})}});
-            k.routing_handler(flow => k.route(d, flow.dest));
+            const resolver = name => k.lookup(name);
+            const d = await k.dialer({carrier: k.host_network({}), outbound: {resolve_handler: resolver, implementation: k.direct_outbound({})}});
+            await k.inbound({
+                implementation: k.http_inbound({listen: {address: k.ip('127.0.0.1'), port: 0}}),
+                routing_handler: flow => k.route(d, flow.dest), udp_idle_timeout: k.timeout(1000),
+            });
         "#;
         let daemon = Daemon::start_with_sources(
             "main.ts".into(),
@@ -490,13 +495,20 @@ async fn capability_checks_and_udp_policy_contract_reject_invalid_requests() -> 
             Duration::from_secs(1),
         )
         .await?;
-        let handler = *daemon.policy().config().routing_handlers.iter().next().unwrap();
+        let (inbound, handler) = daemon
+            .resources()
+            .into_iter()
+            .find_map(|(id, config)| match config {
+                ResourceConfig::Inbound(inbound) => Some((InboundId(id.0), inbound.routing_handler)),
+                _ => None,
+            })
+            .unwrap();
         let error = daemon
             .policy()
             .route(
-                handler,
+                &handler,
                 Flow {
-                    inbound: InboundId(std::num::NonZeroU64::new(1).unwrap()),
+                    inbound,
                     source: "127.0.0.1:12345".parse()?,
                     protocol: TransportProtocol::Udp,
                     sniff: None,
@@ -569,24 +581,24 @@ async fn routing_metadata_identifies_inbound_and_tcp_udp_sources() -> Result<()>
         let udp_port = udp.local_addr()?.port();
         let source = format!(r#"
             import {{ kotoconn as k }} from '@kotoconn/bindings';
-            const resolve = k.resolve_handler(() => []);
-            const direct = k.dialer({{ carrier: k.host_network({{}}), outbound: {{
+            const resolve = () => [];
+            const direct = await k.dialer({{ carrier: k.host_network({{}}), outbound: {{
                 resolve_handler: resolve, implementation: k.direct_outbound({{}})
             }} }});
-            const routing = k.routing_handler(flow => {{
+            const routing = flow => {{
                 if (!flow.inbound.equals(inbound) || flow.inbound.equals(other)) throw Error('wrong inbound');
                 const port = flow.protocol === 'tcp' ? {tcp_port} : {udp_port};
                 if (!flow.source.address.equals(k.ip('127.0.0.1')) || flow.source.port !== port) {{
                     throw Error('wrong source endpoint');
                 }}
                 return flow.protocol === 'udp' ? k.route_udp(direct) : k.route(direct, flow.dest);
-            }});
+            }};
             const listen = {{ address: k.ip('127.0.0.1'), port: 0 }};
-            const inbound = k.inbound({{
+            const inbound = await k.inbound({{
                 implementation: k.socks5_inbound({{ listen }}), routing_handler: routing,
                 udp_idle_timeout: k.timeout(10000)
             }});
-            const other = k.inbound({{
+            const other = await k.inbound({{
                 implementation: k.http_inbound({{ listen }}), routing_handler: routing,
                 udp_idle_timeout: k.timeout(10000)
             }});

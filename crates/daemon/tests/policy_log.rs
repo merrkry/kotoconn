@@ -45,7 +45,7 @@ async fn policy_logs_and_reports_rejections_left_unhandled_after_queued_jobs() {
                 "main.ts".into(),
                 r#"
                 import { kotoconn as k } from '@kotoconn/bindings';
-                k.resolve_handler(async () => {
+                await k.dialer({carrier: k.host_network({}), outbound: {implementation: k.direct_outbound({}), resolve_handler: async () => {
                     k.log('info', 'resolving');
                     Promise.reject(Error('lost'));
                     // A handler attached by a later job still observes the rejection.
@@ -53,7 +53,7 @@ async fn policy_logs_and_reports_rejections_left_unhandled_after_queued_jobs() {
                     await null;
                     late.catch(() => {});
                     return [];
-                });
+                }}});
             "#
                 .into(),
             )]),
@@ -63,15 +63,13 @@ async fn policy_logs_and_reports_rejections_left_unhandled_after_queued_jobs() {
     .await
     .unwrap()
     .unwrap();
-    let id = *daemon
-        .policy()
-        .config()
-        .resolve_handlers
-        .iter()
-        .next()
-        .unwrap();
+    let id = resolve_handler(&daemon);
 
-    daemon.policy().resolve(id, "example".into()).await.unwrap();
+    daemon
+        .policy()
+        .resolve(&id, "example".into())
+        .await
+        .unwrap();
     // Shutdown drains the job queue and the native tasks that report rejections.
     assert_eq!(daemon.shutdown().await.unwrap(), Shutdown::Drained);
 
@@ -97,7 +95,7 @@ async fn describing_a_reason_can_reject_or_handle_promises() {
             "main.ts".into(),
             r#"
             import { kotoconn as k } from '@kotoconn/bindings';
-            k.resolve_handler(() => {
+            await k.dialer({carrier: k.host_network({}), outbound: {implementation: k.direct_outbound({}), resolve_handler: () => {
                 Promise.reject({
                     toString() {
                         Promise.reject('nested rejection');
@@ -114,7 +112,7 @@ async fn describing_a_reason_can_reject_or_handle_promises() {
                     },
                 });
                 return [];
-            });
+            }}});
             "#
             .into(),
         )]),
@@ -122,14 +120,12 @@ async fn describing_a_reason_can_reject_or_handle_promises() {
     )
     .await
     .unwrap();
-    let id = *daemon
+    let id = resolve_handler(&daemon);
+    daemon
         .policy()
-        .config()
-        .resolve_handlers
-        .iter()
-        .next()
+        .resolve(&id, "example".into())
+        .await
         .unwrap();
-    daemon.policy().resolve(id, "example".into()).await.unwrap();
     daemon.shutdown().await.unwrap();
 
     let events = events.0.lock().unwrap();
@@ -137,4 +133,17 @@ async fn describing_a_reason_can_reject_or_handle_promises() {
     assert!(reported("nested rejection"), "{events:?}");
     assert!(reported("outer rejection"), "{events:?}");
     assert!(!reported("handled rejection"), "{events:?}");
+}
+
+fn resolve_handler(daemon: &Daemon) -> kotoconn_config::ResolveHandler {
+    daemon
+        .resources()
+        .into_iter()
+        .find_map(|(_, config)| match config {
+            kotoconn_config::ResourceConfig::Dialer(dialer) => {
+                Some(dialer.outbound.resolve_handler)
+            }
+            _ => None,
+        })
+        .unwrap()
 }

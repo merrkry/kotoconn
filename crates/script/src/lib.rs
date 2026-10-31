@@ -16,42 +16,53 @@ mod types;
 pub use loader::ModuleSource;
 
 use kotoconn_config::*;
-use rquickjs::{AsyncContext, AsyncRuntime, CatchResultExt, Function, Module};
-use std::{collections::HashMap, future::Future, num::NonZeroU64, pin::Pin, sync::Arc};
+use rquickjs::{AsyncContext, AsyncRuntime, CatchResultExt, Module};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
-/// Native DNS services are installed after configuration and dialer construction.
-pub trait DnsServices: Send + Sync {
-    fn query(
+pub type NativeFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
+
+/// The native resource manager. It exists before the entry module runs, so policy
+/// can create and close resources at any time.
+pub trait Resources: Send + Sync + 'static {
+    /// Validate references and start the resource. Errors reject the creation.
+    fn create(&self, config: ResourceConfig) -> NativeFuture<Result<ResourceId, String>>;
+
+    /// Abort the resource. Closing a closed resource does nothing.
+    fn close(&self, id: ResourceId) -> Result<(), String>;
+
+    /// Stop admission and abort the remaining work after `timeout`.
+    fn drain(&self, id: ResourceId, timeout: Duration) -> Result<(), String>;
+
+    /// Completes once the resource has closed and released its native state.
+    fn released(&self, id: ResourceId) -> NativeFuture<()>;
+
+    fn dns_query(
         &self,
-        id: DnsServiceId,
+        service: DnsServiceId,
         request: DnsRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<DnsResponse, String>> + Send + 'static>>;
+    ) -> NativeFuture<Result<DnsResponse, String>>;
 }
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct Error(String);
 
-/// A loaded policy and its JS functions. This runtime stays on its owning thread.
+/// A policy runtime and its JS functions. This runtime stays on its owning thread.
 /// All access must be polled on that thread; the daemon supplies the Send + Sync handle.
 pub struct Script {
     // Context and its traced host/functions must be freed before the runtime.
     context: AsyncContext,
     runtime: AsyncRuntime,
+    rejections: rejection::Tracker,
+    released: Arc<host::Released>,
 }
 
 impl Script {
-    /// Load an entry module and its dependencies from explicit, relative module names.
-    /// Configuration registration closes when top-level evaluation finishes.
-    pub async fn load(entry: &str, sources: HashMap<String, String>) -> Result<Self, Error> {
-        Self::load_with_interrupt(entry, sources, || false).await
-    }
-
     /// Interrupts must be signalled from outside the JS thread, including during startup.
     /// The callback must not block or enter QuickJS.
-    pub async fn load_with_interrupt(
-        entry: &str,
+    pub async fn new(
         sources: impl ModuleSource + 'static,
+        resources: Arc<dyn Resources>,
         interrupt: impl FnMut() -> bool + 'static,
     ) -> Result<Self, Error> {
         let runtime = AsyncRuntime::new().map_err(js_error)?;
@@ -61,20 +72,20 @@ impl Script {
         runtime
             .set_loader(loader::Resolver, loader::Loader(sources))
             .await;
+        let rejections = rejection::Tracker::new();
         runtime
-            .set_host_promise_rejection_tracker(Some(rejection::tracker()))
+            .set_host_promise_rejection_tracker(Some(rejections.handler()))
             .await;
         let context = AsyncContext::full(&runtime).await.map_err(js_error)?;
 
-        context
+        let released = context
             .async_with(async |ctx| {
                 (async {
+                    loader::install(&ctx, resources)?;
                     let module =
                         Module::declare_def::<loader::Native, _>(ctx.clone(), loader::MODULE_NAME)?;
                     module.eval()?.1.into_future::<()>().await?;
-                    Module::import(&ctx, entry)?.into_future::<()>().await?;
-                    loader::host(&ctx)?.borrow().seal();
-                    Ok::<_, rquickjs::Error>(())
+                    Ok(loader::host(&ctx)?.borrow().released.clone())
                 })
                 .await
                 .catch(&ctx)
@@ -82,24 +93,63 @@ impl Script {
             })
             .await?;
 
-        Ok(Self { context, runtime })
+        Ok(Self {
+            context,
+            runtime,
+            rejections,
+            released,
+        })
     }
 
-    pub async fn config(&self) -> Result<Config, Error> {
-        self.context
-            .with(|ctx| {
-                Ok::<_, rquickjs::Error>(loader::host(&ctx)?.borrow().config.borrow().clone())
+    /// Evaluate the entry module and its dependencies from explicit, relative module
+    /// names. Startup finishes once evaluation, including top-level await, and every
+    /// resource creation started until then have settled. An unhandled rejection
+    /// before then fails startup. Handler calls may run concurrently.
+    pub async fn evaluate(&self, entry: &str) -> Result<(), Error> {
+        let evaluated = self
+            .with(async |ctx| {
+                Module::import(&ctx, entry)?.into_future::<()>().await?;
+
+                let creations = loader::host(&ctx)?.borrow().creations.clone();
+                loop {
+                    creations.settled().await;
+                    self.rejections.settled().await;
+                    // A rejection handler can start another creation.
+                    if creations.is_settled() {
+                        break;
+                    }
+                }
+                Ok(())
             })
-            .await
-            .map_err(js_error)
+            .await;
+
+        let reasons = self.rejections.finish_startup();
+        if let Err(error) = evaluated {
+            for reason in reasons {
+                tracing::warn!(target: "policy", %reason, "unhandled promise rejection");
+            }
+            return Err(error);
+        }
+
+        match reasons.as_slice() {
+            [] => Ok(()),
+            reasons => Err(Error(format!(
+                "unhandled promise rejection during startup: {}",
+                reasons.join("; ")
+            ))),
+        }
     }
 
-    pub async fn route(&self, id: RoutingHandlerId, flow: Flow) -> Result<RouteDecision, Error> {
+    pub async fn route(
+        &self,
+        handler: &RoutingHandler,
+        flow: Flow,
+    ) -> Result<RouteDecision, Error> {
         let protocol = flow.protocol;
 
         let decision = self
             .with(async |ctx| {
-                let function = get(&loader::host(&ctx)?.borrow().routing.borrow(), id.0)?;
+                let function = loader::host(&ctx)?.borrow().handler(handler.id())?;
                 Ok(host::RoutingHandler::new(function)
                     .call(data::Flow::from(flow))
                     .await?
@@ -118,9 +168,13 @@ impl Script {
         }
     }
 
-    pub async fn resolve(&self, id: ResolveHandlerId, name: &str) -> Result<Vec<IpAddr>, Error> {
+    pub async fn resolve(
+        &self,
+        handler: &ResolveHandler,
+        name: &str,
+    ) -> Result<Vec<IpAddr>, Error> {
         self.with(async |ctx| {
-            let function = get(&loader::host(&ctx)?.borrow().resolving.borrow(), id.0)?;
+            let function = loader::host(&ctx)?.borrow().handler(handler.id())?;
 
             Ok(host::ResolveHandler::new(function)
                 .call(name.to_owned())
@@ -134,28 +188,12 @@ impl Script {
 
     pub async fn dns(
         &self,
-        id: DnsHandlerId,
-        request: DnsRequest,
-    ) -> Result<DnsHandlerResult, Error> {
-        self.dns_with_info(id, request, None).await
-    }
-
-    pub async fn install_dns_services(&self, services: Arc<dyn DnsServices>) -> Result<(), Error> {
-        self.with(async |ctx| {
-            *loader::host(&ctx)?.borrow().services.borrow_mut() = Some(services);
-            Ok(())
-        })
-        .await
-    }
-
-    pub async fn dns_with_info(
-        &self,
-        id: DnsHandlerId,
+        handler: &DnsHandler,
         request: DnsRequest,
         info: Option<DnsRequestInfo>,
     ) -> Result<DnsHandlerResult, Error> {
         self.with(async |ctx| {
-            let function = get(&loader::host(&ctx)?.borrow().dns.borrow(), id.0)?;
+            let function = loader::host(&ctx)?.borrow().handler(handler.id())?;
 
             Ok(host::DnsHandler::new(function)
                 .call(dns::Request {
@@ -204,18 +242,26 @@ impl Script {
         self.runtime.idle().await;
     }
 
-    /// Continuously drive detached JS promises while the daemon waits for requests.
+    /// Continuously drive detached JS promises while the daemon waits for requests,
+    /// and unregister handlers once their last native reference drops.
     pub async fn drive(&self) {
-        self.runtime.drive().await;
-    }
-}
+        let collect = async {
+            loop {
+                self.released.notify.notified().await;
+                let collected = self
+                    .with(async |ctx| {
+                        loader::host(&ctx)?.borrow().collect_released();
+                        Ok(())
+                    })
+                    .await;
+                if let Err(error) = collected {
+                    tracing::error!(%error, "releasing handlers failed");
+                }
+            }
+        };
 
-fn get<'js>(functions: &[Function<'js>], id: NonZeroU64) -> rquickjs::Result<Function<'js>> {
-    usize::try_from(id.get() - 1)
-        .ok()
-        .and_then(|index| functions.get(index))
-        .cloned()
-        .ok_or_else(|| native::invalid("unknown handler ID"))
+        tokio::join!(self.runtime.drive(), collect);
+    }
 }
 
 fn js_error(error: impl std::fmt::Display) -> Error {
