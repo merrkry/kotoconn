@@ -29,12 +29,18 @@ impl Clients {
         self.protocol.drain();
     }
 
+    /// Closing the returned clients' scope also ends the protocol's own tasks,
+    /// such as connection pools, which the adapter starts in its carrier's scope.
     pub fn new(
         config: OutboundImpl,
         carrier: Arc<dyn Carrier>,
         resolver: Arc<dyn Resolver>,
     ) -> Result<Self> {
         let scope = carrier.scope().child();
+        let carrier: Arc<dyn Carrier> = Arc::new(Owned {
+            carrier,
+            scope: scope.clone(),
+        });
         let tcp = scope.child();
 
         let protocol: Arc<dyn Client> = match config {
@@ -94,6 +100,12 @@ impl Clients {
             scope,
             protocol,
         })
+    }
+
+    /// Completes once no TCP or UDP connection opened through these clients remains.
+    /// Protocol tasks that outlive connections, such as idle pools, do not count.
+    pub async fn connections_closed(&self) {
+        tokio::join!(self.tcp.wait(), self.udp.wait());
     }
 
     pub fn control(&self, protocol: TransportProtocol) -> Scope {
@@ -175,6 +187,38 @@ fn follow_datagram(scope: Scope, lower: Scope) -> Result<()> {
         drop(close);
         Ok(())
     })
+}
+
+/// A carrier seen from the protocol it carries: its scope is the clients' scope.
+struct Owned {
+    carrier: Arc<dyn Carrier>,
+    scope: Scope,
+}
+
+impl Carrier for Owned {
+    fn capabilities(&self) -> Capabilities {
+        self.carrier.capabilities()
+    }
+
+    fn scope(&self) -> &Scope {
+        &self.scope
+    }
+
+    fn tcp_scoped(&self, target: Target, caller: Scope) -> BoxFuture<'_, Result<BoxStream>> {
+        self.carrier.tcp_scoped(target, caller)
+    }
+
+    fn udp_scoped(&self, target: Target, caller: Scope) -> BoxFuture<'_, Result<Datagram>> {
+        self.carrier.udp_scoped(target, caller)
+    }
+
+    fn udp_native_scoped(
+        &self,
+        target: Target,
+        caller: Scope,
+    ) -> BoxFuture<'_, Result<Option<NativeDatagram>>> {
+        self.carrier.udp_native_scoped(target, caller)
+    }
 }
 
 struct Direct(Arc<dyn Carrier>);
