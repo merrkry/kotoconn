@@ -30,10 +30,9 @@ pub(crate) fn tracker() -> RejectionTracker {
             return;
         }
 
-        rejections
-            .pending
-            .borrow_mut()
-            .push((id, describe(&ctx, reason)));
+        // Describing can run JS, such as a `toString` that rejects another promise.
+        let reason = describe(&ctx, reason);
+        rejections.pending.borrow_mut().push((id, reason));
 
         if !rejections.scheduled.replace(true) {
             let rejections = rejections.clone();
