@@ -346,7 +346,14 @@ impl Manager {
             handler: config.dns_handler.clone(),
         });
 
-        let bound = kotoconn_dns::bind(id, config, handler, lifetime.admission.clone()).await?;
+        let bound = kotoconn_dns::bind(
+            id,
+            config,
+            handler,
+            lifetime.admission.clone(),
+            lifetime.scope.clone(),
+        )
+        .await?;
         tracing::info!(inbound_id = id.0.get(), address = %bound.address, "DNS listener bound");
 
         let scope = lifetime.scope.clone();

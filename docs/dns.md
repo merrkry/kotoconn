@@ -29,6 +29,9 @@ await k.dns_listener({
 });
 ```
 
+The listener is an inbound: while it drains, it reads no new queries and still
+answers the ones it has read.
+
 `dialer` is an open Kotoconn dialer reference. Every upstream connection uses
 that dialer, so the dialer cannot close before the service. The service is a
 resource with `close()`, `drain({ timeout })` and `wait()`; a drain lets queries

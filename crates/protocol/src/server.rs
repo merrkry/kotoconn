@@ -2,7 +2,7 @@ use crate::{BoxStream, Datagram, Scope, Target};
 use anyhow::Result;
 use futures_util::future::BoxFuture;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
 pub trait Handler: Send + Sync {
@@ -44,8 +44,39 @@ pub trait Server: Send + Sync {
 /// Retry after other accept errors, such as descriptor exhaustion, without spinning.
 const ACCEPT_RETRY: Duration = Duration::from_secs(1);
 
-/// Accept errors never end the loop: they come from one connection or from a
-/// condition the OS can recover from, and the listener stays usable.
+/// The next connection, or `None` once `stop` completes. Accept errors never end
+/// the loop: they come from one connection or from a condition the OS can recover
+/// from, and the listener stays usable.
+pub async fn accept(
+    listener: &TcpListener,
+    stop: impl Future<Output = ()>,
+) -> Option<(TcpStream, SocketAddr)> {
+    tokio::pin!(stop);
+
+    loop {
+        let accepted = tokio::select! {
+            biased;
+            _ = &mut stop => return None,
+            result = listener.accept() => result,
+        };
+
+        match accepted {
+            Ok(accepted) => return Some(accepted),
+            Err(error) if is_connection_error(&error) => {
+                tracing::debug!(%error, "connection failed before accept");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "accept failed; retrying");
+                tokio::select! {
+                    biased;
+                    _ = &mut stop => return None,
+                    _ = tokio::time::sleep(ACCEPT_RETRY) => {}
+                }
+            }
+        }
+    }
+}
+
 pub async fn accept_loop<F, Fut>(
     listener: TcpListener,
     context: ServerContext,
@@ -56,6 +87,12 @@ where
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     let admission = std::sync::Arc::new(tokio::sync::Semaphore::new(1024));
+    let stopped = || async {
+        tokio::select! {
+            _ = context.stopping.cancelled() => {}
+            _ = context.scope.cancelled() => {}
+        }
+    };
     loop {
         let permit = tokio::select! {
             biased;
@@ -64,28 +101,8 @@ where
             permit = admission.clone().acquire_owned() => permit?,
         };
 
-        let accepted = tokio::select! {
-            biased;
-            _ = context.stopping.cancelled() => return Ok(()),
-            _ = context.scope.cancelled() => return Ok(()),
-            result = listener.accept() => result,
-        };
-
-        let (stream, peer) = match accepted {
-            Ok(accepted) => accepted,
-            Err(error) if is_connection_error(&error) => {
-                tracing::debug!(%error, "connection failed before accept");
-                continue;
-            }
-            Err(error) => {
-                tracing::warn!(%error, "accept failed; retrying");
-                tokio::select! {
-                    biased;
-                    _ = context.stopping.cancelled() => return Ok(()),
-                    _ = context.scope.cancelled() => return Ok(()),
-                    _ = tokio::time::sleep(ACCEPT_RETRY) => continue,
-                }
-            }
+        let Some((stream, peer)) = self::accept(&listener, stopped()).await else {
+            return Ok(());
         };
 
         // The peer can reset the connection before its address is read.

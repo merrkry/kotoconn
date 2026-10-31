@@ -1,19 +1,26 @@
 use anyhow::{Context, Result, ensure};
 use futures_util::future::BoxFuture;
 use hickory_server::{
-    Server,
     net::xfer::Protocol,
-    proto::op::{DnsRequest, Header, HeaderCounts, Message, MessageType, OpCode, ResponseCode},
-    proto::rr::RecordType,
-    server::{Request, RequestHandler, ResponseHandler, ResponseInfo},
-    zone_handler::MessageResponseBuilder,
+    proto::op::{DnsRequest, Header, Message, MessageType, OpCode, ResponseCode},
+    proto::rr::{Record, RecordType},
+    proto::serialize::binary::{BinDecodable, BinDecoder, BinEncoder},
+    server::Request,
+    zone_handler::{MessageResponse, MessageResponseBuilder},
 };
 use kotoconn_config::{
     DnsHandlerResult, DnsListenerConfig, DnsRequestInfo, InboundId, TransportProtocol,
 };
+use kotoconn_protocol::Scope;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream, UdpSocket},
+};
 use tokio_util::sync::CancellationToken;
+
+/// A TCP client that sends no complete message for this long is disconnected.
+const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub trait Handler: Send + Sync + 'static {
     fn handle(
@@ -28,11 +35,14 @@ pub struct BoundListener {
     pub run: BoxFuture<'static, Result<()>>,
 }
 
+/// Requests run in `scope`. Once `stopping` is cancelled, the listener reads no
+/// new request; requests already read are still answered.
 pub async fn bind(
     id: InboundId,
     config: &DnsListenerConfig,
     handler: Arc<dyn Handler>,
     stopping: CancellationToken,
+    scope: Scope,
 ) -> Result<BoundListener> {
     ensure!(
         !config.protocols.is_empty(),
@@ -45,29 +55,125 @@ pub async fn bind(
     );
 
     let (address, tcp, udp) = bind_sockets(config).await?;
-    let mut server = Server::new(Adapter { id, handler });
-    if let Some(listener) = tcp {
-        // This bounds buffered replies for one TCP client, not executing policy calls.
-        server.register_listener(listener, Duration::from_secs(30), 32);
-    }
-    if let Some(socket) = udp {
-        server.register_socket(socket);
-    }
-
-    let shutdown = server.shutdown_token().clone();
+    let responder = Arc::new(Responder { id, handler });
     let run = Box::pin(async move {
-        let done = server.block_until_done();
-        tokio::pin!(done);
-        tokio::select! {
-            result = &mut done => result?,
-            _ = stopping.cancelled() => {
-                shutdown.cancel();
-                done.await?;
+        let udp = async {
+            match udp {
+                Some(socket) => serve_udp(Arc::new(socket), &responder, &stopping, &scope).await,
+                None => Ok(()),
             }
-        }
+        };
+        let tcp = async {
+            match tcp {
+                Some(listener) => serve_tcp(listener, &responder, &stopping, &scope).await,
+                None => Ok(()),
+            }
+        };
+
+        tokio::try_join!(udp, tcp)?;
         Ok(())
     });
     Ok(BoundListener { address, run })
+}
+
+async fn serve_udp(
+    socket: Arc<UdpSocket>,
+    responder: &Arc<Responder>,
+    stopping: &CancellationToken,
+    scope: &Scope,
+) -> Result<()> {
+    let mut buffer = vec![0; usize::from(u16::MAX)];
+
+    loop {
+        let received = tokio::select! {
+            biased;
+            _ = stopping.cancelled() => return Ok(()),
+            received = socket.recv_from(&mut buffer) => received,
+        };
+        let (length, source) = match received {
+            Ok(received) => received,
+            // Some platforms report ICMP errors of earlier replies on the next receive.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                tracing::debug!(%error, "DNS UDP receive failed");
+                continue;
+            }
+            Err(error) => return Err(error).context("DNS UDP listener"),
+        };
+        // A reply to port zero cannot be delivered.
+        if source.port() == 0 {
+            continue;
+        }
+
+        let request = buffer[..length].to_vec();
+        let (responder, socket) = (responder.clone(), socket.clone());
+        scope.spawn(async move {
+            let Some(response) = responder.respond(request, source, Protocol::Udp).await else {
+                return Ok(());
+            };
+            if let Err(error) = socket.send_to(&response, source).await {
+                tracing::debug!(%source, %error, "DNS client response failed");
+            }
+            Ok(())
+        })?;
+    }
+}
+
+async fn serve_tcp(
+    listener: TcpListener,
+    responder: &Arc<Responder>,
+    stopping: &CancellationToken,
+    scope: &Scope,
+) -> Result<()> {
+    while let Some((stream, source)) =
+        kotoconn_protocol::accept(&listener, stopping.cancelled()).await
+    {
+        let (responder, stopping) = (responder.clone(), stopping.clone());
+        scope.spawn(async move {
+            if let Err(error) = serve_connection(stream, source, &responder, &stopping).await {
+                tracing::debug!(%source, error = %format_args!("{error:#}"), "DNS TCP connection failed");
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+/// Answers one message at a time, so one client cannot run unbounded policy calls.
+async fn serve_connection(
+    mut stream: TcpStream,
+    source: SocketAddr,
+    responder: &Responder,
+    stopping: &CancellationToken,
+) -> Result<()> {
+    loop {
+        let read = async {
+            let length = stream.read_u16().await?;
+            let mut message = vec![0; usize::from(length)];
+            stream.read_exact(&mut message).await?;
+            Ok::<_, std::io::Error>(message)
+        };
+        let message = tokio::select! {
+            biased;
+            _ = stopping.cancelled() => return Ok(()),
+            message = tokio::time::timeout(TCP_IDLE_TIMEOUT, read) => match message {
+                Ok(Ok(message)) => message,
+                Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                Ok(Err(error)) => return Err(error.into()),
+                Err(_) => return Ok(()),
+            },
+        };
+
+        if let Some(response) = responder.respond(message, source, Protocol::Tcp).await {
+            let length = u16::try_from(response.len()).context("DNS response too long")?;
+            stream.write_all(&length.to_be_bytes()).await?;
+            stream.write_all(&response).await?;
+        }
+    }
 }
 
 async fn bind_sockets(
@@ -114,26 +220,38 @@ async fn bind_sockets(
     unreachable!("final bind attempt returns its result")
 }
 
-struct Adapter {
+struct Responder {
     id: InboundId,
     handler: Arc<dyn Handler>,
 }
 
-#[async_trait::async_trait]
-impl RequestHandler for Adapter {
-    async fn handle_request<R: ResponseHandler, T: hickory_server::net::runtime::Time>(
+impl Responder {
+    /// The encoded response to one received message, if it gets any.
+    async fn respond(
         &self,
-        request: &Request,
-        mut response_handle: R,
-    ) -> ResponseInfo {
-        let mut metadata = request.metadata;
-        metadata.message_type = MessageType::Response;
-        let fallback = ResponseInfo::from(Header {
-            metadata,
-            counts: HeaderCounts::default(),
-        });
+        bytes: Vec<u8>,
+        source: SocketAddr,
+        protocol: Protocol,
+    ) -> Option<Vec<u8>> {
+        // A message without a complete header is not a DNS query and gets no response.
+        let header = Header::read(&mut BinDecoder::new(&bytes)).ok()?;
+        let request = match Request::from_bytes(bytes, source, protocol) {
+            Ok(request) => request,
+            Err(_) => {
+                let metadata = header.metadata;
+                return Message::error_msg(metadata.id, metadata.op_code, ResponseCode::FormErr)
+                    .to_vec()
+                    .ok();
+            }
+        };
+        // RFC 1035 limits UDP responses to 512 bytes unless EDNS raises the limit.
+        let limit = match protocol {
+            Protocol::Udp => request.edns.as_ref().map_or(512, |edns| edns.max_payload()),
+            _ => u16::MAX,
+        };
 
-        let error_code = if metadata.op_code != OpCode::Query || request.signature.is_some() {
+        let error_code = if request.metadata.op_code != OpCode::Query || request.signature.is_some()
+        {
             Some(ResponseCode::NotImp)
         } else {
             match request.request_info() {
@@ -153,8 +271,8 @@ impl RequestHandler for Adapter {
                 let message = Message::from_vec(request.as_slice())?;
                 let info = DnsRequestInfo {
                     inbound: self.id,
-                    source: request.src(),
-                    protocol: match request.protocol() {
+                    source,
+                    protocol: match protocol {
                         Protocol::Udp => TransportProtocol::Udp,
                         _ => TransportProtocol::Tcp,
                     },
@@ -163,19 +281,20 @@ impl RequestHandler for Adapter {
             }
             .await;
             match result {
-                Ok(DnsHandlerResult::Drop) => return fallback,
+                Ok(DnsHandlerResult::Drop) => return None,
                 Ok(DnsHandlerResult::Response(response)) => Ok(response),
                 Err(error) => {
-                    tracing::warn!(inbound_id = self.id.0.get(), source = %request.src(), error = %format_args!("{error:#}"), "DNS policy failed");
+                    tracing::warn!(inbound_id = self.id.0.get(), %source, error = %format_args!("{error:#}"), "DNS policy failed");
                     Err(ResponseCode::ServFail)
                 }
             }
         };
 
-        let sent = match result {
+        let id = request.metadata.id;
+        match result {
             Ok(response) => {
                 let mut message = response.into_message();
-                message.metadata.id = request.metadata.id;
+                message.metadata.id = id;
                 message.metadata.message_type = MessageType::Response;
                 // Honor the client's UDP limit even when the upstream used TCP.
                 if let Some(edns) = &mut message.edns {
@@ -190,23 +309,43 @@ impl RequestHandler for Adapter {
                         std::iter::empty(),
                         message.additionals.iter(),
                     );
-                response_handle.send_response(response).await
+                encode(response, id, limit)
             }
-            Err(code) => {
-                response_handle
-                    .send_response(
-                        MessageResponseBuilder::from_message_request(request)
-                            .error_msg(&request.metadata, code),
-                    )
-                    .await
-            }
-        };
-        match sent {
-            Ok(info) => info,
-            Err(error) => {
-                tracing::debug!(%error, "DNS client response failed");
-                fallback
-            }
+            Err(code) => encode(
+                MessageResponseBuilder::from_message_request(&request)
+                    .error_msg(&request.metadata, code),
+                id,
+                limit,
+            ),
+        }
+    }
+}
+
+/// Emitting truncates a response that exceeds `limit`; a response that still
+/// cannot be encoded becomes SERVFAIL.
+fn encode<'a>(
+    response: MessageResponse<
+        '_,
+        'a,
+        impl Iterator<Item = &'a Record> + Send + 'a,
+        impl Iterator<Item = &'a Record> + Send + 'a,
+        impl Iterator<Item = &'a Record> + Send + 'a,
+        impl Iterator<Item = &'a Record> + Send + 'a,
+    >,
+    id: u16,
+    limit: u16,
+) -> Option<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(512);
+    let mut encoder = BinEncoder::new(&mut bytes);
+    encoder.set_max_size(limit);
+
+    match response.destructive_emit(&mut encoder) {
+        Ok(_) => Some(bytes),
+        Err(error) => {
+            tracing::error!(%error, "encoding a DNS response failed");
+            Message::error_msg(id, OpCode::Query, ResponseCode::ServFail)
+                .to_vec()
+                .ok()
         }
     }
 }

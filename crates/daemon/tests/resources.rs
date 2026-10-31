@@ -75,7 +75,7 @@ async fn relays(proxy: SocketAddr, destination: &Target) -> Result<bool> {
     })
 }
 
-fn socks5_address(daemon: &Daemon) -> SocketAddr {
+fn listen_address(daemon: &Daemon) -> SocketAddr {
     *daemon.listen_addresses().values().next().unwrap()
 }
 
@@ -127,7 +127,7 @@ async fn policy_creates_and_closes_resources_while_running() -> Result<()> {
 
         command(&daemon, "create").await?;
         assert_eq!(daemon.resources().len(), 5);
-        let proxy = socks5_address(&daemon);
+        let proxy = listen_address(&daemon);
         assert!(relays(proxy, &destination).await?);
 
         let error = command(&daemon, "close carrier").await.unwrap_err();
@@ -180,7 +180,7 @@ async fn a_dialer_drain_keeps_accepted_sessions_until_they_finish() -> Result<()
             .into(),
         )
         .await?;
-        let proxy = socks5_address(&daemon);
+        let proxy = listen_address(&daemon);
 
         let client = Clients::new(
             OutboundImpl::Socks5(Socks5OutboundConfig {
@@ -244,4 +244,70 @@ async fn startup_failure_releases_the_resources_that_evaluation_created() -> Res
     assert!(error.to_string().contains("later failure"), "{error}");
     TcpListener::bind(("127.0.0.1", port)).await?;
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dns_listener_drain_answers_accepted_queries_and_admits_no_new_ones() -> Result<()> {
+    tokio::time::timeout(LIMIT, async {
+        let daemon = start(
+            r#"
+            import { kotoconn as k } from '@kotoconn/bindings';
+            let calls = 0, markEntered, release;
+            const entered = new Promise(resolve => markEntered = resolve);
+            const gate = new Promise(resolve => release = resolve);
+            let listener;
+            const hook = async name => {
+                if (name === 'entered') await entered;
+                if (name === 'drain') listener.drain({timeout: k.timeout(60000)});
+                if (name === 'release') release();
+                if (name === 'wait') await listener.wait();
+                if (name === 'calls' && calls !== 1) throw Error(`${calls} DNS handler calls`);
+                return [];
+            };
+            await k.dialer({carrier: k.host_network({}), outbound: {
+                resolve_handler: hook, implementation: k.direct_outbound({}),
+            }});
+            listener = await k.dns_listener({
+                listen: {address: k.ip('127.0.0.1'), port: 0}, protocols: ['udp'],
+                dns_handler: async request => {
+                    calls++;
+                    markEntered();
+                    await gate;
+                    const bytes = k.request_bytes(request);
+                    bytes[2] |= 0x80;
+                    return k.respond(k.dns_response(bytes));
+                },
+            });
+        "#
+            .into(),
+        )
+        .await?;
+        let listener = listen_address(&daemon);
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let query = |id: u8| {
+            [
+                0x12, id, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 4, b't', b'e', b's', b't', 0, 0, 1, 0, 1,
+            ]
+        };
+
+        socket.send_to(&query(1), listener).await?;
+        command(&daemon, "entered").await?;
+        command(&daemon, "drain").await?;
+        socket.send_to(&query(2), listener).await?;
+
+        // The accepted query is answered after the drain started.
+        command(&daemon, "release").await?;
+        let mut response = [0; 512];
+        let received = socket.recv_from(&mut response).await?.0;
+        let mut answered = query(1);
+        answered[2] |= 0x80;
+        assert_eq!(response[..received], answered);
+
+        command(&daemon, "wait").await?;
+        command(&daemon, "calls").await?;
+        assert!(daemon.listen_addresses().is_empty());
+        assert_eq!(daemon.shutdown().await?, Shutdown::Drained);
+        Ok(())
+    })
+    .await?
 }

@@ -1766,7 +1766,6 @@ name = "kotoconn-dns"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "bytes",
  "futures-util",
  "hickory-net",
