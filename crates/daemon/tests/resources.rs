@@ -164,10 +164,8 @@ async fn a_dialer_drain_keeps_accepted_sessions_until_they_finish() -> Result<()
             import { kotoconn as k } from '@kotoconn/bindings';
             const direct = k.direct_outbound({});
             const hook = async name => {
-                if (name === 'drain') {
-                    dialer.drain({timeout: k.timeout(60000)});
-                    await dialer.wait();
-                }
+                if (name === 'drain') dialer.drain({timeout: k.timeout(60000)});
+                if (name === 'wait') await dialer.wait();
                 return [];
             };
             const dialer = await k.dialer({carrier: k.host_network({}), outbound: {resolve_handler: hook, implementation: direct}});
@@ -195,9 +193,12 @@ async fn a_dialer_drain_keeps_accepted_sessions_until_they_finish() -> Result<()
         let mut received = [0; 6];
         accepted.read_exact(&mut received).await?;
 
-        let drained = command(&daemon, "drain");
-        tokio::pin!(drained);
-        // The drain waits for the accepted session, which still forwards traffic.
+        command(&daemon, "drain").await?;
+        assert!(!relays(proxy, &destination).await?);
+
+        // The release waits for the accepted session, which still forwards traffic.
+        let released = command(&daemon, "wait");
+        tokio::pin!(released);
         let traffic = async {
             accepted.write_all(b"during").await?;
             session.read_exact(&mut received).await?;
@@ -205,14 +206,13 @@ async fn a_dialer_drain_keeps_accepted_sessions_until_they_finish() -> Result<()
             Ok::<_, anyhow::Error>(())
         };
         tokio::select! {
-            result = &mut drained => panic!("drain ended with an active session: {result:?}"),
+            result = &mut released => panic!("drain ended with an active session: {result:?}"),
             result = traffic => result?,
         }
-        assert!(!relays(proxy, &destination).await?);
 
         drop(session);
         drop(accepted);
-        drained.await?;
+        released.await?;
         assert_eq!(daemon.shutdown().await?, Shutdown::Drained);
         Ok(())
     })
