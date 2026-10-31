@@ -747,3 +747,51 @@ async fn a_failed_auto_route_installation_removes_what_it_added() {
     .await
     .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_checks_address_the_target_authority() {
+    load(r#"
+        import { kotoconn as k } from '@kotoconn/bindings';
+        import { http_check } from '@kotoconn/api';
+        const dialer = await k.dialer({carrier: k.host_network({}), outbound: {
+            resolve_handler: () => [], implementation: k.direct_outbound({}),
+        }});
+        k.probe = async (_, options) => {
+            const request = String.fromCharCode(...options.request);
+            if (!request.includes('\r\nHost: [::1]:8080\r\n')) {
+                throw Error(`incorrect HTTP authority: ${JSON.stringify(request)}`);
+            }
+            return {latency: 1, response: new Uint8Array([72,84,84,80,47,49,46,49,32,50,48,52])};
+        };
+        await http_check({target: k.ip_target(k.ip('::1'), 8080), timeout: k.timeout(1000)})(dialer);
+    "#).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_throwing_health_check_fails_only_its_member() {
+    load(
+        r#"
+        import { kotoconn as k } from '@kotoconn/bindings';
+        import { fallback } from '@kotoconn/api';
+        const config = {carrier: k.host_network({}), outbound: {
+            resolve_handler: () => [], implementation: k.direct_outbound({}),
+        }};
+        const a = await k.dialer(config);
+        const b = await k.dialer(config);
+        const group = fallback({
+            dialers: [a, b], interval: k.timeout(3600000),
+            check: dialer => {
+                if (dialer.equals(a)) throw Error('member is unavailable');
+                return Promise.resolve(10);
+            },
+        });
+        try {
+            await group.check();
+            if (!group.current.equals(b)) throw Error('healthy member was not selected');
+        } finally {
+            group.close();
+        }
+    "#,
+    )
+    .await;
+}

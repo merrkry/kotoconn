@@ -133,7 +133,9 @@ export interface HttpCheckOptions {
  * status is 2xx or 3xx. The latency includes connecting through the carrier chain.
  */
 export function http_check(options: HttpCheckOptions): HealthCheck {
-  const host = options.target.domain ?? options.target.ip?.toString() ?? "";
+  const { domain, ip, port } = options.target;
+  const name = domain ?? (ip?.version === 6 ? `[${ip.toString()}]` : String(ip));
+  const host = port === 80 ? name : `${name}:${port}`;
   const request = ascii(
     `HEAD ${options.path ?? "/generate_204"} HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`,
   );
@@ -256,7 +258,8 @@ function checked(
   const check = async () => {
     const round = ++rounds;
     const checked = members;
-    const results = await Promise.allSettled(checked.map((member) => options.check(member)));
+    // A check that throws instead of rejecting fails only its own member.
+    const results = await Promise.allSettled(checked.map(async (member) => options.check(member)));
     // A later round or an update makes these measurements stale.
     if (round !== rounds || checked !== members) return;
 
