@@ -178,16 +178,19 @@ impl Network {
         })
     }
 
-    pub async fn wait(&self) -> Result<Shutdown, Error> {
-        self.scope.wait().await;
+    /// Wait for inbound work and for `policy`, whose calls may still use outbound
+    /// connections, then close those connections.
+    pub async fn wait<T>(&self, policy: impl Future<Output = T>) -> (T, Result<Shutdown, Error>) {
+        let (policy, ()) = tokio::join!(policy, self.scope.wait());
         self.outbound_scope.close();
         self.outbound_scope.wait().await;
 
-        match self.failure.borrow().as_ref() {
+        let network = match self.failure.borrow().as_ref() {
             Some(error) => Err(Error::Network(error.clone())),
             None if self.force.is_cancelled() => Ok(Shutdown::TimedOut),
             None => Ok(Shutdown::Drained),
-        }
+        };
+        (policy, network)
     }
 }
 

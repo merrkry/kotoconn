@@ -305,9 +305,9 @@ impl Daemon {
 
     /// Also reports worker and inbound failures before a shutdown request.
     pub async fn wait(&self) -> Result<Shutdown, Error> {
-        // Wait for both sides so network sessions can drain while the policy
-        // worker finishes its outstanding handler calls. An inbound failure has
-        // already started the shutdown, so only a failed worker stops the network.
+        // Network sessions drain while the policy worker finishes its outstanding
+        // handler calls. An inbound failure has already started the shutdown, so
+        // only a failed worker stops the network.
         let policy = async {
             let result = self.worker.wait().await;
             if result.is_err() {
@@ -316,7 +316,7 @@ impl Daemon {
             }
             result
         };
-        let (policy, network) = tokio::join!(policy, self.network.wait());
+        let (policy, network) = self.network.wait(policy).await;
 
         let (policy, network) = (policy?, network?);
         Ok(

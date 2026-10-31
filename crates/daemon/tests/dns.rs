@@ -639,3 +639,39 @@ async fn service_resolve_answers_resolve_handlers_and_dialer_server_names() -> R
     gateway.shutdown().await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_keeps_outbound_connections_for_pending_policy_calls() -> Result<()> {
+    let upstream = TcpListener::bind("127.0.0.1:0").await?;
+    let address = upstream.local_addr()?;
+    let daemon = start(format!(r#"
+        import {{kotoconn as k}} from '@kotoconn/bindings';
+        import {{dns_service}} from '@kotoconn/api';
+        const unused = k.resolve_handler(() => []);
+        const direct = k.dialer({{carrier: k.host_network({{}}), outbound: {{resolve_handler: unused, implementation: k.direct_outbound({{}})}}}});
+        const service = dns_service({{dialer: direct, upstream: {{protocol: 'tcp', server: {server}}}, timeout: k.timeout(30000)}});
+        k.resolve_handler(service.resolve);
+    "#, server = ip_endpoint(address))).await?;
+    let policy = daemon.policy().clone();
+    let pending = tokio::spawn(async move {
+        policy
+            .resolve(
+                ResolveHandlerId(NonZeroU64::new(2).unwrap()),
+                "pending.example".into(),
+            )
+            .await
+    });
+    let (mut stream, _) = tokio::time::timeout(LIMIT, upstream.accept()).await??;
+    // Both questions are now accepted policy work waiting on this TCP connection.
+    tokio::time::timeout(LIMIT, read_message(&mut stream)).await??;
+    tokio::time::timeout(LIMIT, read_message(&mut stream)).await??;
+    daemon.stop();
+    let (shutdown, result) =
+        tokio::time::timeout(LIMIT, async { tokio::join!(daemon.wait(), pending) }).await?;
+    assert_eq!(
+        shutdown?,
+        Shutdown::TimedOut,
+        "pending query was cancelled early: {result:?}"
+    );
+    Ok(())
+}
