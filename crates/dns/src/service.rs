@@ -28,6 +28,8 @@ pub struct Service {
     connections: [Mutex<Option<Connection>>; 2],
     generation: std::sync::atomic::AtomicU64,
     cache: Option<ResponseCache>,
+    /// Whether truncated UDP responses are retried over TCP through the same carrier.
+    tcp_fallback: bool,
 }
 
 impl Service {
@@ -37,9 +39,14 @@ impl Service {
             config.upstream.server.port() != 0,
             "DNS upstream port must be positive"
         );
-        carrier
-            .capabilities()
-            .require_for(config.upstream.protocol, &target(config.upstream.server))?;
+        let capabilities = carrier.capabilities();
+        let server = target(config.upstream.server);
+        capabilities.require_for(config.upstream.protocol, &server)?;
+        // Without TCP, a truncated answer reaches the client, which can retry over TCP itself.
+        let tcp_fallback = config.upstream.protocol == TransportProtocol::Udp
+            && capabilities
+                .require_for(TransportProtocol::Tcp, &server)
+                .is_ok();
 
         let cache = (config.cache_capacity > 0).then(|| ResponseCache::new(config.cache_capacity));
         Ok(Self {
@@ -52,6 +59,7 @@ impl Service {
             connections: [Mutex::new(None), Mutex::new(None)],
             generation: std::sync::atomic::AtomicU64::new(0),
             cache,
+            tcp_fallback,
         })
     }
 
@@ -90,7 +98,7 @@ impl Service {
         let mut response = self
             .exchange(request.clone(), self.config.upstream.protocol, deadline)
             .await?;
-        if response.metadata.truncation && self.config.upstream.protocol == TransportProtocol::Udp {
+        if response.metadata.truncation && self.tcp_fallback {
             response = self
                 .exchange(request.clone(), TransportProtocol::Tcp, deadline)
                 .await?;

@@ -32,8 +32,9 @@ k.dns_listener({
 
 `dialer` is an existing Kotoconn dialer reference. Every upstream connection uses
 that dialer. The upstream protocol is independent of the listener protocols.
-UDP upstreams retry truncated responses over TCP through the same dialer, which
-must support TCP for that fallback to succeed.
+UDP upstreams retry truncated responses over TCP through the same dialer. When
+the dialer cannot carry TCP to the upstream, the truncated response is returned
+as is, so the client can retry over TCP itself.
 Closed pooled TCP connections are re-established once within the same query
 deadline. Timeouts and DNS error responses do not trigger that retry.
 
