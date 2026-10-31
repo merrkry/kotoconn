@@ -1,5 +1,6 @@
 use crate::api::{Optional, Parameter, Void, api};
 use crate::handler::{Handler, Hook};
+use crate::log::LogLevel;
 use crate::process::{ExecOptions, ExecResult};
 use crate::{data::*, dns::*, native::*};
 use kotoconn_config as config;
@@ -331,6 +332,11 @@ api! {
 
         fn response_bytes(self, response: Response) -> Vec<u8> {
             response.value.to_vec().map_err(|e| invalid(e.to_string()))
+        }
+
+        fn log(self, level: LogLevel, message: String) -> Void {
+            crate::log::log(level, &message);
+            Ok(Void)
         }
 
         fn on_shutdown(self, handler: Hook<'js>) -> Void {

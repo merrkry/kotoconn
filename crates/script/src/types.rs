@@ -77,6 +77,7 @@ pub(crate) fn declarations() -> String {
         HostNetwork::decl(&cfg),
         HostNetworkConfig::decl(&cfg),
         crate::handler::Handler::<(), ()>::decl(&cfg),
+        crate::log::LogLevel::decl(&cfg),
         crate::process::ExecOptions::decl(&cfg),
         crate::process::ExecResult::decl(&cfg),
     ];

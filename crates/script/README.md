@@ -18,7 +18,9 @@ names, compare labels without regard to case and ignore an optional trailing roo
 dot. A leading dot, an empty name or a malformed name raises an error. Exact,
 keyword and regex matching use JavaScript's existing string and regex methods.
 
-## Timers, subprocesses and shutdown hooks
+## Logging, timers, subprocesses and shutdown hooks
+
+`kotoconn.log(level, message)` emits a daemon log event at `error`, `warn`, `info`, `debug` or `trace` with the `policy` target, inside the span of the policy call that logs it.
 
 `kotoconn.sleep(timeout)` resolves after the timeout. Once shutdown starts, pending and later sleeps reject, so scheduled work such as a refresh loop cannot hold shutdown open. Catch the rejection to end the loop quietly.
 

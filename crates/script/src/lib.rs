@@ -6,6 +6,7 @@ mod dns;
 mod handler;
 mod host;
 mod loader;
+mod log;
 mod native;
 mod process;
 mod task;
