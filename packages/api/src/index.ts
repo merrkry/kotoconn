@@ -357,8 +357,16 @@ export async function subscription(options: SubscriptionOptions): Promise<Subscr
     if (next.size === 0) throw new Error("subscription has no usable dialers");
 
     const removed = [...dialers].filter(([key]) => !next.has(key));
+    try {
+      options.update([...next.values()]);
+    } catch (error) {
+      // Routing kept the current dialers, so the new ones were never used.
+      for (const [key, dialer] of next) {
+        if (!dialers.has(key)) dialer.close();
+      }
+      throw error;
+    }
     dialers = next;
-    options.update([...next.values()]);
     for (const [key, dialer] of removed) {
       try {
         dialer.drain({ timeout: options.drain });
@@ -447,7 +455,9 @@ export async function auto_route(options: AutoRouteOptions): Promise<void> {
   };
 
   // Registered first, so a startup that fails later still removes the routes.
+  let stopping = false;
   k.on_shutdown(async () => {
+    stopping = true;
     if (options.drain_first ?? true) {
       options.inbound.drain({ timeout: options.drain ?? k.timeout(5000) });
       await options.inbound.wait();
@@ -468,6 +478,8 @@ export async function auto_route(options: AutoRouteOptions): Promise<void> {
     await remove();
     throw error;
   }
+  // Shutdown may have removed the routes while these commands still ran.
+  if (stopping) await remove();
 }
 
 async function ip(argv: string[]): Promise<void> {

@@ -180,6 +180,8 @@ pub async fn serve_stream(
             let length = u16::try_from(response.len()).context("DNS response too long")?;
             stream.write_all(&length.to_be_bytes()).await?;
             stream.write_all(&response).await?;
+            // Buffering streams would hold the answer while the client waits for it.
+            stream.flush().await?;
         }
     }
 
@@ -418,6 +420,112 @@ mod tests {
         ) -> Poll<std::io::Result<()>> {
             self.shut_down.store(true, Ordering::Release);
             Pin::new(&mut self.stream).poll_shutdown(cx)
+        }
+    }
+
+    /// Delivers written bytes only when flushed, like a framed protocol stream.
+    struct Buffering<S> {
+        stream: S,
+        pending: Vec<u8>,
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for Buffering<S> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.stream).poll_read(cx, buffer)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for Buffering<S> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.pending.extend_from_slice(bytes);
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            let this = &mut *self;
+            while !this.pending.is_empty() {
+                let written =
+                    std::task::ready!(Pin::new(&mut this.stream).poll_write(cx, &this.pending))?;
+                this.pending.drain(..written);
+            }
+            Pin::new(&mut this.stream).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            std::task::ready!(self.as_mut().poll_flush(cx))?;
+            Pin::new(&mut self.stream).poll_shutdown(cx)
+        }
+    }
+
+    struct Echo;
+
+    impl Handler for Echo {
+        fn handle(
+            &self,
+            request: DnsRequest,
+            _: DnsRequestInfo,
+        ) -> BoxFuture<'_, Result<DnsHandlerResult>> {
+            Box::pin(async move {
+                let (mut message, _) = request.into_parts();
+                message.metadata.message_type = MessageType::Response;
+                Ok(DnsHandlerResult::Response(
+                    hickory_server::proto::op::DnsResponse::from_message(message)?,
+                ))
+            })
+        }
+    }
+
+    // The client waits for each answer before it sends the next query.
+    #[tokio::test]
+    async fn each_answer_is_delivered_before_the_next_query_is_read() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let responder = Responder::new(InboundId(std::num::NonZeroU64::MIN), Arc::new(Echo));
+        let server = Buffering {
+            stream: server,
+            pending: Vec::new(),
+        };
+        let stopping = CancellationToken::new();
+        let serving = serve_stream(
+            server,
+            "127.0.0.1:53".parse().unwrap(),
+            &responder,
+            &stopping,
+        );
+        tokio::pin!(serving);
+
+        let mut query = Message::query();
+        query.metadata.id = 7;
+        query.queries.push(hickory_server::proto::op::Query::query(
+            "example.".parse().unwrap(),
+            RecordType::A,
+        ));
+        let query = query.to_vec().unwrap();
+        let exchange = async {
+            client
+                .write_u16(u16::try_from(query.len()).unwrap())
+                .await
+                .unwrap();
+            client.write_all(&query).await.unwrap();
+            let length = client.read_u16().await.unwrap();
+            let mut answer = vec![0; usize::from(length)];
+            client.read_exact(&mut answer).await.unwrap();
+            Message::from_vec(&answer).unwrap()
+        };
+
+        tokio::select! {
+            result = &mut serving => panic!("server stopped early: {result:?}"),
+            answer = exchange => assert_eq!(answer.metadata.id, 7),
         }
     }
 

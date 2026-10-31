@@ -57,8 +57,10 @@ Requests expose the routing inbound, the client source and the protocol, like
 listener requests.
 
 ```ts
-routing_handler: (flow) =>
-  flow.dest.port === 53 ? k.route_dns(service.handler) : k.route(dialer, flow.dest),
+routing_handler: (flow) => {
+  if (flow.dest.port === 53) return k.route_dns(service.handler);
+  return flow.protocol === "udp" ? k.route_udp(dialer) : k.route(dialer, flow.dest);
+},
 ```
 
 ## Resolving names

@@ -5,6 +5,78 @@ use kotoconn_script::Script;
 use resources::{Ending, load};
 use std::collections::HashMap;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rejected_subscription_update_keeps_the_current_dialers() {
+    let result = evaluate(r#"
+        import { kotoconn as k } from '@kotoconn/bindings';
+        import { subscription } from '@kotoconn/api';
+        const config = {carrier: k.host_network({}), outbound: {
+            resolve_handler: () => [], implementation: k.direct_outbound({}),
+        }};
+        let entries = new Map([['a', config]]);
+        let reject = false;
+        const subscribed = await subscription({
+            load: async () => entries, interval: k.timeout(3600000), drain: k.timeout(1000),
+            update: () => { if (reject) throw Error('consumer could not apply update'); },
+        });
+        const [original] = subscribed.dialers;
+        entries = new Map([['b', config]]);
+        reject = true;
+        try { await subscribed.refresh(); } catch {}
+        subscribed.close();
+        if (!subscribed.dialers[0].equals(original)) throw Error('failed update replaced current dialers');
+    "#).await;
+    assert!(result.is_ok(), "{}", result.err().unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_removes_routes_that_an_installation_adds_meanwhile() {
+    let (script, recorder) = load(r#"
+        import { kotoconn as k } from '@kotoconn/bindings';
+        import { auto_route } from '@kotoconn/api';
+        let release;
+        let entered;
+        const installing = new Promise(resolve => { entered = resolve; });
+        const resume = new Promise(resolve => { release = resolve; });
+        const rules = new Set();
+        // Hooks run newest first, so the blocked command finishes after the preset's cleanup.
+        k.on_shutdown(() => release());
+        k.exec = async argv => {
+            const [, family, kind, operation] = argv;
+            if (kind === 'rule') {
+                const priority = argv[5];
+                const key = `${family}/${priority}`;
+                if (operation === 'del') {
+                    return {status: rules.delete(key) ? 0 : 2, stdout: '', stderr: ''};
+                }
+                if (family === '-6' && priority === '9002') {
+                    entered();
+                    await resume;
+                }
+                rules.add(key);
+            }
+            return {status: 0, stdout: '', stderr: ''};
+        };
+        await k.dialer({carrier: k.host_network({}), outbound: {
+            implementation: k.direct_outbound({}),
+            resolve_handler: () => {
+                if (rules.size !== 0) throw Error(`installation added rules after cleanup: ${[...rules]}`);
+                return [];
+            },
+        }});
+        auto_route({
+            interface: 'testtun0', mark: 8226,
+            inbound: {drain() {}, async wait() {}},
+        });
+        await installing;
+    "#).await;
+
+    script.shutdown().await.unwrap();
+    script.idle().await;
+    let result = script.resolve(&recorder.resolve_handler(), "check").await;
+    assert!(result.is_ok(), "{}", result.err().unwrap());
+}
+
 async fn evaluate(source: &str) -> Result<Script, kotoconn_script::Error> {
     resources::start(HashMap::from([("main.ts".to_owned(), source.to_owned())]))
         .await
@@ -641,4 +713,37 @@ async fn subscriptions_create_new_dialers_before_draining_removed_ones() {
     for kept in [1, 3, 4] {
         assert_eq!(recorder.ended(id(kept)), None);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_auto_route_installation_removes_what_it_added() {
+    evaluate(
+        r#"
+        import { kotoconn as k } from '@kotoconn/bindings';
+        import { auto_route } from '@kotoconn/api';
+        // Rules and routes the recorded `ip` commands leave, as family/kind/priority keys.
+        const installed = new Set();
+        k.exec = async argv => {
+            const [, family, kind, operation] = argv;
+            const key = `${family}/${kind}/${kind === 'rule' ? argv[5] : 'default'}`;
+            if (operation === 'del' || operation === 'flush') {
+                return {status: installed.delete(key) ? 0 : 2, stdout: '', stderr: ''};
+            }
+            // IPv6 is unavailable.
+            if (family === '-6') return {status: 2, stdout: '', stderr: 'IPv6 is disabled'};
+            installed.add(key);
+            return {status: 0, stdout: '', stderr: ''};
+        };
+
+        let rejected = false;
+        try {
+            await auto_route({interface: 'testtun0', mark: 8226, inbound: {drain() {}, async wait() {}}});
+        } catch (error) {
+            rejected = String(error).includes('IPv6 is disabled');
+        }
+        if (!rejected || installed.size !== 0) throw Error(`left ${[...installed]}`);
+    "#,
+    )
+    .await
+    .unwrap();
 }
