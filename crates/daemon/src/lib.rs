@@ -238,6 +238,7 @@ impl Daemon {
         };
         let network = network::Network::start(
             policy.clone(),
+            worker.shutdown.clone(),
             worker.stopping.clone(),
             worker.force.clone(),
         )
@@ -357,7 +358,7 @@ async fn serve(
     let mut hooks_finished = false;
 
     loop {
-        // Admission normally stops after the hooks; a fatal failure can stop it while they run.
+        // Admission normally stops after the hooks; a daemon failure or drop can stop it while they run.
         let hooks_running = shutdown.is_cancelled() && !hooks_finished;
 
         if exhausted && calls.is_empty() && !hooks_running {

@@ -33,16 +33,18 @@ pub(crate) struct Network {
 impl Network {
     pub async fn start(
         policy: Policy,
+        shutdown: CancellationToken,
         stopping: CancellationToken,
         force: CancellationToken,
     ) -> Result<Self, Error> {
-        Self::build(policy, stopping, force)
+        Self::build(policy, shutdown, stopping, force)
             .await
             .map_err(|e| Error::Config(e.to_string()))
     }
 
     async fn build(
         policy: Policy,
+        shutdown: CancellationToken,
         stopping: CancellationToken,
         force: CancellationToken,
     ) -> Result<Self> {
@@ -127,19 +129,17 @@ impl Network {
 
         for (id, server) in bound {
             let failed = failed.clone();
-            let stop = stopping.clone();
-            let control = scope.clone();
-            let outbound = outbound_scope.clone();
+            let shutdown = shutdown.clone();
             let span = tracing::info_span!("inbound", inbound_id = id.0.get());
             span.in_scope(|| {
                 scope.spawn(async move {
                     let result = server.run.await;
                     if let Err(error) = &result {
-                        tracing::error!(error = %format_args!("{error:#}"), "inbound failed");
+                        tracing::error!(error = %format_args!("{error:#}"), "inbound failed; shutting down");
                         failed.send_replace(Some(format!("{error:#}")));
-                        stop.cancel();
-                        control.close();
-                        outbound.close();
+                        // A full shutdown runs the policy hooks, which may need to
+                        // undo host configuration that depended on this inbound.
+                        shutdown.cancel();
                     }
                     result
                 })
