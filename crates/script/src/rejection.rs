@@ -12,8 +12,14 @@ struct Rejections {
     // Promise identities rather than references, so tracking never keeps a promise alive.
     // A collected promise's identity can be reused; only its newest entry can belong
     // to a live promise, so a handled notification removes that one.
-    pending: RefCell<Vec<(u64, String)>>,
+    pending: RefCell<Vec<Rejection>>,
     scheduled: Cell<bool>,
+}
+
+struct Rejection {
+    promise: u64,
+    /// `None` while the reason is being described.
+    reason: Option<String>,
 }
 
 pub(crate) fn tracker() -> RejectionTracker {
@@ -24,15 +30,28 @@ pub(crate) fn tracker() -> RejectionTracker {
 
         if handled {
             let mut pending = rejections.pending.borrow_mut();
-            if let Some(index) = pending.iter().rposition(|(pending, _)| *pending == id) {
+            if let Some(index) = pending.iter().rposition(|entry| entry.promise == id) {
                 pending.remove(index);
             }
             return;
         }
 
-        // Describing can run JS, such as a `toString` that rejects another promise.
+        // Describing can run JS, such as a `toString` that rejects another promise or
+        // handles this one, so the entry exists before and is not borrowed during it.
+        rejections.pending.borrow_mut().push(Rejection {
+            promise: id,
+            reason: None,
+        });
         let reason = describe(&ctx, reason);
-        rejections.pending.borrow_mut().push((id, reason));
+        if let Some(entry) = rejections
+            .pending
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.promise == id && entry.reason.is_none())
+        {
+            entry.reason = Some(reason);
+        }
 
         if !rejections.scheduled.replace(true) {
             let rejections = rejections.clone();
@@ -42,7 +61,9 @@ pub(crate) fn tracker() -> RejectionTracker {
                 while jobs.execute_pending_job() {}
 
                 rejections.scheduled.set(false);
-                for (_, reason) in rejections.pending.take() {
+                for entry in rejections.pending.take() {
+                    debug_assert!(entry.reason.is_some(), "described before jobs run");
+                    let reason = entry.reason.unwrap_or_default();
                     tracing::warn!(target: "policy", %reason, "unhandled promise rejection");
                 }
             });

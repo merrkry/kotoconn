@@ -87,7 +87,7 @@ async fn policy_logs_and_reports_rejections_left_unhandled_after_queued_jobs() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rejections_raised_while_describing_a_reason_are_reported() {
+async fn describing_a_reason_can_reject_or_handle_promises() {
     let events = Events::default();
     let _subscriber =
         tracing::subscriber::set_default(tracing_subscriber::registry().with(events.clone()));
@@ -102,6 +102,15 @@ async fn rejections_raised_while_describing_a_reason_are_reported() {
                     toString() {
                         Promise.reject('nested rejection');
                         return 'outer rejection';
+                    },
+                });
+
+                let reject;
+                const handled = new Promise((_, fail) => reject = fail);
+                reject({
+                    toString() {
+                        handled.catch(() => {});
+                        return 'handled rejection';
                     },
                 });
                 return [];
@@ -124,10 +133,8 @@ async fn rejections_raised_while_describing_a_reason_are_reported() {
     daemon.shutdown().await.unwrap();
 
     let events = events.0.lock().unwrap();
-    for reason in ["nested rejection", "outer rejection"] {
-        assert!(
-            events.iter().any(|(_, fields)| fields.contains(reason)),
-            "{reason} was not reported: {events:?}",
-        );
-    }
+    let reported = |reason| events.iter().any(|(_, fields)| fields.contains(reason));
+    assert!(reported("nested rejection"), "{events:?}");
+    assert!(reported("outer rejection"), "{events:?}");
+    assert!(!reported("handled rejection"), "{events:?}");
 }
