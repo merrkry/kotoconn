@@ -176,6 +176,40 @@ async fn shutdown_hooks_run_before_admission_closes_and_release_pending_sleeps()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_hooks_run_when_an_inbound_fails_to_bind() {
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = occupied.local_addr().unwrap().port();
+    let directory = tempfile::tempdir().unwrap();
+    let cleaned = directory.path().join("cleaned");
+    let source = format!(
+        r#"
+        import {{ kotoconn as k }} from '@kotoconn/bindings';
+        k.on_shutdown(() => k.exec(['sh', '-c', 'cat > "$1"', 'sh', {path:?}], {{ input: 'cleaned' }}));
+        k.inbound({{
+            implementation: k.socks5_inbound({{ listen: {{ address: k.ip('127.0.0.1'), port: {port} }} }}),
+            routing_handler: k.routing_handler(() => null),
+            udp_idle_timeout: k.timeout(1000),
+        }});
+    "#,
+        path = cleaned.to_str().unwrap(),
+    );
+
+    let started = tokio::time::timeout(
+        TIMEOUT,
+        Daemon::start_with_sources(
+            "main.ts".into(),
+            HashMap::from([("main.ts".into(), source)]),
+            TIMEOUT,
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert!(started.is_err());
+    assert_eq!(std::fs::read_to_string(&cleaned).unwrap(), "cleaned");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deadline_cancels_unsettled_promises_and_interrupts_running_js() {
     for body in ["await new Promise(() => {});", "while (true) {}"] {
         let source = format!(

@@ -5,14 +5,16 @@ mod udp;
 
 use crate::{Error, Policy, Shutdown};
 use anyhow::{Context, Result, ensure};
-use futures_util::future::BoxFuture;
+use futures_util::{FutureExt, future::BoxFuture};
 use kotoconn_config::*;
 use kotoconn_outbounds::{Clients, System};
 use kotoconn_protocol::{self as p, *};
 pub use sessions::{SessionHandle, SessionId};
 use std::{
+    any::Any,
     collections::{HashMap, HashSet},
     net::SocketAddr,
+    panic::AssertUnwindSafe,
     sync::Arc,
 };
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
@@ -133,7 +135,11 @@ impl Network {
             let span = tracing::info_span!("inbound", inbound_id = id.0.get());
             span.in_scope(|| {
                 scope.spawn(async move {
-                    let result = server.run.await;
+                    // A panic ends the inbound like an error instead of silently stopping it.
+                    let result = match AssertUnwindSafe(server.run).catch_unwind().await {
+                        Ok(result) => result,
+                        Err(panic) => Err(anyhow::anyhow!("inbound panicked: {}", panic_message(&*panic))),
+                    };
                     if let Err(error) = &result {
                         tracing::error!(error = %format_args!("{error:#}"), "inbound failed; shutting down");
                         failed.send_replace(Some(format!("{error:#}")));
@@ -182,6 +188,16 @@ impl Network {
             None if self.force.is_cancelled() => Ok(Shutdown::TimedOut),
             None => Ok(Shutdown::Drained),
         }
+    }
+}
+
+fn panic_message(panic: &(dyn Any + Send)) -> &str {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        message
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message
+    } else {
+        "unknown payload"
     }
 }
 

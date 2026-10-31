@@ -236,13 +236,24 @@ impl Daemon {
             stopping: worker.stopping.clone(),
             config,
         };
-        let network = network::Network::start(
+        let network = match network::Network::start(
             policy.clone(),
             worker.shutdown.clone(),
             worker.stopping.clone(),
             worker.force.clone(),
         )
-        .await?;
+        .await
+        {
+            Ok(network) => network,
+            Err(error) => {
+                // Evaluation may already have changed host configuration that its hooks undo.
+                worker.shutdown.cancel();
+                if let Err(hooks) = worker.wait().await {
+                    tracing::warn!(error = %hooks, "policy shutdown after a startup failure");
+                }
+                return Err(error);
+            }
+        };
 
         Ok(Self {
             policy,
