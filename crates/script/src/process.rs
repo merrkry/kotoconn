@@ -110,7 +110,8 @@ async fn read(mut pipe: impl AsyncRead + Unpin) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Kills the process group of a spawned program when dropped, unless released.
+/// Kills the process group of a spawned program when dropped before the program
+/// exits. Release it once the program is reaped, after which its ID can be reused.
 struct ProcessGroup(Option<u32>);
 
 impl ProcessGroup {
@@ -126,14 +127,21 @@ impl ProcessGroup {
 impl Drop for ProcessGroup {
     #[cfg(unix)]
     fn drop(&mut self) {
-        use rustix::process::{Pid, Signal, kill_process_group};
+        use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
 
-        // A process ID is not reused while it names a live group member, and an
-        // empty group makes the signal fail harmlessly.
-        let Some(group) = self.0.and_then(|id| Pid::from_raw(id.try_into().ok()?)) else {
+        let Some(leader) = self.0.and_then(|id| Pid::from_raw(id.try_into().ok()?)) else {
             return;
         };
-        let _ = kill_process_group(group, Signal::KILL);
+
+        // The unreaped program still holds its ID, which also names the group. A
+        // program that exited before anyone observed it leaves its processes alone.
+        let exited = waitid(
+            WaitId::Pid(leader),
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+        );
+        if !matches!(exited, Ok(Some(_))) {
+            let _ = kill_process_group(leader, Signal::KILL);
+        }
     }
 
     #[cfg(not(unix))]
@@ -160,4 +168,71 @@ fn signal(status: std::process::ExitStatus) -> Option<i32> {
 #[cfg(not(unix))]
 fn signal(_: std::process::ExitStatus) -> Option<i32> {
     None
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelling_after_an_unobserved_exit_leaves_its_processes_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("fifo");
+        let pid = directory.path().join("pid");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let mut running = Box::pin(exec(
+            vec![
+                "sh".into(),
+                "-c".into(),
+                r#"cat "$1" > /dev/null & echo $$ > "$2.tmp" && mv "$2.tmp" "$2""#.into(),
+                "sh".into(),
+                fifo.to_str().unwrap().into(),
+                pid.to_str().unwrap().into(),
+            ],
+            None,
+            None,
+        ));
+        // Spawn the program, then stop polling so nothing observes its exit.
+        assert!(poll_once(running.as_mut()).is_pending());
+
+        let pid = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid)
+                .ok()
+                .and_then(|pid| pid.trim().parse::<u32>().ok())
+            {
+                break pid;
+            }
+            tokio::task::yield_now().await;
+        };
+        while !std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .unwrap()
+            .rsplit_once(") ")
+            .is_some_and(|(_, rest)| rest.starts_with('Z'))
+        {
+            tokio::task::yield_now().await;
+        }
+        drop(running);
+
+        // Opening the FIFO for writing completes only while the background reader lives.
+        let (opened, written) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || opened.send(std::fs::write(fifo, "alive")));
+        tokio::time::timeout(Duration::from_secs(3), written)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    fn poll_once<F: std::future::Future>(
+        future: std::pin::Pin<&mut F>,
+    ) -> std::task::Poll<F::Output> {
+        future.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+    }
 }
