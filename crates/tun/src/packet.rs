@@ -106,6 +106,8 @@ fn checksums(verified: bool) -> ChecksumCapabilities {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct FragmentKey {
+    // IPv6 identifies a datagram without its next header, so conflicting fragments
+    // must poison one assembly instead of starting separate ones.
     ipv4_protocol: Option<IpProtocol>,
     source: IpAddress,
     destination: IpAddress,

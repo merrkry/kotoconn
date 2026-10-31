@@ -134,7 +134,11 @@ pub struct Daemon {
     network: network::Network,
 }
 
+// Shutdown phases: `shutdown` starts the deadline and runs policy shutdown hooks
+// while admission stays open; the worker then cancels `stopping`, which closes
+// admission and drains the remaining work; `force` cancels whatever is left.
 struct Worker {
+    shutdown: CancellationToken,
     stopping: CancellationToken,
     force: CancellationToken,
     finished: watch::Receiver<Option<Result<Shutdown, Error>>>,
@@ -166,6 +170,7 @@ impl Daemon {
             ));
         }
 
+        let shutdown = CancellationToken::new();
         let stopping = CancellationToken::new();
         let force = CancellationToken::new();
         let (commands, receiver) = mpsc::channel(CAPACITY);
@@ -173,10 +178,10 @@ impl Daemon {
         let (finished, completion) = watch::channel(None);
 
         let deadline = tokio::spawn({
-            let stopping = stopping.clone();
+            let shutdown = shutdown.clone();
             let force = force.clone();
             async move {
-                stopping.cancelled().await;
+                shutdown.cancelled().await;
                 tokio::time::sleep(shutdown_timeout).await;
                 force.cancel();
             }
@@ -184,6 +189,7 @@ impl Daemon {
 
         // The guard also stops startup if its caller drops the start future.
         let worker = Worker {
+            shutdown: shutdown.clone(),
             stopping: stopping.clone(),
             force: force.clone(),
             finished: completion,
@@ -213,7 +219,7 @@ impl Daemon {
                     if ready.send(config).is_err() {
                         return Ok(Shutdown::Drained);
                     }
-                    serve(&script, receiver, stopping, force).await
+                    serve(&script, receiver, shutdown, stopping, force).await
                 });
                 // The worker drops all JS state before reporting completion.
                 let _ = finished.send(Some(result));
@@ -230,12 +236,24 @@ impl Daemon {
             stopping: worker.stopping.clone(),
             config,
         };
-        let network = network::Network::start(
+        let network = match network::Network::start(
             policy.clone(),
+            worker.shutdown.clone(),
             worker.stopping.clone(),
             worker.force.clone(),
         )
-        .await?;
+        .await
+        {
+            Ok(network) => network,
+            Err(error) => {
+                // Evaluation may already have changed host configuration that its hooks undo.
+                worker.shutdown.cancel();
+                if let Err(hooks) = worker.wait().await {
+                    tracing::warn!(error = %hooks, "policy shutdown after a startup failure");
+                }
+                return Err(error);
+            }
+        };
 
         Ok(Self {
             policy,
@@ -273,9 +291,10 @@ impl Daemon {
         &self.policy
     }
 
-    /// Request admission shutdown without waiting for accepted sessions to drain.
+    /// Request shutdown without waiting for it. Policy shutdown hooks run first;
+    /// admission then stops and accepted work drains.
     pub fn stop(&self) {
-        self.policy.stopping.cancel();
+        self.worker.shutdown.cancel();
     }
 
     /// Idempotent; cancellation of this future does not cancel the shutdown request.
@@ -284,24 +303,29 @@ impl Daemon {
         self.wait().await
     }
 
-    /// Also reports worker failures before a shutdown request.
+    /// Also reports worker and inbound failures before a shutdown request.
     pub async fn wait(&self) -> Result<Shutdown, Error> {
-        // Wait for both sides so network sessions can drain while the policy
-        // worker finishes its outstanding handler calls.
-        match tokio::try_join!(self.worker.wait(), self.network.wait()) {
-            Ok((policy, network)) => Ok(
-                if policy == Shutdown::TimedOut || network == Shutdown::TimedOut {
-                    Shutdown::TimedOut
-                } else {
-                    Shutdown::Drained
-                },
-            ),
-            Err(error) => {
+        // Network sessions drain while the policy worker finishes its outstanding
+        // handler calls. An inbound failure has already started the shutdown, so
+        // only a failed worker stops the network.
+        let policy = async {
+            let result = self.worker.wait().await;
+            if result.is_err() {
                 self.policy.stopping.cancel();
                 self.worker.force.cancel();
-                Err(error)
             }
-        }
+            result
+        };
+        let (policy, network) = self.network.wait(policy).await;
+
+        let (policy, network) = (policy?, network?);
+        Ok(
+            if policy == Shutdown::TimedOut || network == Shutdown::TimedOut {
+                Shutdown::TimedOut
+            } else {
+                Shutdown::Drained
+            },
+        )
     }
 }
 
@@ -312,12 +336,14 @@ impl Worker {
             .wait_for(|result| result.is_some())
             .await
             .map_err(|_| Error::Worker("thread exited without a result".into()))?;
+        // SAFETY: wait_for returns the value its predicate accepted, so it is Some.
         result.as_ref().expect("completion was checked").clone()
     }
 }
 
 impl Drop for Worker {
     fn drop(&mut self) {
+        self.shutdown.cancel();
         self.stopping.cancel();
         self.force.cancel();
     }
@@ -326,6 +352,7 @@ impl Drop for Worker {
 async fn serve(
     script: &Script,
     mut commands: mpsc::Receiver<(tracing::Span, Command)>,
+    shutdown: CancellationToken,
     stopping: CancellationToken,
     force: CancellationToken,
 ) -> Result<Shutdown, Error> {
@@ -334,8 +361,23 @@ async fn serve(
     let driver = script.drive();
     tokio::pin!(driver);
 
+    // Hooks run while calls are still served, so they can rely on policy handlers
+    // and decide what to stop before the daemon drains the rest.
+    let hooks = async {
+        shutdown.cancelled().await;
+        tracing::debug!("running policy shutdown hooks");
+        let result = script.shutdown().await;
+        stopping.cancel();
+        result
+    };
+    tokio::pin!(hooks);
+    let mut hooks_finished = false;
+
     loop {
-        if exhausted && calls.is_empty() {
+        // Admission normally stops after the hooks; a daemon failure or drop can stop it while they run.
+        let hooks_running = shutdown.is_cancelled() && !hooks_finished;
+
+        if exhausted && calls.is_empty() && !hooks_running {
             // Include native promises started without awaiting them in the handler.
             return tokio::select! {
                 biased;
@@ -347,6 +389,10 @@ async fn serve(
             biased;
             _ = force.cancelled() => {
                 return Ok(Shutdown::TimedOut);
+            }
+            result = &mut hooks, if !hooks_finished => {
+                hooks_finished = true;
+                result?;
             }
             _ = stopping.cancelled(), if !commands.is_closed() => {
                 commands.close();

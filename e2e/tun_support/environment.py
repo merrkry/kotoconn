@@ -241,7 +241,7 @@ def configure_routes():
 def policy(path: Path, mtu: int, idle_ms: int = 30000, outbound: str = "direct"):
     path.write_text(f"""import {{ kotoconn as k }} from '@kotoconn/bindings';
 const resolver = k.resolve_handler(name => k.lookup(name));
-const direct = k.dialer({{dialer: null, outbound: {{
+const direct = k.dialer({{carrier: k.host_network({{}}), outbound: {{
     resolve_handler: resolver, implementation: k.direct_outbound({{}})
 }}}});
 const routing = k.routing_handler(flow => flow.protocol === 'udp'
@@ -260,7 +260,7 @@ k.inbound({{implementation: k.tun_inbound({{name: '{NAME}', mtu: {mtu}, addresse
     }}),
     routing_handler: routing, udp_idle_timeout: k.timeout(30000)
 });
-const proxy = k.dialer({dialer: null, outbound: {
+const proxy = k.dialer({carrier: k.host_network({}), outbound: {
     resolve_handler: resolver, implementation: k.socks5_outbound({
         server: k.ip_target(k.ip('127.0.0.1'), 9100)
     })

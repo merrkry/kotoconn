@@ -2,10 +2,14 @@
 
 mod api;
 mod data;
+mod dns;
 mod handler;
 mod host;
 mod loader;
+mod log;
 mod native;
+mod process;
+mod rejection;
 mod task;
 mod types;
 
@@ -56,6 +60,9 @@ impl Script {
             .await;
         runtime
             .set_loader(loader::Resolver, loader::Loader(sources))
+            .await;
+        runtime
+            .set_host_promise_rejection_tracker(Some(rejection::tracker()))
             .await;
         let context = AsyncContext::full(&runtime).await.map_err(js_error)?;
 
@@ -151,12 +158,34 @@ impl Script {
             let function = get(&loader::host(&ctx)?.borrow().dns.borrow(), id.0)?;
 
             Ok(host::DnsHandler::new(function)
-                .call(native::Request {
+                .call(dns::Request {
                     value: request,
                     info,
                 })
                 .await?
                 .value)
+        })
+        .await
+    }
+
+    /// Start policy shutdown: reject pending and later sleeps, then run shutdown hooks
+    /// one at a time, newest first. A failed hook is logged and the next one still runs.
+    /// Handler calls may run concurrently, and hooks they register during this call run too.
+    pub async fn shutdown(&self) -> Result<(), Error> {
+        self.with(async |ctx| {
+            let host = loader::host(&ctx)?;
+            host.borrow().shutdown.cancel();
+
+            loop {
+                // Release the host borrow before calling JS, which may register more hooks.
+                let Some(function) = host.borrow().next_shutdown_hook() else {
+                    return Ok(());
+                };
+
+                if let Err(error) = handler::Hook::new(function).call().await.catch(&ctx) {
+                    tracing::error!(%error, "shutdown hook failed");
+                }
+            }
         })
         .await
     }

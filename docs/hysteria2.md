@@ -45,8 +45,9 @@ Set the same nonempty `obfs_password` at both ends to enable Salamander. The
 password used for HTTP/3 authentication is independent of the obfuscation key.
 Register these implementations through the usual `k.dialer` and `k.inbound`
 configuration. An outbound's carrier must provide UDP even for TCP proxying.
-A TCP-only carrier is rejected at construction. Server resolution uses the
-configured resolver; user destinations retain their domain/IP metadata.
+A TCP-only carrier is rejected at construction. The configured resolver
+resolves the server only when the carrier requires IP targets; user destinations
+retain their domain/IP metadata.
 
 ## Connections and limits
 
@@ -63,7 +64,7 @@ using the inbound `udp_idle_timeout`, with a minimum retention of one second.
 
 Quinn's endpoint and connection drivers participate in scope cancellation and
 completion. Inbound TCP acknowledges admission before routing, consistently with
-[the admission contract](adr/0005-independent-protocol-admission-and-session-execution.md).
+[the admission contract](adr/0006-independent-inbound-admission.md).
 Listener shutdown stops new admission and drains accepted TCP sessions. UDP
 sessions remain separated by association and destination.
 

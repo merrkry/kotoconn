@@ -10,7 +10,7 @@ bytes.workspace = true
 crossbeam-queue = "0.3"
 futures-util.workspace = true
 kotoconn-config.workspace = true
-tokio = { workspace = true, features = ["io-util", "net", "sync", "time", "rt"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "sync", "time", "rt"] }
 tokio-util = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 

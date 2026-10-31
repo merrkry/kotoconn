@@ -1,4 +1,4 @@
-use crate::{data::*, host, native::*};
+use crate::{data::*, dns::*, host, native::*};
 use ts_rs::TS;
 
 pub(crate) fn declarations() -> String {
@@ -27,6 +27,7 @@ pub(crate) fn declarations() -> String {
         Port::decl(&cfg),
         Mtu::decl(&cfg),
         Byte::decl(&cfg),
+        Bytes::decl(&cfg),
         Milliseconds::decl(&cfg),
         Dialer::decl(&cfg),
         Inbound::decl(&cfg),
@@ -37,6 +38,9 @@ pub(crate) fn declarations() -> String {
         DnsServiceConfig::decl(&cfg),
         DnsUpstreamConfig::decl(&cfg),
         DnsListenerConfig::decl(&cfg),
+        RecordType::decl(&cfg),
+        ResponseCode::decl(&cfg),
+        DnsRecord::decl(&cfg),
         Request::decl(&cfg),
         Response::decl(&cfg),
         Decision::decl(&cfg),
@@ -70,7 +74,13 @@ pub(crate) fn declarations() -> String {
         InboundConfig::decl(&cfg),
         OutboundConfig::decl(&cfg),
         DialerConfig::decl(&cfg),
+        CarrierConfig::decl(&cfg),
+        HostNetwork::decl(&cfg),
+        HostNetworkConfig::decl(&cfg),
         crate::handler::Handler::<(), ()>::decl(&cfg),
+        crate::log::LogLevel::decl(&cfg),
+        crate::process::ExecOptions::decl(&cfg),
+        crate::process::ExecResult::decl(&cfg),
     ];
 
     format!(

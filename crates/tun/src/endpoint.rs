@@ -51,21 +51,20 @@ pub struct ReceiveBuffer {
 
 impl ReceiveBuffer {
     pub(crate) fn publish(&mut self, len: usize) -> (Bytes, usize) {
-        // SAFETY: The completed receive initialized this prefix of the installed
-        // lease. Keep private scratch for short frames; only large frames take it.
-        let lease = self.lease.as_ref().expect("receive lease");
+        // SAFETY: Both receive paths install a lease with get_or_insert_with,
+        // receive into it, and publish only after that receive completed. The
+        // receive initialized this prefix.
+        let lease = self.lease.take().expect("receive lease");
         debug_assert!(len <= lease.as_ref().len());
+
+        // Keep private scratch for short frames; only large frames take it.
         if len < lease.as_ref().len() / 4 {
-            (
-                self.pool.copy(&lease.as_ref()[..len]),
-                len.max(256).next_power_of_two(),
-            )
+            let bytes = self.pool.copy(&lease.as_ref()[..len]);
+            self.lease = Some(lease);
+            (bytes, len.max(256).next_power_of_two())
         } else {
             let allocation_size = lease.as_ref().len().max(256).next_power_of_two();
-            (
-                self.lease.take().expect("receive lease").freeze(len),
-                allocation_size,
-            )
+            (lease.freeze(len), allocation_size)
         }
     }
 }

@@ -95,8 +95,35 @@ impl<'js> IntoJs<'js> for TransportProtocol {
 #[convert(from(config::DialerConfig), into(config::DialerConfig))]
 #[ts(as = "config::DialerConfig")]
 pub(crate) struct DialerConfig {
-    pub dialer: Option<Dialer>,
+    pub carrier: CarrierConfig,
     pub outbound: OutboundConfig,
+}
+
+#[derive(TS, StructuralConvert)]
+#[convert(from(config::CarrierConfig), into(config::CarrierConfig))]
+#[ts(as = "config::CarrierConfig")]
+pub(crate) enum CarrierConfig {
+    Dialer(Dialer),
+    Host(HostNetwork),
+}
+
+impl<'js> FromJs<'js> for CarrierConfig {
+    fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
+        if let Ok(dialer) = Dialer::from_js(ctx, value.clone()) {
+            return Ok(Self::Dialer(dialer));
+        }
+        HostNetwork::from_js(ctx, value)
+            .map(Self::Host)
+            .map_err(|_| invalid("expected a dialer or host network carrier"))
+    }
+}
+
+#[derive(FromJs, TS, StructuralConvert)]
+#[convert(from(config::HostNetworkConfig), into(config::HostNetworkConfig))]
+#[ts(as = "config::HostNetworkConfig")]
+pub(crate) struct HostNetworkConfig {
+    pub mark: Option<Mark>,
+    pub interface: Option<String>,
 }
 
 #[derive(FromJs, TS, StructuralConvert)]

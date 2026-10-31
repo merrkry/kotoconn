@@ -3,6 +3,7 @@ import type {
   Dialer,
   DnsHandler,
   DnsUpstreamConfig,
+  IpAddr,
   Request,
   Response,
   Timeout,
@@ -20,6 +21,14 @@ export interface DnsServiceOptions {
 export interface DnsService {
   readonly query: (request: Request) => Promise<Response>;
   readonly handler: DnsHandler;
+  /**
+   * A and AAAA addresses of a name and the aliases its CNAME chain reaches; records for
+   * other owners are ignored. NXDOMAIN and NODATA give no addresses; other response
+   * codes and query errors fail that query. When one query fails and the other gives
+   * addresses, they are returned and the failure is logged as a warning; otherwise a failure
+   * rejects. Usable directly as a resolve handler.
+   */
+  readonly resolve: (name: string) => Promise<IpAddr[]>;
 }
 
 /** Register one upstream service. Querying is available after configuration loads. */
@@ -41,5 +50,57 @@ export function dns_service(options: DnsServiceOptions): DnsService {
   const query = (request: Request) => k.dns_query(service, request);
   const handler: DnsHandler = async (request) => k.respond(await query(request));
 
-  return Object.freeze({ query, handler });
+  const lookup = async (name: string, type: "A" | "AAAA") => {
+    const request = k.dns_request(name, type);
+    const response = await query(request);
+    if (response.code !== "NOERROR" && response.code !== "NXDOMAIN") {
+      throw new Error(`${type} query for ${name} returned ${response.code}`);
+    }
+
+    // Addresses count only for the queried name and the aliases its CNAME chain reaches.
+    const aliases = new Map(
+      response.answers.flatMap((record) =>
+        record.type === "CNAME" ? [[record.name, record.data] as const] : [],
+      ),
+    );
+    const chain = new Set<string>();
+    for (
+      let owner: string | undefined = request.query.name;
+      owner !== undefined && !chain.has(owner);
+      owner = aliases.get(owner)
+    ) {
+      chain.add(owner);
+    }
+
+    return response.answers.flatMap((record) =>
+      (record.type === "A" || record.type === "AAAA") &&
+      record.type === type &&
+      chain.has(record.name)
+        ? [record.data]
+        : [],
+    );
+  };
+
+  const resolve = async (name: string) => {
+    const results = await Promise.allSettled([lookup(name, "A"), lookup(name, "AAAA")]);
+    const addresses = results.flatMap((result) =>
+      result.status === "fulfilled" ? result.value : [],
+    );
+    const failures = results.flatMap((result) =>
+      result.status === "rejected"
+        ? [result.reason instanceof Error ? result.reason.message : String(result.reason)]
+        : [],
+    );
+
+    if (failures.length > 0 && addresses.length === 0) {
+      throw new Error(`DNS resolution of ${name} failed: ${failures.join("; ")}`);
+    }
+
+    for (const failure of failures) {
+      k.log("warn", `DNS resolution of ${name} ignored a failure: ${failure}`);
+    }
+    return addresses;
+  };
+
+  return Object.freeze({ query, handler, resolve });
 }

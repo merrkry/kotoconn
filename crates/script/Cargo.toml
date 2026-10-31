@@ -7,18 +7,22 @@ publish.workspace = true
 [dependencies]
 derive_more = { workspace = true, features = ["from", "into"] }
 duplicate.workspace = true
-hickory-proto.workspace = true
+hickory-proto = { workspace = true, features = ["std"] }
 ipnet.workspace = true
 kotoconn-config.workspace = true
 kotoconn-typescript.workspace = true
 rquickjs = { workspace = true, features = ["macro", "loader", "futures"] }
 structural-convert.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "time"] }
 tokio-util = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 ts-rs.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["process"] }
+
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "test-util", "time"] }
 trybuild.workspace = true

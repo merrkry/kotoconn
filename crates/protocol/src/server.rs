@@ -41,6 +41,11 @@ pub trait Server: Send + Sync {
     ) -> BoxFuture<'_, Result<BoundServer>>;
 }
 
+/// Retry after other accept errors, such as descriptor exhaustion, without spinning.
+const ACCEPT_RETRY: Duration = Duration::from_secs(1);
+
+/// Accept errors never end the loop: they come from one connection or from a
+/// condition the OS can recover from, and the listener stays usable.
 pub async fn accept_loop<F, Fut>(
     listener: TcpListener,
     context: ServerContext,
@@ -59,22 +64,71 @@ where
             permit = admission.clone().acquire_owned() => permit?,
         };
 
-        tokio::select! {
+        let accepted = tokio::select! {
             biased;
             _ = context.stopping.cancelled() => return Ok(()),
             _ = context.scope.cancelled() => return Ok(()),
-            result = listener.accept() => {
-                let (stream, peer) = result?;
-                let local = stream.local_addr()?;
+            result = listener.accept() => result,
+        };
 
-                let scope = context.scope.child();
-                let work = accept(Box::pin(stream), peer, local, scope.clone());
-                let span = tracing::info_span!("connection", %peer, %local);
-                span.in_scope(|| scope.spawn(async move {
-                    let _permit = permit;
-                    work.await
-                }))?;
+        let (stream, peer) = match accepted {
+            Ok(accepted) => accepted,
+            Err(error) if is_connection_error(&error) => {
+                tracing::debug!(%error, "connection failed before accept");
+                continue;
             }
+            Err(error) => {
+                tracing::warn!(%error, "accept failed; retrying");
+                tokio::select! {
+                    biased;
+                    _ = context.stopping.cancelled() => return Ok(()),
+                    _ = context.scope.cancelled() => return Ok(()),
+                    _ = tokio::time::sleep(ACCEPT_RETRY) => continue,
+                }
+            }
+        };
+
+        // The peer can reset the connection before its address is read.
+        let local = match stream.local_addr() {
+            Ok(local) => local,
+            Err(error) => {
+                tracing::debug!(%peer, %error, "connection failed after accept");
+                continue;
+            }
+        };
+
+        let scope = context.scope.child();
+        let work = accept(Box::pin(stream), peer, local, scope.clone());
+        let span = tracing::info_span!("connection", %peer, %local);
+        let spawned = span.in_scope(|| {
+            scope.spawn(async move {
+                let _permit = permit;
+                work.await
+            })
+        });
+
+        // Spawning fails only once the inbound scope closes, which ends the loop.
+        if spawned.is_err() {
+            debug_assert!(context.scope.is_closed());
+            return Ok(());
         }
     }
+}
+
+/// Errors that belong to one pending connection. Linux also reports pending
+/// network errors of the new connection through accept.
+fn is_connection_error(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+
+    matches!(
+        error.kind(),
+        ConnectionAborted
+            | ConnectionRefused
+            | ConnectionReset
+            | Interrupted
+            | HostUnreachable
+            | NetworkDown
+            | NetworkUnreachable
+            | TimedOut
+    )
 }

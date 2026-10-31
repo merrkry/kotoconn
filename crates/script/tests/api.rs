@@ -55,7 +55,7 @@ async fn seals_registration_after_native_await_and_calls_each_handler_family() {
                 resolve: () => k.resolve_handler(() => []),
                 routing: () => k.routing_handler(() => k.reject()),
                 dns: () => k.dns_handler(() => k.drop()),
-                dialer: () => k.dialer({outbound}),
+                dialer: () => k.dialer({carrier: k.host_network({}), outbound}),
                 inbound: () => k.inbound(inbound),
             };
         "#).await;
@@ -277,14 +277,14 @@ async fn proxy_configuration_preserves_native_targets_and_optional_fields() {
         import { kotoconn as k } from '@kotoconn/bindings';
         const server = k.domain('proxy.invalid', 8443);
         const resolve = k.resolve_handler(() => []);
-        let previous = null;
+        let previous = k.host_network({mark: 0xffffffff, interface: 'eth0'});
         for (const implementation of [
             k.hysteria2_outbound({server, password: 'secret', server_name: 'server.invalid',
                 ca_certificate: 'CA', obfs_password: 'obfs'}),
             k.shadowsocks2022_outbound({server, password: 'secret'}),
             k.socks5_outbound({server}),
         ]) {
-            previous = k.dialer({dialer: previous, outbound: {resolve_handler: resolve, implementation}});
+            previous = k.dialer({carrier: previous, outbound: {resolve_handler: resolve, implementation}});
         }
         const routing = k.routing_handler(flow => k.route(previous, flow.dest));
         k.inbound({
@@ -322,7 +322,14 @@ async fn proxy_configuration_preserves_native_targets_and_optional_fields() {
             dialer.outbound.resolve_handler,
             *config.resolve_handlers.iter().next().unwrap()
         );
-        assert_eq!(dialer.dialer, NonZeroU64::new(index as u64).map(DialerId));
+        let carrier = match NonZeroU64::new(index as u64) {
+            Some(lower) => CarrierConfig::Dialer(DialerId(lower)),
+            None => CarrierConfig::Host(HostNetworkConfig {
+                mark: Some(u32::MAX),
+                interface: Some("eth0".into()),
+            }),
+        };
+        assert_eq!(dialer.carrier, carrier);
     }
 
     let inbound = config.inbounds.values().next().unwrap();
@@ -348,16 +355,13 @@ async fn proxy_configuration_preserves_native_targets_and_optional_fields() {
 }
 
 #[tokio::test]
-async fn numeric_api_arguments_reject_truncation_and_dns_packets_require_a_header() {
+async fn numeric_api_arguments_reject_truncation_and_dns_packets_require_header_bytes() {
     load(r#"
         import { kotoconn as k } from '@kotoconn/bindings';
-        const bytes = Array(12).fill(0);
-        bytes[2] = 0x80;
         for (const [convert, max] of [
             [value => k.domain('example.com', value), 65535],
             [value => k.ip_target(k.ip('::1'), value), 65535],
             [value => k.timeout(value), 4294967295],
-            [value => k.dns_response(bytes.map((byte, index) => index === 0 ? value : byte)), 255],
         ]) {
             convert(0);
             convert(max);
@@ -371,9 +375,17 @@ async fn numeric_api_arguments_reject_truncation_and_dns_packets_require_a_heade
             }
         }
 
-        let rejected = false;
-        try { k.dns_response([]); } catch { rejected = true; }
-        if (!rejected) throw Error('accepted DNS packet without a header');
+        const header = new Uint8Array(12);
+        header[2] = 0x80;
+        k.dns_response(header);
+        for (const [bytes, message] of [
+            [new Uint8Array(), 'accepted DNS packet without a header'],
+            [Array.from(header), 'accepted a plain array as DNS bytes'],
+        ]) {
+            let rejected = false;
+            try { k.dns_response(bytes); } catch { rejected = true; }
+            if (!rejected) throw Error(message);
+        }
     "#).await;
 }
 
@@ -417,7 +429,7 @@ async fn dns_helpers_register_shared_services_and_validate_cache_options() {
     let script = load(r#"
         import { kotoconn as k } from '@kotoconn/bindings';
         import { dns_service } from '@kotoconn/api';
-        const dialer = k.dialer({dialer: null, outbound: {
+        const dialer = k.dialer({carrier: k.host_network({}), outbound: {
             resolve_handler: k.resolve_handler(() => []), implementation: k.direct_outbound({})
         }});
         const options = {dialer, upstream: {protocol: 'tcp', server: {address: k.ip('192.0.2.53'), port: 53}}};

@@ -1,5 +1,8 @@
-use crate::{api::api, handler::Handler};
-use crate::{data::*, native::*};
+use crate::api::{Optional, Parameter, Void, api};
+use crate::handler::{Handler, Hook};
+use crate::log::LogLevel;
+use crate::process::{ExecOptions, ExecResult};
+use crate::{data::*, dns::*, native::*};
 use kotoconn_config as config;
 use rquickjs::{Function, Result};
 use std::{
@@ -9,6 +12,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tokio_util::sync::CancellationToken;
 use ts_rs::TS;
 
 pub(crate) type RoutingHandler<'js> = Handler<'js, Flow, Decision>;
@@ -26,6 +30,10 @@ pub(crate) struct Host<'js> {
     pub dns: RefCell<Vec<Function<'js>>>,
     sealed: Cell<bool>,
     pub services: RefCell<Option<Arc<dyn crate::DnsServices>>>,
+    /// Cancelled when shutdown starts; pending and later sleeps reject.
+    pub shutdown: CancellationToken,
+    /// Shutdown hooks in registration order; `None` once they have all run.
+    shutdown_hooks: RefCell<Option<Vec<Function<'js>>>>,
 }
 
 // Registration never calls JS while these cells are borrowed.
@@ -34,6 +42,7 @@ impl<'js> rquickjs::class::Trace<'js> for Host<'js> {
         self.routing.borrow().trace(tracer);
         self.resolving.borrow().trace(tracer);
         self.dns.borrow().trace(tracer);
+        self.shutdown_hooks.borrow().trace(tracer);
     }
 }
 
@@ -54,7 +63,25 @@ impl<'js> Host<'js> {
             dns: RefCell::new(Vec::new()),
             sealed: Cell::new(false),
             services: RefCell::new(None),
+            shutdown: CancellationToken::new(),
+            shutdown_hooks: RefCell::new(Some(Vec::new())),
         }
+    }
+
+    /// Takes the most recently registered hook that has not run yet. Once none
+    /// remain, later registrations fail instead of being silently skipped.
+    pub fn next_shutdown_hook(&self) -> Option<Function<'js>> {
+        debug_assert!(
+            self.shutdown.is_cancelled(),
+            "hooks run only after sleeps are released"
+        );
+
+        let mut hooks = self.shutdown_hooks.borrow_mut();
+        let next = hooks.as_mut()?.pop();
+        if next.is_none() {
+            *hooks = None;
+        }
+        next
     }
 
     fn mutable(&self) -> Result<()> {
@@ -218,6 +245,10 @@ api! {
             Ok(config::OutboundImpl::Socks5(options.into()).into())
         }
 
+        fn host_network(self, options: HostNetworkConfig) -> HostNetwork {
+            Ok(config::HostNetworkConfig::from(options).into())
+        }
+
         fn routing_handler(self, handler: RoutingHandler<'js>) -> Routing {
             self.mutable()?;
 
@@ -285,18 +316,37 @@ api! {
             Ok(id.into())
         }
 
-        fn dns_response(self, bytes: Vec<Byte>) -> Response {
-            config::DnsResponse::from_buffer(bytes.into_iter().map(|b| b.0).collect())
+        fn dns_response(self, bytes: Bytes) -> Response {
+            config::DnsResponse::from_buffer(bytes.0)
                 .map(Into::into)
                 .map_err(|e| invalid(e.to_string()))
         }
 
-        fn request_bytes(self, request: Request) -> Vec<u8> {
-            request.value.to_vec().map_err(|e| invalid(e.to_string()))
+        fn dns_request(self, name: String, record_type: RecordType) -> Request {
+            crate::dns::request(&name, record_type).map(Into::into)
         }
 
-        fn response_bytes(self, response: Response) -> Vec<u8> {
-            response.value.to_vec().map_err(|e| invalid(e.to_string()))
+        fn request_bytes(self, request: Request) -> Bytes {
+            request.value.to_vec().map(Bytes).map_err(|e| invalid(e.to_string()))
+        }
+
+        fn response_bytes(self, response: Response) -> Bytes {
+            response.value.to_vec().map(Bytes).map_err(|e| invalid(e.to_string()))
+        }
+
+        fn log(self, level: LogLevel, message: String) -> Void {
+            crate::log::log(level, &message);
+            Ok(Void)
+        }
+
+        fn on_shutdown(self, handler: Hook<'js>) -> Void {
+            self.shutdown_hooks
+                .borrow_mut()
+                .as_mut()
+                .ok_or_else(|| invalid("shutdown hooks have already run"))?
+                .push(handler.function);
+
+            Ok(Void)
         }
     }
 
@@ -324,6 +374,36 @@ api! {
             .await?
             .map_err(|error| invalid(error.to_string()))?;
             Ok(addresses.into_iter().map(Into::into).collect())
+        }
+
+        fn sleep(self, timeout: Timeout) -> Void {
+            let shutdown = self.shutdown.clone();
+
+            let elapsed = crate::task::run(async move {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => false,
+                    _ = tokio::time::sleep(timeout.value) => true,
+                }
+            })
+            .await?;
+
+            if elapsed {
+                Ok(Void)
+            } else {
+                Err(invalid("sleep cancelled by shutdown"))
+            }
+        }
+
+        fn exec(self, argv: Vec<String>, options: Optional<ExecOptions>) -> ExecResult {
+            let (timeout, input) = match options.0 {
+                Some(options) => (options.timeout.map(|timeout| timeout.value), options.input),
+                None => (None, None),
+            };
+
+            crate::task::run(crate::process::exec(argv, timeout, input))
+                .await?
+                .map_err(invalid)
         }
     }
 }

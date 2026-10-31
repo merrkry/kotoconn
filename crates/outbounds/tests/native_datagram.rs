@@ -38,7 +38,7 @@ async fn native_datagrams_preserve_boundaries_and_nested_carrier_cancellation() 
                 }
             });
             let root = Scope::new();
-            let system = Arc::new(System::new(root.clone()));
+            let system = Arc::new(System::new(root.clone(), Default::default()).unwrap());
             let middle = Arc::new(
                 Clients::new(
                     OutboundImpl::Direct(DirectOutboundConfig {}),

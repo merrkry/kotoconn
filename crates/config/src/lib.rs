@@ -15,7 +15,7 @@ pub use anytls::{AnyTlsInboundConfig, AnyTlsOutboundConfig};
 pub use tls::{TlsClientConfig, TlsServerConfig};
 
 pub use config::Config;
-pub use dialer::{DialerConfig, DialerId};
+pub use dialer::{CarrierConfig, DialerConfig, DialerId, HostNetworkConfig};
 pub use dns::{
     DnsHandlerId, DnsHandlerResult, DnsListenerConfig, DnsRequest, DnsRequestInfo, DnsResponse,
     DnsServiceConfig, DnsServiceId, DnsUpstreamConfig,

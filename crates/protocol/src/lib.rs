@@ -26,26 +26,57 @@ pub use server::{BoundServer, Handler, Server, ServerContext, accept_loop};
 pub use session::UdpSession;
 use std::{net::SocketAddr, sync::Arc};
 
+/// What a carrier offers to the adapters above it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Capabilities {
     pub tcp: bool,
     pub udp: bool,
+    /// The carrier passes domain targets on unchanged, for example inside its
+    /// wire protocol. Without it, the carrier requires IP targets and rejects
+    /// domains instead of resolving them.
+    pub domain_targets: bool,
 }
 
 impl Capabilities {
-    pub const BOTH: Self = Self {
-        tcp: true,
-        udp: true,
-    };
     pub const TCP: Self = Self {
         tcp: true,
         udp: false,
+        domain_targets: false,
     };
+
+    pub const UDP: Self = Self {
+        tcp: false,
+        udp: true,
+        domain_targets: false,
+    };
+
+    pub const BOTH: Self = Self {
+        tcp: true,
+        udp: true,
+        domain_targets: false,
+    };
+
     pub fn require(self, required: Self) -> Result<()> {
-        if (required.tcp && !self.tcp) || (required.udp && !self.udp) {
+        if (required.tcp && !self.tcp)
+            || (required.udp && !self.udp)
+            || (required.domain_targets && !self.domain_targets)
+        {
             bail!("carrier lacks required capabilities: {required:?}; available: {self:?}");
         }
         Ok(())
+    }
+
+    /// Check a connection request before it starts any I/O.
+    pub fn require_for(self, protocol: TransportProtocol, target: &Target) -> Result<()> {
+        let transport = match protocol {
+            TransportProtocol::Tcp => Self::TCP,
+            TransportProtocol::Udp => Self::UDP,
+        };
+
+        self.require(Self {
+            domain_targets: matches!(target, Target::Domain { .. }),
+            ..transport
+        })
     }
 }
 
@@ -108,10 +139,11 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-    pub async fn resolve(&self) -> Result<Target> {
+    /// The target to request from a carrier with `capabilities`. The server
+    /// name is resolved only when that carrier requires IP targets.
+    pub async fn target(&self, capabilities: Capabilities) -> Result<Target> {
         match &self.address {
-            Target::Ip { .. } => Ok(self.address.clone()),
-            Target::Domain { name, port } => {
+            Target::Domain { name, port } if !capabilities.domain_targets => {
                 let addresses = self.resolver.resolve(name.clone()).await?;
                 let address = addresses
                     .into_iter()
@@ -122,7 +154,18 @@ impl Endpoint {
                     port: *port,
                 })
             }
+            _ => Ok(self.address.clone()),
         }
+    }
+}
+
+/// Whether a datagram from `source` comes from the server at `server`. A
+/// carrier that accepted a domain target reports whichever address it reached,
+/// so only the port identifies that server.
+pub fn from_server(server: &Target, source: &Target) -> bool {
+    match server {
+        Target::Domain { port, .. } => source.port() == *port,
+        Target::Ip { .. } => server == source,
     }
 }
 
@@ -130,7 +173,7 @@ pub fn socket_addr(target: &Target) -> Result<SocketAddr> {
     match target {
         Target::Ip { address, port } => Ok(SocketAddr::new(*address, *port)),
         Target::Domain { .. } => {
-            bail!("I/O carrier requires an IP target; resolve it in user policy")
+            bail!("carrier requires IP targets; resolve domains in user policy")
         }
     }
 }

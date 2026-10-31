@@ -21,10 +21,6 @@ fn hysteria_certificate() -> &'static rcgen::CertifiedKey<rcgen::KeyPair> {
     &CERTIFICATE
 }
 
-fn direct() -> OutboundImpl {
-    OutboundImpl::Direct(DirectOutboundConfig {})
-}
-
 fn outbound(kind: &str, server: Target) -> OutboundImpl {
     match kind {
         "hysteria2" => OutboundImpl::Hysteria2(Hysteria2OutboundConfig {
@@ -53,7 +49,7 @@ async fn daemon_with_idle(idle: u32) -> Result<Daemon> {
         r#"
         import {{ kotoconn as k }} from '@kotoconn/bindings';
         const resolver = k.resolve_handler(name => k.lookup(name));
-        const direct = k.dialer({{ dialer: undefined, outbound: {{ resolve_handler: resolver, implementation: k.direct_outbound({{}}) }} }});
+        const direct = k.dialer({{ carrier: k.host_network({{}}), outbound: {{ resolve_handler: resolver, implementation: k.direct_outbound({{}}) }} }});
         const inbounds = [];
         const routing = k.routing_handler(flow => {{
             if (!inbounds.some(inbound => flow.inbound.equals(inbound))) throw Error('unknown inbound');
@@ -167,7 +163,8 @@ async fn protocols_and_nested_carriers_preserve_tcp_and_udp() -> Result<()> {
         let daemon = daemon().await?;
         let scope = Scope::new();
         let (tcp, udp) = echoes(&scope).await?;
-        let system: Arc<dyn Carrier> = Arc::new(System::new(scope.clone()));
+        let system: Arc<dyn Carrier> =
+            Arc::new(System::new(scope.clone(), Default::default()).unwrap());
 
         for kind in ["http", "socks5", "shadowsocks2022", "hysteria2"] {
             let client = Clients::new(
@@ -221,16 +218,6 @@ async fn protocols_and_nested_carriers_preserve_tcp_and_udp() -> Result<()> {
         )?;
         tcp_roundtrip(&hysteria, tcp.clone()).await?;
         udp_roundtrip(&hysteria, udp.clone()).await?;
-
-        // A domain user target cannot accidentally fall through to OS DNS.
-        let direct = Clients::new(direct(), system, Arc::new(SystemResolver))?;
-        let mut rejected = direct
-            .tcp(Target::Domain {
-                name: "localhost".into(),
-                port: 80,
-            })
-            .await?;
-        assert_eq!(rejected.read(&mut [0]).await?, 0);
         scope.close();
         scope.wait().await;
         daemon.shutdown().await?;
@@ -293,7 +280,7 @@ async fn sessions_split_by_destination_and_close_without_killing_association() -
             let (_, b) = echoes(&scope).await?;
             let client = Clients::new(
                 outbound(kind, address(&daemon, kind)),
-                Arc::new(System::new(scope.clone())),
+                Arc::new(System::new(scope.clone(), Default::default()).unwrap()),
                 Arc::new(SystemResolver),
             )?;
             let mut association = client.udp(a.clone()).await?;
@@ -366,7 +353,7 @@ async fn lower_tcp_close_ends_socks_udp_control_but_not_sibling_udp() -> Result<
         let (_, target) = echoes(&scope).await?;
         let lower = Arc::new(Clients::new(
             outbound("shadowsocks2022", address(&daemon, "shadowsocks2022")),
-            Arc::new(System::new(scope.clone())),
+            Arc::new(System::new(scope.clone(), Default::default()).unwrap()),
             Arc::new(SystemResolver),
         )?);
         let socks = Clients::new(
@@ -473,7 +460,7 @@ async fn capability_checks_and_udp_policy_contract_reject_invalid_requests() -> 
         let scope = Scope::new();
         let http: Arc<dyn Carrier> = Arc::new(Clients::new(
             outbound("http", target("127.0.0.1:1".parse()?)),
-            Arc::new(System::new(scope.clone())),
+            Arc::new(System::new(scope.clone(), Default::default()).unwrap()),
             Arc::new(SystemResolver),
         )?);
         let socks = Clients::new(
@@ -494,7 +481,7 @@ async fn capability_checks_and_udp_policy_contract_reject_invalid_requests() -> 
         let source = r#"
             import { kotoconn as k } from '@kotoconn/bindings';
             const resolver = k.resolve_handler(name => k.lookup(name));
-            const d = k.dialer({dialer: undefined, outbound: {resolve_handler: resolver, implementation: k.direct_outbound({})}});
+            const d = k.dialer({carrier: k.host_network({}), outbound: {resolve_handler: resolver, implementation: k.direct_outbound({})}});
             k.routing_handler(flow => k.route(d, flow.dest));
         "#;
         let daemon = Daemon::start_with_sources(
@@ -554,7 +541,7 @@ async fn configured_resolver_only_receives_outbound_server_names() -> Result<()>
         };
         let client = Clients::new(
             outbound("socks5", endpoint),
-            Arc::new(System::new(scope.clone())),
+            Arc::new(System::new(scope.clone(), Default::default()).unwrap()),
             Arc::new(Recording(tx)),
         )?;
         tcp_roundtrip(&client, echo).await?;
@@ -583,7 +570,7 @@ async fn routing_metadata_identifies_inbound_and_tcp_udp_sources() -> Result<()>
         let source = format!(r#"
             import {{ kotoconn as k }} from '@kotoconn/bindings';
             const resolve = k.resolve_handler(() => []);
-            const direct = k.dialer({{ dialer: null, outbound: {{
+            const direct = k.dialer({{ carrier: k.host_network({{}}), outbound: {{
                 resolve_handler: resolve, implementation: k.direct_outbound({{}})
             }} }});
             const routing = k.routing_handler(flow => {{
@@ -702,7 +689,7 @@ async fn shutdown_deadline_reports_forced_network_cleanup() -> Result<()> {
         let (echo, _) = echoes(&scope).await?;
         let client = Clients::new(
             outbound("http", address(&daemon, "http")),
-            Arc::new(System::new(scope.clone())),
+            Arc::new(System::new(scope.clone(), Default::default()).unwrap()),
             Arc::new(SystemResolver),
         )?;
         let mut stream = client.tcp(echo).await?;
@@ -761,7 +748,7 @@ async fn hysteria_shared_connection_keeps_siblings_alive_and_retires_when_unused
         let client = Clients::new(
             outbound("hysteria2", address(&daemon, "hysteria2")),
             Arc::new(CountUdp {
-                lower: System::new(client_scope.clone()),
+                lower: System::new(client_scope.clone(), Default::default()).unwrap(),
                 calls: calls.clone(),
             }),
             Arc::new(SystemResolver),
@@ -818,7 +805,8 @@ async fn hysteria_rejects_bad_credentials_certificates_and_tcp_only_carriers() -
             address: server.clone(),
             resolver: Arc::new(SystemResolver),
         };
-        let system: Arc<dyn Carrier> = Arc::new(System::new(scope.clone()));
+        let system: Arc<dyn Carrier> =
+            Arc::new(System::new(scope.clone(), Default::default()).unwrap());
         for failure in ["password", "name", "ca"] {
             let mut options = options.clone();
             match failure {

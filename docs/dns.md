@@ -3,9 +3,11 @@
 Kotoconn can listen for UDP and TCP DNS queries. Each query enters a JavaScript
 DNS handler, including queries answered from a service's cache. A handler may
 return a response, drop the request, or call a registered upstream service.
+Resolve handlers can also resolve names through a service.
 
-See [the DNS example](../packages/api/examples/dns.ts) for a SOCKS5-backed service
-and a domain policy. Run the example with a SOCKS5 server at `127.0.0.1:1080`.
+See [the DNS example](../packages/api/examples/dns.ts) for a SOCKS5-backed service,
+a domain policy, an answer check, and a dialer whose server name the service
+resolves. Run the example with a SOCKS5 server at `127.0.0.1:1080`.
 The DNS listener binds UDP and TCP at `127.0.0.1:1053`.
 
 ```ts
@@ -30,14 +32,37 @@ k.dns_listener({
 
 `dialer` is an existing Kotoconn dialer reference. Every upstream connection uses
 that dialer. The upstream protocol is independent of the listener protocols.
-UDP upstreams retry truncated responses over TCP through the same dialer, which
-must support TCP for that fallback to succeed.
+UDP upstreams retry truncated responses over TCP through the same dialer. When
+the dialer cannot carry TCP to the upstream, the truncated response is returned
+as is, so the client can retry over TCP itself.
 Closed pooled TCP connections are re-established once within the same query
 deadline. Timeouts and DNS error responses do not trigger that retry.
 
-Services accept one IP upstream with an explicit port. Resolve proxy server
-domains through the dialer's existing resolve handler. Its bootstrap resolution
-must not depend on querying the DNS service that needs that proxy connection.
+Services accept one IP upstream with an explicit port. A domain server in the
+service's dialer chain is resolved by the resolve handler of the dialer that
+names it. Such a handler must not depend on the same service, which would need
+its own connection to answer.
+
+## Resolving names
+
+`await service.resolve(name)` queries A and AAAA records through the service, so
+its cache and forwarding apply, and returns the addresses of both answers that
+belong to the name or to an alias its CNAME chain reaches.
+NXDOMAIN and answers without addresses give an empty list. When one query fails
+with another response code or an error while the other returns addresses, the
+addresses are returned and the failure is logged as a warning; otherwise the
+failure rejects. Like `service.handler`, it needs no `this`, so it serves directly as a
+resolve handler:
+
+```ts
+const remote = k.dialer({
+  carrier: k.host_network({}),
+  outbound: {
+    resolve_handler: k.resolve_handler(service.resolve),
+    implementation: k.http_outbound({ server: k.domain("proxy.example.com", 8080) }),
+  },
+});
+```
 
 ## Policy and responses
 
@@ -49,9 +74,21 @@ must not depend on querying the DNS service that needs that proxy connection.
 class. Domain names are lowercase without the final dot, except the root `.`.
 Known record types use names such as `A` and `AAAA`; unknown types use numbers.
 Listener requests also expose `inbound`, `source`, and the client `protocol`.
-These context properties are undefined for requests passed directly to the
-embedding API without listener information. Request properties are read-only;
-`k.request_bytes` and `k.response_bytes` provide explicit message access.
+These context properties are undefined for requests built by policy or passed
+directly to the embedding API without listener information.
+
+`k.dns_request(name, type)` builds a recursive IN-class query with one question.
+The type is a record type name or number, as in `request.query`.
+
+`response.code` is the response code: `NOERROR`, `NXDOMAIN`, `SERVFAIL` and the
+other RFC 1035 and RFC 2136 mnemonics, or a number. `response.answers` lists the
+answer records with a normalized `name`, `type`, numeric `class`, `ttl` and
+`data`. The data of A and AAAA records is an IP value; CNAME, NS, PTR and ANAME
+records carry a normalized domain name; other types carry their RDATA as a
+`Uint8Array` with uncompressed names. Request and response properties are read-only;
+`k.request_bytes` and `k.response_bytes` return the wire message as a
+`Uint8Array`, and `k.dns_response` accepts one, for example to read or build the
+authority and additional sections.
 
 Forwarding preserves the query's DNS flags and EDNS information. The listener
 restores the client request ID and question and respects the client's UDP size

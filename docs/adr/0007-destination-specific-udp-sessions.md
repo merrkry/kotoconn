@@ -1,7 +1,0 @@
-# Route UDP once per destination-specific session
-
-Within an inbound association, each original destination has its own UDP session. The first datagram starts routing; subsequent datagrams keep the selected client until that session ends. Different associations never share sessions merely because their destinations match. Association identities and wire-protocol state are owned by the adapter.
-
-The existing inbound `udp_idle_timeout` expires individual sessions, including a session waiting for policy or outbound setup. Successful forwarding activity in either direction refreshes its idle clock; waiting for capacity does not. Expiry removes the session so a later datagram can be routed again. Completion messages identify the session generation, preventing an old completion from removing its replacement. Explicit cancellation and protocol association closure also end sessions. Session expiry does not close a shared client or discard security state still needed by the protocol.
-
-Datagram channels preserve complete messages and address metadata, including empty payloads. Datagram queues bound accumulated bytes using their own consumption feedback. Association/session admission remains adapter-specific. Shared ingress paths use nonblocking enqueue and drop new packets on overflow so one session cannot stop reception for others. Packet loss does not close a session or trigger core retransmission.

@@ -115,7 +115,8 @@ impl Carrier for Clients {
 
     fn tcp_scoped(&self, target: Target, caller: Scope) -> BoxFuture<'_, Result<BoxStream>> {
         Box::pin(async move {
-            self.capabilities().require(Capabilities::TCP)?;
+            self.capabilities()
+                .require_for(TransportProtocol::Tcp, &target)?;
             let scope = self.tcp.child().tracked_by(&caller);
             let protocol = self.protocol.clone();
             let connection_scope = scope.clone();
@@ -127,10 +128,8 @@ impl Carrier for Clients {
 
     fn udp_scoped(&self, target: Target, caller: Scope) -> BoxFuture<'_, Result<Datagram>> {
         Box::pin(async move {
-            self.capabilities().require(Capabilities {
-                tcp: false,
-                udp: true,
-            })?;
+            self.capabilities()
+                .require_for(TransportProtocol::Udp, &target)?;
             let scope = self.udp.child().tracked_by(&caller);
             let transport = scope.run(self.protocol.udp(target, scope.clone())).await?;
             follow_datagram(scope, transport.scope.clone())?;
@@ -144,10 +143,8 @@ impl Carrier for Clients {
         caller: Scope,
     ) -> BoxFuture<'_, Result<Option<NativeDatagram>>> {
         Box::pin(async move {
-            self.capabilities().require(Capabilities {
-                tcp: false,
-                udp: true,
-            })?;
+            self.capabilities()
+                .require_for(TransportProtocol::Udp, &target)?;
             let scope = self.udp.child().tracked_by(&caller);
             let transport = scope
                 .run(self.protocol.udp_native(target, scope.clone()))

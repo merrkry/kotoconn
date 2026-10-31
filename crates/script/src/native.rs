@@ -13,9 +13,9 @@ use ts_rs::TS;
     [Dns] [config::DnsHandlerId] [ts(as = "config::DnsHandlerId")];
     [DnsServiceRef] [config::DnsServiceId] [ts(as = "config::DnsServiceId")];
     [Timeout] [std::time::Duration] [ts(type = "{ readonly __brand: unique symbol }")];
-    [Response] [config::DnsResponse] [ts(type = "{ readonly __brand: unique symbol }")];
     [InboundImpl] [config::InboundImpl] [ts(as = "config::InboundImpl")];
     [OutboundImpl] [config::OutboundImpl] [ts(as = "config::OutboundImpl")];
+    [HostNetwork] [config::HostNetworkConfig] [ts(type = "{ readonly __brand: unique symbol }")];
     [Decision] [config::RouteDecision] [ts(as = "config::RouteDecision")];
     [DnsResult] [config::DnsHandlerResult] [ts(as = "config::DnsHandlerResult")];
 )]
@@ -27,66 +27,6 @@ use ts_rs::TS;
 pub(crate) struct Wrapper {
     #[qjs(skip_trace)]
     pub value: Native,
-}
-
-#[derive(Clone, rquickjs::class::Trace, rquickjs::JsLifetime, TS)]
-#[rquickjs::class]
-#[ts(
-    type = "{ readonly query: { readonly name: string; readonly type: string | number; readonly class: number }; readonly inbound: Inbound | undefined; readonly source: SocketAddr | undefined; readonly protocol: TransportProtocol | undefined; readonly __brand: unique symbol }"
-)]
-pub(crate) struct Request {
-    #[qjs(skip_trace)]
-    pub value: config::DnsRequest,
-    #[qjs(skip_trace)]
-    pub info: Option<config::DnsRequestInfo>,
-}
-
-impl From<config::DnsRequest> for Request {
-    fn from(value: config::DnsRequest) -> Self {
-        Self { value, info: None }
-    }
-}
-
-#[rquickjs::methods]
-impl Request {
-    #[qjs(get)]
-    pub fn query<'js>(&self, ctx: Ctx<'js>) -> Result<rquickjs::Object<'js>> {
-        let [query] = self.value.queries.as_slice() else {
-            return Err(invalid("expected exactly one DNS question"));
-        };
-
-        let view = rquickjs::Object::new(ctx.clone())?;
-        let name = query.name.to_lowercase().to_utf8();
-        view.prop(
-            "name",
-            if name == "." {
-                name.as_str()
-            } else {
-                name.strip_suffix('.').unwrap_or(name.as_str())
-            },
-        )?;
-        match query.query_type {
-            hickory_proto::rr::RecordType::Unknown(code) => view.prop("type", code)?,
-            record_type => view.prop("type", record_type.to_string())?,
-        };
-        view.prop("class", u16::from(query.query_class))?;
-        Ok(view)
-    }
-
-    #[qjs(get)]
-    pub fn inbound(&self) -> Option<Inbound> {
-        self.info.map(|info| info.inbound.into())
-    }
-
-    #[qjs(get)]
-    pub fn source(&self) -> Option<crate::data::SocketAddr> {
-        self.info.map(|info| info.source.into())
-    }
-
-    #[qjs(get)]
-    pub fn protocol(&self) -> Option<crate::data::TransportProtocol> {
-        self.info.map(|info| info.protocol.into())
-    }
 }
 
 #[derive(
@@ -210,7 +150,7 @@ impl Target {
 }
 
 // QuickJS integer conversions truncate, so validate configuration numbers first.
-#[duplicate::duplicate_item(Wrapper Native; [Port] [u16]; [Milliseconds] [u32]; [Byte] [u8]; [Mtu] [u16]; [Capacity] [u32];)]
+#[duplicate::duplicate_item(Wrapper Native; [Port] [u16]; [Milliseconds] [u32]; [Byte] [u8]; [Mtu] [u16]; [Capacity] [u32]; [Mark] [u32]; [TypeCode] [u16];)]
 mod checked_number {
     use super::*;
 
@@ -238,9 +178,35 @@ mod checked_number {
 
 pub(crate) use checked_number_byte::Byte;
 pub(crate) use checked_number_capacity::Capacity;
+pub(crate) use checked_number_mark::Mark;
 pub(crate) use checked_number_milliseconds::Milliseconds;
 pub(crate) use checked_number_mtu::Mtu;
 pub(crate) use checked_number_port::Port;
+pub(crate) use checked_number_type_code::TypeCode;
+
+/// Binary data, exchanged with JS as a `Uint8Array`.
+#[derive(derive_more::From, derive_more::Into, TS)]
+#[ts(type = "Uint8Array")]
+pub(crate) struct Bytes(pub Vec<u8>);
+
+impl<'js> FromJs<'js> for Bytes {
+    fn from_js(_: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
+        let array = rquickjs::TypedArray::<u8>::from_value(value)
+            .map_err(|_| invalid("expected a Uint8Array"))?;
+
+        // SAFETY: the slice is copied before any JS can run and change the buffer.
+        let bytes = unsafe { array.as_bytes() }
+            .ok_or_else(|| invalid("Uint8Array buffer is detached"))?
+            .to_vec();
+        Ok(Self(bytes))
+    }
+}
+
+impl<'js> IntoJs<'js> for Bytes {
+    fn into_js(self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        rquickjs::TypedArray::<u8>::new(ctx.clone(), self.0)?.into_js(ctx)
+    }
+}
 
 #[rquickjs::methods]
 impl Inbound {

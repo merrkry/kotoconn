@@ -58,10 +58,7 @@ impl Client {
         carrier: Arc<dyn Carrier>,
         options: &Hysteria2OutboundConfig,
     ) -> Result<Self> {
-        carrier.capabilities().require(Capabilities {
-            tcp: false,
-            udp: true,
-        })?;
+        carrier.capabilities().require(Capabilities::UDP)?;
         let tls = tls::client(options)?;
         let server_name = options
             .server_name
@@ -131,7 +128,10 @@ impl Drop for Client {
 
 impl p::Client for Client {
     fn capabilities(&self) -> Capabilities {
-        Capabilities::BOTH
+        Capabilities {
+            domain_targets: true,
+            ..Capabilities::BOTH
+        }
     }
 
     fn tcp(&self, target: Target, scope: Scope) -> BoxFuture<'_, Result<BoxStream>> {
@@ -242,15 +242,17 @@ async fn manage(
 
 async fn connect(settings: &Settings, scope: Scope) -> Result<Session> {
     let close_scope = CloseScope(scope.clone());
-    let peer = p::socket_addr(&settings.endpoint.resolve().await?)?;
+    let server = settings
+        .endpoint
+        .target(settings.carrier.capabilities())
+        .await?;
     let transport = settings
         .carrier
-        .udp_scoped(p::target(peer), scope.clone())
+        .udp_scoped(server.clone(), scope.clone())
         .await?;
-    let socket = Salamander::wrap(
-        Arc::new(CarrierSocket::new(transport, peer)),
-        settings.obfs.as_deref(),
-    );
+    let carrier_socket = CarrierSocket::new(transport, server);
+    let peer = carrier_socket.peer();
+    let socket = Salamander::wrap(Arc::new(carrier_socket), settings.obfs.as_deref());
     let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
         Default::default(),
         None,

@@ -4,15 +4,17 @@ mod sessions;
 mod udp;
 
 use crate::{Error, Policy, Shutdown};
-use anyhow::{Context, Result, bail, ensure};
-use futures_util::future::BoxFuture;
+use anyhow::{Context, Result, ensure};
+use futures_util::{FutureExt, future::BoxFuture};
 use kotoconn_config::*;
 use kotoconn_outbounds::{Clients, System};
 use kotoconn_protocol::{self as p, *};
 pub use sessions::{SessionHandle, SessionId};
 use std::{
+    any::Any,
     collections::{HashMap, HashSet},
     net::SocketAddr,
+    panic::AssertUnwindSafe,
     sync::Arc,
 };
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
@@ -33,16 +35,18 @@ pub(crate) struct Network {
 impl Network {
     pub async fn start(
         policy: Policy,
+        shutdown: CancellationToken,
         stopping: CancellationToken,
         force: CancellationToken,
     ) -> Result<Self, Error> {
-        Self::build(policy, stopping, force)
+        Self::build(policy, shutdown, stopping, force)
             .await
             .map_err(|e| Error::Config(e.to_string()))
     }
 
     async fn build(
         policy: Policy,
+        shutdown: CancellationToken,
         stopping: CancellationToken,
         force: CancellationToken,
     ) -> Result<Self> {
@@ -127,19 +131,21 @@ impl Network {
 
         for (id, server) in bound {
             let failed = failed.clone();
-            let stop = stopping.clone();
-            let control = scope.clone();
-            let outbound = outbound_scope.clone();
+            let shutdown = shutdown.clone();
             let span = tracing::info_span!("inbound", inbound_id = id.0.get());
             span.in_scope(|| {
                 scope.spawn(async move {
-                    let result = server.run.await;
+                    // A panic ends the inbound like an error instead of silently stopping it.
+                    let result = match AssertUnwindSafe(server.run).catch_unwind().await {
+                        Ok(result) => result,
+                        Err(panic) => Err(anyhow::anyhow!("inbound panicked: {}", panic_message(&*panic))),
+                    };
                     if let Err(error) = &result {
-                        tracing::error!(error = %format_args!("{error:#}"), "inbound failed");
+                        tracing::error!(error = %format_args!("{error:#}"), "inbound failed; shutting down");
                         failed.send_replace(Some(format!("{error:#}")));
-                        stop.cancel();
-                        control.close();
-                        outbound.close();
+                        // A full shutdown runs the policy hooks, which may need to
+                        // undo host configuration that depended on this inbound.
+                        shutdown.cancel();
                     }
                     result
                 })
@@ -172,16 +178,29 @@ impl Network {
         })
     }
 
-    pub async fn wait(&self) -> Result<Shutdown, Error> {
-        self.scope.wait().await;
+    /// Wait for inbound work and for `policy`, whose calls may still use outbound
+    /// connections, then close those connections.
+    pub async fn wait<T>(&self, policy: impl Future<Output = T>) -> (T, Result<Shutdown, Error>) {
+        let (policy, ()) = tokio::join!(policy, self.scope.wait());
         self.outbound_scope.close();
         self.outbound_scope.wait().await;
 
-        match self.failure.borrow().as_ref() {
+        let network = match self.failure.borrow().as_ref() {
             Some(error) => Err(Error::Network(error.clone())),
             None if self.force.is_cancelled() => Ok(Shutdown::TimedOut),
             None => Ok(Shutdown::Drained),
-        }
+        };
+        (policy, network)
+    }
+}
+
+fn panic_message(panic: &(dyn Any + Send)) -> &str {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        message
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message
+    } else {
+        "unknown payload"
     }
 }
 
@@ -214,14 +233,13 @@ fn build_clients(policy: &Policy, scope: Scope) -> Result<HashMap<DialerId, Arc<
             "unknown resolve handler"
         );
         let mut seen = HashSet::from([*id]);
-        let mut next = config.dialer;
-        while let Some(id) = next {
-            ensure!(seen.insert(id), "carrier cycle");
-            next = definitions.get(&id).context("unknown carrier")?.dialer;
+        let mut next = &config.carrier;
+        while let CarrierConfig::Dialer(id) = next {
+            ensure!(seen.insert(*id), "carrier cycle");
+            next = &definitions.get(id).context("unknown carrier")?.carrier;
         }
     }
 
-    let system: Arc<dyn Carrier> = Arc::new(System::new(scope));
     let mut clients = HashMap::<DialerId, Arc<Clients>>::new();
 
     while clients.len() < definitions.len() {
@@ -229,12 +247,15 @@ fn build_clients(policy: &Policy, scope: Scope) -> Result<HashMap<DialerId, Arc<
             if clients.contains_key(id) {
                 continue;
             }
-            let carrier: Arc<dyn Carrier> = match config.dialer {
-                Some(id) => match clients.get(&id) {
+            // Each host network dialer has its own carrier for its socket options.
+            let carrier: Arc<dyn Carrier> = match &config.carrier {
+                CarrierConfig::Dialer(id) => match clients.get(id) {
                     Some(client) => client.clone(),
                     None => continue,
                 },
-                None => system.clone(),
+                CarrierConfig::Host(options) => {
+                    Arc::new(System::new(scope.clone(), options.clone())?)
+                }
             };
             let resolver = Arc::new(PolicyResolver {
                 policy: policy.clone(),
@@ -312,8 +333,17 @@ impl p::Handler for SessionHandler {
                                 },
                             )
                             .await?;
-                        let RouteDecision::Route { dialer, target } = decision else {
-                            bail!("TCP session rejected");
+                        let (dialer, target) = match decision {
+                            RouteDecision::Route { dialer, target } => (dialer, target),
+                            // Rejection is a policy outcome, not a session failure.
+                            RouteDecision::Reject => {
+                                tracing::debug!("TCP session rejected");
+                                return Ok(());
+                            }
+                            // SAFETY: Policy::route rejects UDP decisions for TCP flows.
+                            RouteDecision::Udp { .. } => {
+                                unreachable!("UDP decision for a TCP flow")
+                            }
                         };
                         tracing::debug!(dialer_id = dialer.0.get(), ?target, "TCP route selected");
 

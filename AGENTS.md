@@ -22,9 +22,9 @@ Do not make avoiding dependencies the primary consideration. Use well-maintained
 
 ## Documentation
 
-See `docs/adr` for design decisions.
+`docs/adr` records design decisions and their reasons, not how the code implements them. An ADR may describe a decided design before it is implemented. Keep the ADRs a current set of decisions rather than a change log: when a decision changes, rewrite, merge or remove the affected ADRs instead of adding ones that supersede them.
 
-Documentation must remain consistent with the implementation. In cases of ambiguous or conflicting semantics, you must explicitly confirm with the user whether to modify the documentation or adjust the implementation.
+Docs should hold what the code cannot say, such as intent, contracts and user-facing behavior, without restating implementation details. Update the affected docs in the same change as the code. When docs and code disagree and the intended behavior is unclear, ask the user which one to change.
 
 ## Code Style
 

@@ -166,7 +166,10 @@ impl Client {
         let mut closing = Closing(Some(session_scope.clone()));
         let transport = self
             .carrier
-            .tcp_scoped(self.endpoint.resolve().await?, session_scope.clone())
+            .tcp_scoped(
+                self.endpoint.target(self.carrier.capabilities()).await?,
+                session_scope.clone(),
+            )
             .await?;
         let mut tls = self.connector.connect(self.name.clone(), transport).await?;
         let padding = self.padding.borrow().clone();
@@ -224,7 +227,11 @@ impl p::Client for Client {
 
     fn capabilities(&self) -> Capabilities {
         let tcp = self.carrier.capabilities().tcp;
-        Capabilities { tcp, udp: tcp }
+        Capabilities {
+            tcp,
+            udp: tcp,
+            domain_targets: true,
+        }
     }
 
     fn tcp(&self, destination: Target, scope: Scope) -> BoxFuture<'_, Result<BoxStream>> {

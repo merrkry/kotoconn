@@ -18,13 +18,13 @@ ip rule add priority 100 iif lan0 lookup 100
 ip -6 rule add priority 100 iif lan0 lookup 100
 ```
 
-For local applications, use socket/connection marks or a dedicated client source address and exclude the daemon. UID-only rules can miss kernel-generated TIME_WAIT acknowledgments because they no longer carry the application's UID. Sending the daemon's own connections back into TUN creates a routing loop. The daemon manages the interface and its addresses; the operator manages these policy rules and their removal.
+For local applications, exclude the daemon's own connections from TUN routing. Give each dialer that reaches the host network a socket mark, `carrier: k.host_network({ mark: 0x1 })`, and route only unmarked traffic into TUN, for example with `ip rule add priority 100 not fwmark 0x1 lookup 100`. Alternatively bind those dialers to the uplink with `k.host_network({ interface: "eth0" })`, or use a dedicated client source address. The mark and interface apply to every TCP and UDP socket of the dialer. UID-only rules can miss kernel-generated TIME_WAIT acknowledgments because they no longer carry the application's UID. Sending the daemon's own connections back into TUN creates a routing loop. The daemon manages the interface and its addresses; the operator manages these policy rules and their removal.
 
 The adapter proxies unicast TCP and UDP over IPv4 and IPv6. smoltcp handles TCP and provides the wire types and Assembler used for IP fragmentation and reassembly. IPv6 overlapping fragments poison their datagram until expiry; atomic fragments remain independent. IPv6 UDP requires a checksum; IPv4 UDP may omit it. Empty UDP payloads and destination-specific session routing are preserved.
 
 ICMP echo forwarding, multicast, source routing, IPsec and unsupported IPv6 extension chains are filtered. Supported IPv6 options are those accepted by smoltcp's option parser with an action that permits processing to continue. Linux TUN offload is enabled when the kernel supports it. TCP GSO aggregates enter smoltcp as complete large segments with their verified checksum metadata. UDP GSO retains shared payload views with individual datagram boundaries. Output uses vectored TCP/UDP GSO when supported. After policy routing, eligible native sockets execute in the flow's worker; other outbounds use the same chunk and datagram contracts.
 
-For queue ownership, TCP scheduling, platform extension points and shutdown, see [ADR 0009](../../docs/adr/0009-independent-tun-connection-drivers.md). For overload behavior, adaptive queues and packet storage, see [TUN buffering](../../docs/tun-buffering.md).
+For worker ownership, TCP termination and shutdown, see [ADR 0010](../../docs/adr/0010-user-space-tun.md). For overload behavior, adaptive queues and packet storage, see [TUN buffering](../../docs/tun-buffering.md).
 
 Run the protocol tests with:
 

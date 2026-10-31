@@ -36,3 +36,46 @@ impl<'js, Input: rquickjs::IntoJs<'js>, Output: FromJs<'js>> Handler<'js, Input,
             .await
     }
 }
+
+/// A callback without input or result, such as a shutdown hook.
+pub(crate) struct Hook<'js> {
+    pub function: Function<'js>,
+}
+
+// Named only inline, so declarations show the callback signature itself.
+impl TS for Hook<'_> {
+    type WithoutGenerics = Self;
+    type OptionInnerType = Self;
+
+    fn name(_: &ts_rs::Config) -> String {
+        "() => void | Promise<void>".into()
+    }
+
+    fn inline(cfg: &ts_rs::Config) -> String {
+        Self::name(cfg)
+    }
+}
+
+impl<'js> FromJs<'js> for Hook<'js> {
+    fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
+        Ok(Self {
+            function: Function::from_js(ctx, value)?,
+        })
+    }
+}
+
+impl<'js> Hook<'js> {
+    pub fn new(function: Function<'js>) -> Self {
+        Self { function }
+    }
+
+    /// Resolves after the returned promise, if any, settles.
+    pub async fn call(self) -> Result<()> {
+        self.function
+            .call::<_, rquickjs::promise::MaybePromise>(())?
+            .into_future::<Value>()
+            .await?;
+
+        Ok(())
+    }
+}

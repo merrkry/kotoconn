@@ -7,6 +7,9 @@ Kotoconn is a programmable proxy. User policy controls routing and name resoluti
 **Policy**:
 The user's resource registrations and handlers that control routing, name resolution, and DNS responses. Its handlers share the same user state.
 
+**Resource**:
+An inbound, dialer, DNS service, or DNS listener registered by policy. Handlers are not resources.
+
 **Inbound**:
 An entry point for client traffic, such as a proxy server, TUN interface, or direct listener.
 
@@ -15,13 +18,13 @@ A client-side protocol configuration used to carry traffic, including direct for
 _Avoid_: Dialer, when referring only to protocol-specific settings.
 
 **Dialer**:
-A connection configuration combining an outbound with its carrier and address-resolution policy. A chain ends at the I/O layer.
+A connection configuration combining an outbound with its carrier and address-resolution policy. A chain of carriers ends at the host network.
 
 **Client**:
 A stateful runtime entry that provides TCP or UDP outbound connections. The entries for one dialer can share a protocol instance and can be closed independently.
 
 **Carrier**:
-The relationship through which a dialer uses another dialer to carry its connections. At runtime, one carrier entry supplies the lower-layer transport capabilities required by a protocol adapter.
+What carries a dialer's connections: another dialer, or the host network with its socket options. A carrier offers TCP, UDP or both, and either accepts domain targets or requires IP targets.
 
 **Session**:
 A logical connection established through an inbound and routed independently. A multiplexed inbound connection can carry multiple sessions. UDP sessions are separated by association and original destination, and keep one routing decision until they end.
@@ -37,7 +40,7 @@ _Avoid_: DNS server, DNS handler.
 A user policy function that answers a received DNS request with a DNS response or drops it without responding.
 
 **DNS service**:
-A reusable query service configured with an upstream and a dialer. DNS handlers can call and compose services, each with its own forwarding and caching behavior.
+A reusable query service configured with an upstream and a dialer. DNS handlers and resolve handlers can call and compose services, each with its own forwarding and caching behavior.
 
 **Destination**:
 The client's requested endpoint. Routing and resolution do not change it.

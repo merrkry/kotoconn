@@ -71,9 +71,10 @@ impl Client {
     }
 
     fn required(&self) -> Capabilities {
-        Capabilities {
-            tcp: !self.quic,
-            udp: self.quic,
+        if self.quic {
+            Capabilities::UDP
+        } else {
+            Capabilities::TCP
         }
     }
 
@@ -138,6 +139,7 @@ impl p::Client for Client {
         Capabilities {
             tcp: self.carrier.capabilities().require(self.required()).is_ok(),
             udp: false,
+            domain_targets: true,
         }
     }
 

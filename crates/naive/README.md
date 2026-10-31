@@ -7,7 +7,7 @@ by its tunnels and verifies the proxy certificate and hostname.
 
 ```ts
 const naive = k.dialer({
-  dialer: null,
+  carrier: k.host_network({}),
   outbound: {
     resolve_handler: resolver,
     implementation: k.naive_outbound({
@@ -39,7 +39,6 @@ receive windows are 8 MiB per stream and 32 MiB per connection; capacity returns
 as the application consumes data.
 
 See [build setup](../../docs/build.md) for the native library and
-[the ADR](../../docs/adr/0010-naiveproxy-cronet-carriers.md) for ownership and
-carrier behavior. Protocol references are the
+[the ADR](../../docs/adr/0009-naive-cronet.md) for the choice of Cronet. Protocol references are the
 [Naive specification](https://github.com/klzgrad/naiveproxy#padding-protocol-an-informal-specification)
 and [SagerNet's Cronet bindings](https://github.com/SagerNet/cronet-go).

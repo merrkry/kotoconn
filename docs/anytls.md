@@ -35,7 +35,7 @@ The server's optional `padding_scheme` overrides the default AnyTLS padding.
 Certificate rotation requires constructing a new inbound.
 
 Inbound acknowledgement admits the stream to Kotoconn before routing, as specified
-by ADR 0005. FIN closes both directions; it cannot represent TCP half-close.
+by [ADR 0006](adr/0006-independent-inbound-admission.md). FIN closes both directions; it cannot represent TCP half-close.
 TLS/authentication/target setup has a 15-second network deadline, and stalled TLS
 writes have a 30-second deadline. The inbound allows at most 128 logical streams
 per TLS session, with a shared 4 MiB receive budget including message overhead.

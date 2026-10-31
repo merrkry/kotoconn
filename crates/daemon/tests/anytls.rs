@@ -27,7 +27,7 @@ async fn typescript_anytls_routes_tcp_and_udp_over_an_http_carrier() -> Result<(
         let server = start(format!(r#"
             import {{ kotoconn as k }} from '@kotoconn/bindings';
             const resolver = k.resolve_handler(name => k.lookup(name));
-            const direct = k.dialer({{ outbound: {{resolve_handler: resolver, implementation: k.direct_outbound({{}})}} }});
+            const direct = k.dialer({{ carrier: k.host_network({{}}), outbound: {{resolve_handler: resolver, implementation: k.direct_outbound({{}})}} }});
             const routing = k.routing_handler(flow => flow.protocol === 'udp' ? k.route_udp(direct) : k.route(direct, flow.dest));
             const listen = {{address: k.ip('127.0.0.1'), port: 0}};
             for (const implementation of [
@@ -43,8 +43,8 @@ async fn typescript_anytls_routes_tcp_and_udp_over_an_http_carrier() -> Result<(
         let client = start(format!(r#"
             import {{ kotoconn as k }} from '@kotoconn/bindings';
             const resolver = k.resolve_handler(name => k.lookup(name));
-            const lower = k.dialer({{outbound: {{resolve_handler: resolver, implementation: k.http_outbound({{server: k.ip_target(k.ip('127.0.0.1'), {})}})}}}});
-            const anytls = k.dialer({{dialer: lower, outbound: {{resolve_handler: resolver, implementation: k.anytls_outbound({{
+            const lower = k.dialer({{carrier: k.host_network({{}}), outbound: {{resolve_handler: resolver, implementation: k.http_outbound({{server: k.ip_target(k.ip('127.0.0.1'), {})}})}}}});
+            const anytls = k.dialer({{carrier: lower, outbound: {{resolve_handler: resolver, implementation: k.anytls_outbound({{
                 server: k.ip_target(k.ip('127.0.0.1'), {}), password: 'secret',
                 tls: {{server_name: 'localhost', certificate: {pem:?}}}, idle_session_timeout: k.timeout(60000),
             }})}}}});
@@ -73,7 +73,7 @@ async fn typescript_anytls_routes_tcp_and_udp_over_an_http_carrier() -> Result<(
         })?;
         let carrier = Clients::new(
             OutboundImpl::Socks5(Socks5OutboundConfig { server: target(*client.listen_addresses().values().next().unwrap()) }),
-            Arc::new(System::new(scope.clone())), Arc::new(SystemResolver),
+            Arc::new(System::new(scope.clone(), Default::default()).unwrap()), Arc::new(SystemResolver),
         )?;
         let mut stream = carrier.tcp(tcp_target).await?;
         let mut greeting = [0; 5];
