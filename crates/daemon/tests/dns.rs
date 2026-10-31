@@ -67,7 +67,10 @@ fn answer(request: &Message) -> Message {
         response.metadata.response_code = ResponseCode::ServFail;
     } else {
         let mut owner = question.name.clone();
-        if name == "alias.example." {
+        if name == "stray.example." {
+            // Records for a name the question's CNAME chain does not reach.
+            owner = Name::from_ascii("other.example.").unwrap();
+        } else if name == "alias.example." {
             owner = Name::from_ascii("target.example.").unwrap();
             response.answers.push(Record::from_rdata(
                 question.name.clone(),
@@ -606,6 +609,8 @@ async fn service_resolve_answers_resolve_handlers_and_dialer_server_names() -> R
     questions(&mut upstream, 2).await;
     let error = resolve("servfail.example").await.unwrap_err();
     assert!(error.to_string().contains("SERVFAIL"), "{error}");
+    questions(&mut upstream, 2).await;
+    assert!(resolve("stray.example").await?.is_empty());
     questions(&mut upstream, 2).await;
     assert_eq!(
         resolve("partial.example").await?,

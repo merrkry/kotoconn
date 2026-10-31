@@ -22,7 +22,8 @@ export interface DnsService {
   readonly query: (request: Request) => Promise<Response>;
   readonly handler: DnsHandler;
   /**
-   * A and AAAA addresses of a name. NXDOMAIN and NODATA give no addresses; other response
+   * A and AAAA addresses of a name and the aliases its CNAME chain reaches; records for
+   * other owners are ignored. NXDOMAIN and NODATA give no addresses; other response
    * codes and query errors fail that query. When one query fails and the other gives
    * addresses, they are returned and the failure is logged as a warning; otherwise a failure
    * rejects. Usable directly as a resolve handler.
@@ -50,13 +51,33 @@ export function dns_service(options: DnsServiceOptions): DnsService {
   const handler: DnsHandler = async (request) => k.respond(await query(request));
 
   const lookup = async (name: string, type: "A" | "AAAA") => {
-    const response = await query(k.dns_request(name, type));
+    const request = k.dns_request(name, type);
+    const response = await query(request);
     if (response.code !== "NOERROR" && response.code !== "NXDOMAIN") {
       throw new Error(`${type} query for ${name} returned ${response.code}`);
     }
 
+    // Addresses count only for the queried name and the aliases its CNAME chain reaches.
+    const aliases = new Map(
+      response.answers.flatMap((record) =>
+        record.type === "CNAME" ? [[record.name, record.data] as const] : [],
+      ),
+    );
+    const chain = new Set<string>();
+    for (
+      let owner: string | undefined = request.query.name;
+      owner !== undefined && !chain.has(owner);
+      owner = aliases.get(owner)
+    ) {
+      chain.add(owner);
+    }
+
     return response.answers.flatMap((record) =>
-      record.type === "A" || record.type === "AAAA" ? [record.data] : [],
+      (record.type === "A" || record.type === "AAAA") &&
+      record.type === type &&
+      chain.has(record.name)
+        ? [record.data]
+        : [],
     );
   };
 

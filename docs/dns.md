@@ -46,7 +46,8 @@ its own connection to answer.
 ## Resolving names
 
 `await service.resolve(name)` queries A and AAAA records through the service, so
-its cache and forwarding apply, and returns the addresses of both answers.
+its cache and forwarding apply, and returns the addresses of both answers that
+belong to the name or to an alias its CNAME chain reaches.
 NXDOMAIN and answers without addresses give an empty list. When one query fails
 with another response code or an error while the other returns addresses, the
 addresses are returned and the failure is logged as a warning; otherwise the
