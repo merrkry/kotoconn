@@ -612,6 +612,19 @@ async fn subscriptions_create_new_dialers_before_draining_removed_ones() {
         if (!kept.equals(a) || updates.length !== 2 || updates[1].length !== 2 || !updates[1][1].equals(added)) {
             throw Error('subscription did not keep a and add c');
         }
+
+        // Refreshes apply one at a time, so each new dialer is created once.
+        entries = new Map([['a', config(1)], ['c', config(3)], ['d', config(4)]]);
+        await Promise.all([subscribed.refresh(), subscribed.refresh()]);
+        if (subscribed.dialers.length !== 3) throw Error('concurrent refreshes');
+
+        // Routing needs a dialer, so a load without any keeps the current ones.
+        entries = new Map();
+        let rejected = false;
+        try { await subscribed.refresh(); } catch { rejected = true; }
+        if (!rejected || subscribed.dialers.length !== 3 || updates.length !== 4) {
+            throw Error('an empty load replaced the dialers');
+        }
         subscribed.close();
     "#,
     )
@@ -620,10 +633,12 @@ async fn subscriptions_create_new_dialers_before_draining_removed_ones() {
     use kotoconn_config::ResourceId;
     use std::{num::NonZeroU64, time::Duration};
     let id = |id| ResourceId(NonZeroU64::new(id).unwrap());
-    assert_eq!(recorder.created().len(), 3);
-    assert_eq!(recorder.ended(id(1)), None);
+    assert_eq!(recorder.created().len(), 4);
     assert_eq!(
         recorder.ended(id(2)),
         Some(Ending::Drain(Duration::from_millis(1234)))
     );
+    for kept in [1, 3, 4] {
+        assert_eq!(recorder.ended(id(kept)), None);
+    }
 }

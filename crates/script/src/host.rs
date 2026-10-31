@@ -431,6 +431,7 @@ api! {
             let probe = config::Probe {
                 target: options.target.value,
                 request: options.request.map(|request| request.0).unwrap_or_default(),
+                length: options.length.map_or(1, |length| usize::from(length.0)),
                 timeout: options.timeout.value,
             };
             let result = crate::task::run(self.resources.probe(dialer.value, probe))

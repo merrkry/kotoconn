@@ -142,6 +142,8 @@ export function http_check(options: HttpCheckOptions): HealthCheck {
     const result = await k.probe(dialer, {
       target: options.target,
       request,
+      // "HTTP/1.1 204", which can arrive in several reads.
+      length: 12,
       timeout: options.timeout,
     });
     const status = /^HTTP\/1\.[01] ([0-9]{3})/.exec(
@@ -249,12 +251,14 @@ function checked(
   let members = nonEmpty(options.dialers);
   let current = members[0]!;
   let closed = false;
+  let rounds = 0;
 
   const check = async () => {
+    const round = ++rounds;
     const checked = members;
     const results = await Promise.allSettled(checked.map((member) => options.check(member)));
-    // An update during the round replaces the members it measured.
-    if (checked !== members) return;
+    // A later round or an update makes these measurements stale.
+    if (round !== rounds || checked !== members) return;
 
     const latencies = new Map<Dialer, number>();
     results.forEach((result, index) => {
@@ -318,14 +322,22 @@ export interface Subscription {
 /**
  * Keeps a set of dialers in sync with a subscription. Dialers for new keys are created
  * and passed to `update` before the dialers of removed keys drain, so routing moves
- * away from them first. The first load must succeed; later failures are logged and
- * keep the current dialers.
+ * away from them first. The first load must succeed; later failures, including a
+ * load without any usable dialer, are logged and keep the current dialers.
  */
 export async function subscription(options: SubscriptionOptions): Promise<Subscription> {
   let dialers = new Map<string, Dialer>();
   let closed = false;
+  // Refreshes run one at a time, so each compares against the dialers the last one left.
+  let previous = Promise.resolve();
 
-  const refresh = async () => {
+  const refresh = () => {
+    const applied = previous.then(apply);
+    previous = applied.catch(() => {});
+    return applied;
+  };
+
+  const apply = async () => {
     const loaded = await options.load();
     const next = new Map<string, Dialer>();
     for (const [key, config] of loaded) {
@@ -341,9 +353,12 @@ export async function subscription(options: SubscriptionOptions): Promise<Subscr
       }
     }
 
+    // Routing needs a dialer, so an update without any keeps the current ones.
+    if (next.size === 0) throw new Error("subscription has no usable dialers");
+
     const removed = [...dialers].filter(([key]) => !next.has(key));
     dialers = next;
-    if (next.size > 0) options.update([...next.values()]);
+    options.update([...next.values()]);
     for (const [key, dialer] of removed) {
       try {
         dialer.drain({ timeout: options.drain });
@@ -431,14 +446,7 @@ export async function auto_route(options: AutoRouteOptions): Promise<void> {
     }
   };
 
-  await remove();
-  for (const family of ["-4", "-6"]) {
-    await ip([family, "route", "replace", "default", "dev", options.interface, "table", table]);
-    for (const [index, rule] of rules.entries()) {
-      await ip([family, "rule", "add", "priority", priorities[index]!, ...rule!]);
-    }
-  }
-
+  // Registered first, so a startup that fails later still removes the routes.
   k.on_shutdown(async () => {
     if (options.drain_first ?? true) {
       options.inbound.drain({ timeout: options.drain ?? k.timeout(5000) });
@@ -446,6 +454,20 @@ export async function auto_route(options: AutoRouteOptions): Promise<void> {
     }
     await remove();
   });
+
+  await remove();
+  try {
+    for (const family of ["-4", "-6"]) {
+      await ip([family, "route", "replace", "default", "dev", options.interface, "table", table]);
+      for (const [index, rule] of rules.entries()) {
+        await ip([family, "rule", "add", "priority", priorities[index]!, ...rule!]);
+      }
+    }
+  } catch (error) {
+    // Partial routes could send traffic into the TUN without the bypass rules.
+    await remove();
+    throw error;
+  }
 }
 
 async function ip(argv: string[]): Promise<void> {

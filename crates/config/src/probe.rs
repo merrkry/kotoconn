@@ -8,6 +8,9 @@ pub struct Probe {
     pub target: Target,
     /// Sent once connected; empty for protocols where the server speaks first.
     pub request: Vec<u8>,
+    /// Response bytes to read before the probe completes, unless the server
+    /// closes the connection first.
+    pub length: usize,
     pub timeout: Duration,
 }
 
@@ -15,6 +18,6 @@ pub struct Probe {
 pub struct ProbeResult {
     /// From the start of the probe to the first response bytes.
     pub latency: Duration,
-    /// The first response bytes the connection delivered.
+    /// The response bytes read, at most the requested length.
     pub response: Vec<u8>,
 }

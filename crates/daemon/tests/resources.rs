@@ -332,7 +332,8 @@ async fn probes_measure_a_response_through_an_open_dialer() -> Result<()> {
             let dialer;
             const target = k.ip_target(k.ip('127.0.0.1'), {port});
             const probe = () => k.probe(dialer, {{
-                target, request: new Uint8Array([112, 105, 110, 103]), timeout: k.timeout(10000),
+                // The server closes after four bytes, which ends the read early.
+                target, request: new Uint8Array([112, 105, 110, 103]), length: 8, timeout: k.timeout(10000),
             }});
             const hook = async name => {{
                 if (name === 'probe') {{

@@ -34,6 +34,7 @@ pub(crate) fn declarations() -> String {
         Timeout::decl(&cfg),
         Port::decl(&cfg),
         Mtu::decl(&cfg),
+        Length::decl(&cfg),
         Byte::decl(&cfg),
         Bytes::decl(&cfg),
         Milliseconds::decl(&cfg),

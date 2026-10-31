@@ -148,7 +148,7 @@ async fn serve_tcp(
 
 /// Answers the DNS messages of one TCP connection, one at a time, so one client
 /// cannot run unbounded policy calls. Once `stopping` is cancelled, it reads no
-/// new message.
+/// new message. The connection ends with an orderly close of the write side.
 pub async fn serve_stream(
     mut stream: impl AsyncRead + AsyncWrite + Unpin,
     source: SocketAddr,
@@ -164,12 +164,12 @@ pub async fn serve_stream(
         };
         let message = tokio::select! {
             biased;
-            _ = stopping.cancelled() => return Ok(()),
+            _ = stopping.cancelled() => break,
             message = tokio::time::timeout(TCP_IDLE_TIMEOUT, read) => match message {
                 Ok(Ok(message)) => message,
-                Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Ok(Err(error)) => return Err(error.into()),
-                Err(_) => return Ok(()),
+                Err(_) => break,
             },
         };
 
@@ -182,6 +182,9 @@ pub async fn serve_stream(
             stream.write_all(&response).await?;
         }
     }
+
+    stream.shutdown().await?;
+    Ok(())
 }
 
 async fn bind_sockets(
@@ -374,6 +377,71 @@ fn encode<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        pin::Pin,
+        sync::atomic::{AtomicBool, Ordering},
+        task::{Context, Poll},
+    };
+
+    /// Records whether the server closed its write side.
+    struct Closing<S> {
+        stream: S,
+        shut_down: Arc<AtomicBool>,
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for Closing<S> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.stream).poll_read(cx, buffer)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for Closing<S> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.stream).poll_write(cx, bytes)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.stream).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.shut_down.store(true, Ordering::Release);
+            Pin::new(&mut self.stream).poll_shutdown(cx)
+        }
+    }
+
+    // Some streams, such as TUN connections, abort unless their writer closes them.
+    #[tokio::test]
+    async fn a_client_half_close_ends_the_stream_in_order() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let shut_down = Arc::new(AtomicBool::new(false));
+        let responder = Responder::new(InboundId(std::num::NonZeroU64::MIN), Arc::new(Unused));
+        client.shutdown().await.unwrap();
+
+        serve_stream(
+            Closing {
+                stream: server,
+                shut_down: shut_down.clone(),
+            },
+            "127.0.0.1:53".parse().unwrap(),
+            &responder,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(shut_down.load(Ordering::Acquire));
+    }
 
     struct Unused;
 

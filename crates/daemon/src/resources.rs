@@ -487,6 +487,7 @@ impl Manager {
     async fn probe(&self, id: DialerId, probe: Probe) -> Result<ProbeResult> {
         let (clients, lifetime) = self.open_dialer(id)?;
 
+        ensure!(probe.length > 0, "a probe reads at least one response byte");
         let started = Instant::now();
         let exchange = async {
             let mut stream = clients.tcp_scoped(probe.target, Scope::new()).await?;
@@ -494,24 +495,28 @@ impl Manager {
                 stream.write_all(&probe.request).await?;
             }
 
-            let mut response = vec![0; 4096];
-            let length = stream.read(&mut response).await?;
+            let mut response = vec![0; probe.length];
+            let mut length = stream.read(&mut response).await?;
             ensure!(length > 0, "connection closed before a response");
+            let latency = started.elapsed();
+
+            while length < response.len() {
+                match stream.read(&mut response[length..]).await? {
+                    0 => break,
+                    read => length += read,
+                }
+            }
             response.truncate(length);
-            Ok(response)
+            Ok(ProbeResult { latency, response })
         };
 
-        let response = tokio::select! {
+        tokio::select! {
             biased;
             _ = lifetime.admission.cancelled() => bail!("dialer is closed"),
             result = tokio::time::timeout(probe.timeout, exchange) => {
-                result.context("probe timed out")??
+                result.context("probe timed out")?
             }
-        };
-        Ok(ProbeResult {
-            latency: started.elapsed(),
-            response,
-        })
+        }
     }
 
     /// Runs `work` in the resource scope. A failure starts daemon shutdown.
