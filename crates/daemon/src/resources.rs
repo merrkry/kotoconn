@@ -52,13 +52,20 @@ struct Registry {
 }
 
 struct Entry {
-    config: ResourceConfig,
-    native: Native,
+    tier: Tier,
+    /// `None` once released, while the native state is destroyed; waiters still
+    /// find the entry until that finishes.
+    live: Option<Live>,
     lifetime: Arc<Lifetime>,
     /// The resource this one was created on, such as a dialer's carrier.
     uses: Option<ResourceId>,
     /// Open resources created on this one; it cannot close while any remain.
     users: usize,
+}
+
+struct Live {
+    config: ResourceConfig,
+    native: Native,
 }
 
 enum Native {
@@ -165,24 +172,16 @@ impl Manager {
 
     /// An open dialer for new work.
     pub fn dialer(&self, id: DialerId) -> Result<Arc<Clients>> {
-        match self.registry().entries.get(&id.into()) {
-            Some(Entry {
-                native: Native::Dialer(clients),
-                lifetime,
-                ..
-            }) if lifetime.is_open() => Ok(clients.clone()),
-            Some(Entry {
-                native: Native::Dialer(_),
-                ..
-            })
-            | None => bail!("dialer is closed"),
+        match self.registry().native(id.into()) {
+            Some((Native::Dialer(clients), true)) => Ok(clients.clone()),
+            Some((Native::Dialer(_), false)) | None => bail!("dialer is closed"),
             Some(_) => bail!("resource is not a dialer"),
         }
     }
 
     pub fn client_control(&self, id: DialerId, protocol: TransportProtocol) -> Option<Scope> {
-        match self.registry().entries.get(&id.into())?.native {
-            Native::Dialer(ref clients) => Some(clients.control(protocol)),
+        match self.registry().native(id.into())? {
+            (Native::Dialer(clients), _) => Some(clients.control(protocol)),
             _ => None,
         }
     }
@@ -193,7 +192,7 @@ impl Manager {
             .registry()
             .entries
             .iter()
-            .map(|(id, entry)| (*id, entry.config.clone()))
+            .filter_map(|(id, entry)| Some((*id, entry.live.as_ref()?.config.clone())))
             .collect();
         resources.sort_by_key(|(id, _)| id.0);
         resources
@@ -203,7 +202,7 @@ impl Manager {
         self.registry()
             .entries
             .iter()
-            .filter_map(|(id, entry)| match &entry.native {
+            .filter_map(|(id, entry)| match &entry.live.as_ref()?.native {
                 Native::Inbound(address) => Some((InboundId(id.0), address.clone())),
                 _ => None,
             })
@@ -246,8 +245,11 @@ impl Manager {
         registry.entries.insert(
             id,
             Entry {
-                config,
-                native: built.native,
+                tier: built.native.tier(),
+                live: Some(Live {
+                    config,
+                    native: built.native,
+                }),
                 lifetime: lifetime.clone(),
                 uses: built.uses,
                 users: 0,
@@ -282,7 +284,11 @@ impl Manager {
             .get_mut(&id)
             .filter(|entry| entry.lifetime.is_open())
             .context("referenced resource is closed")?;
-        let selected = select(&entry.native).context("referenced resource has the wrong kind")?;
+        let live = entry
+            .live
+            .as_ref()
+            .context("referenced resource is closed")?;
+        let selected = select(&live.native).context("referenced resource has the wrong kind")?;
 
         entry.users += 1;
         reservation.id = Some(id);
@@ -454,17 +460,9 @@ impl Manager {
     }
 
     async fn dns_query(&self, id: DnsServiceId, request: DnsRequest) -> Result<DnsResponse> {
-        let service = match self.registry().entries.get(&id.into()) {
-            Some(Entry {
-                native: Native::DnsService(service),
-                lifetime,
-                ..
-            }) if lifetime.is_open() => service.clone(),
-            Some(Entry {
-                native: Native::DnsService(_),
-                ..
-            })
-            | None => bail!("DNS service is closed"),
+        let service = match self.registry().native(id.into()) {
+            Some((Native::DnsService(service), true)) => service.clone(),
+            Some((Native::DnsService(_), false)) | None => bail!("DNS service is closed"),
             Some(_) => bail!("resource is not a DNS service"),
         };
 
@@ -544,10 +542,16 @@ impl Manager {
         lifetime.scope.close();
         lifetime.scope.wait().await;
 
-        let entry = self.registry().entries.remove(&id);
-        debug_assert!(entry.is_some(), "only the supervisor removes its entry");
-        // Native state, including handler references, is released before waiters resume.
-        drop(entry);
+        // Native state, including handler references, is destroyed before waiters resume.
+        let live = self
+            .registry()
+            .entries
+            .get_mut(&id)
+            .and_then(|entry| entry.live.take());
+        debug_assert!(live.is_some(), "only the supervisor releases its entry");
+        drop(live);
+
+        self.registry().entries.remove(&id);
         lifetime.released.cancel();
         tracing::debug!(resource_id = id.0.get(), "resource released");
     }
@@ -602,7 +606,7 @@ impl Manager {
         let ids: Vec<_> = registry
             .entries
             .iter()
-            .filter(|(_, entry)| entry.tier() == tier && entry.lifetime.is_open())
+            .filter(|(_, entry)| entry.tier == tier && entry.lifetime.is_open())
             .map(|(id, _)| *id)
             .collect();
         for id in ids {
@@ -616,7 +620,7 @@ impl Manager {
             .registry()
             .entries
             .values()
-            .filter(|entry| entry.tier() == tier)
+            .filter(|entry| entry.tier == tier)
             .map(|entry| entry.lifetime.released.clone())
             .collect();
 
@@ -646,12 +650,20 @@ enum Ending {
     Drain(Option<Instant>),
 }
 
-impl Entry {
+impl Native {
     fn tier(&self) -> Tier {
-        match self.native {
+        match self {
             Native::Inbound(_) => Tier::EntryPoint,
             Native::Dialer(_) | Native::DnsService(_) => Tier::Service,
         }
+    }
+}
+
+impl Registry {
+    /// The native state of a resource that has not been released, and whether it is open.
+    fn native(&self, id: ResourceId) -> Option<(&Native, bool)> {
+        let entry = self.entries.get(&id)?;
+        Some((&entry.live.as_ref()?.native, entry.lifetime.is_open()))
     }
 }
 
@@ -718,14 +730,65 @@ fn panic_message(panic: &(dyn Any + Send)) -> &str {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn creation_after_an_abort_registers_nothing() {
-        let (commands, _receiver) = tokio::sync::mpsc::channel(1);
+    fn manager() -> Arc<Manager> {
+        let (commands, _) = tokio::sync::mpsc::channel(1);
         let policy = Policy {
             commands,
             stopping: CancellationToken::new(),
         };
-        let manager = Manager::new(policy, CancellationToken::new());
+        Manager::new(policy, CancellationToken::new())
+    }
+
+    /// Blocks its destructor until the test lets it finish.
+    struct Dropping {
+        entered: Option<tokio::sync::oneshot::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Drop for Dropping {
+        fn drop(&mut self) {
+            self.entered.take().unwrap().send(()).unwrap();
+            self.release.recv().unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_includes_the_destruction_of_native_state() {
+        let manager = manager();
+        let (entered, dropping) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let registration = Arc::new(Mutex::new(Dropping {
+            entered: Some(entered),
+            release: released,
+        }));
+        let id = manager
+            .create(ResourceConfig::Dialer(DialerConfig {
+                carrier: CarrierConfig::Host(Default::default()),
+                outbound: OutboundConfig {
+                    implementation: OutboundImpl::Direct(DirectOutboundConfig {}),
+                    resolve_handler: ResolveHandler::new(std::num::NonZeroU64::MIN, registration),
+                },
+            }))
+            .await
+            .unwrap();
+
+        manager.terminate(id, Ending::Abort).unwrap();
+        dropping.await.unwrap();
+        let returned_before_destruction = tokio::select! {
+            biased;
+            _ = manager.released(id) => true,
+            _ = std::future::ready(()) => false,
+        };
+        release.send(()).unwrap();
+        assert!(
+            !returned_before_destruction,
+            "wait completed while the resource still owned its handler registration"
+        );
+    }
+
+    #[tokio::test]
+    async fn creation_after_an_abort_registers_nothing() {
+        let manager = manager();
         manager.abort();
 
         let config = ResourceConfig::Inbound(InboundConfig {

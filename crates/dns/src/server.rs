@@ -235,6 +235,10 @@ impl Responder {
     ) -> Option<Vec<u8>> {
         // A message without a complete header is not a DNS query and gets no response.
         let header = Header::read(&mut BinDecoder::new(&bytes)).ok()?;
+        // Answering a response could start a loop between two listeners.
+        if header.metadata.message_type != MessageType::Query {
+            return None;
+        }
         let request = match Request::from_bytes(bytes, source, protocol) {
             Ok(request) => request,
             Err(_) => {
@@ -347,5 +351,35 @@ fn encode<'a>(
                 .to_vec()
                 .ok()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Unused;
+
+    impl Handler for Unused {
+        fn handle(
+            &self,
+            _: DnsRequest,
+            _: DnsRequestInfo,
+        ) -> BoxFuture<'_, Result<DnsHandlerResult>> {
+            panic!("response packets must never enter policy");
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_get_no_reply() {
+        let responder = Responder {
+            id: InboundId(std::num::NonZeroU64::MIN),
+            handler: Arc::new(Unused),
+        };
+        let response = vec![0x12, 0x34, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let reply = responder
+            .respond(response, "127.0.0.1:53".parse().unwrap(), Protocol::Udp)
+            .await;
+        assert!(reply.is_none(), "listener replied to a response: {reply:?}");
     }
 }
