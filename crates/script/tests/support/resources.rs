@@ -20,6 +20,7 @@ pub enum Ending {
 pub struct Recorder {
     created: Mutex<Vec<(ResourceId, ResourceConfig)>>,
     ended: Mutex<HashMap<ResourceId, Ending>>,
+    probes: Mutex<HashMap<ResourceId, Result<ProbeResult, String>>>,
 }
 
 impl Recorder {
@@ -40,6 +41,11 @@ impl Recorder {
                 _ => None,
             })
             .expect("a dialer was created")
+    }
+
+    /// The result of later probes through `dialer`; probes fail without one.
+    pub fn set_probe(&self, dialer: ResourceId, result: Result<ProbeResult, String>) {
+        self.probes.lock().unwrap().insert(dialer, result);
     }
 
     /// Forget recorded configurations, dropping their handler references.
@@ -95,6 +101,17 @@ impl Resources for Recorder {
         Box::pin(async {})
     }
 
+    fn probe(&self, dialer: DialerId, _: Probe) -> NativeFuture<Result<ProbeResult, String>> {
+        let result = self
+            .probes
+            .lock()
+            .unwrap()
+            .get(&dialer.into())
+            .cloned()
+            .unwrap_or_else(|| Err("no probe result".to_owned()));
+        Box::pin(async move { result })
+    }
+
     fn dns_query(
         &self,
         _: DnsServiceId,
@@ -107,7 +124,13 @@ impl Resources for Recorder {
 pub async fn start(
     sources: impl ModuleSource + 'static,
 ) -> Result<(Script, Arc<Recorder>), kotoconn_script::Error> {
-    let recorder = Arc::new(Recorder::default());
+    start_with(Arc::new(Recorder::default()), sources).await
+}
+
+pub async fn start_with(
+    recorder: Arc<Recorder>,
+    sources: impl ModuleSource + 'static,
+) -> Result<(Script, Arc<Recorder>), kotoconn_script::Error> {
     let script = Script::new(sources, recorder.clone(), || false).await?;
     script.evaluate("main.ts").await?;
     Ok((script, recorder))

@@ -27,6 +27,14 @@ impl Resources for Unavailable {
         Box::pin(async {})
     }
 
+    fn probe(
+        &self,
+        _: config::DialerId,
+        _: config::Probe,
+    ) -> NativeFuture<Result<config::ProbeResult, String>> {
+        Box::pin(async { Err("unavailable".to_owned()) })
+    }
+
     fn dns_query(
         &self,
         _: config::DnsServiceId,

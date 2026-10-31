@@ -311,3 +311,56 @@ async fn a_dns_listener_drain_answers_accepted_queries_and_admits_no_new_ones() 
     })
     .await?
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probes_measure_a_response_through_an_open_dialer() -> Result<()> {
+    tokio::time::timeout(LIMIT, async {
+        let server = TcpListener::bind("127.0.0.1:0").await?;
+        let address = server.local_addr()?;
+        let serving = tokio::spawn(async move {
+            let (mut stream, _) = server.accept().await?;
+            let mut request = [0; 4];
+            stream.read_exact(&mut request).await?;
+            assert_eq!(&request, b"ping");
+            stream.write_all(b"pong").await?;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let daemon = start(format!(
+            r#"
+            import {{ kotoconn as k }} from '@kotoconn/bindings';
+            let dialer;
+            const target = k.ip_target(k.ip('127.0.0.1'), {port});
+            const probe = () => k.probe(dialer, {{
+                target, request: new Uint8Array([112, 105, 110, 103]), timeout: k.timeout(10000),
+            }});
+            const hook = async name => {{
+                if (name === 'probe') {{
+                    const result = await probe();
+                    if (String.fromCharCode(...result.response) !== 'pong' || !(result.latency >= 0)) {{
+                        throw Error('unexpected probe result');
+                    }}
+                }}
+                if (name === 'closed') {{
+                    dialer.close();
+                    await probe();
+                }}
+                return [];
+            }};
+            dialer = await k.dialer({{carrier: k.host_network({{}}), outbound: {{
+                resolve_handler: hook, implementation: k.direct_outbound({{}}),
+            }}}});
+        "#,
+            port = address.port(),
+        ))
+        .await?;
+
+        command(&daemon, "probe").await?;
+        serving.await??;
+        let error = command(&daemon, "closed").await.unwrap_err();
+        assert!(error.to_string().contains("dialer is closed"), "{error}");
+        assert_eq!(daemon.shutdown().await?, Shutdown::Drained);
+        Ok(())
+    })
+    .await?
+}

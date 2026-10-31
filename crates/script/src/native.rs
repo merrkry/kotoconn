@@ -212,6 +212,23 @@ pub(crate) struct DrainOptions {
     pub timeout: Timeout,
 }
 
+/// A health check through a dialer: connect to `target`, send `request` and wait
+/// for the first response bytes.
+#[derive(rquickjs::FromJs, TS)]
+pub(crate) struct ProbeOptions {
+    pub target: Target,
+    #[ts(optional)]
+    pub request: Option<Bytes>,
+    pub timeout: Timeout,
+}
+
+#[derive(rquickjs::IntoJs, TS)]
+pub(crate) struct ProbeResult {
+    /// Milliseconds from the start of the probe to the first response bytes.
+    pub latency: f64,
+    pub response: Bytes,
+}
+
 #[duplicate::duplicate_item(Kind; [Dialer]; [Inbound]; [DnsServiceRef];)]
 #[rquickjs::methods]
 impl Kind {

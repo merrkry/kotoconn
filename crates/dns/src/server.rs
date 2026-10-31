@@ -14,8 +14,8 @@ use kotoconn_config::{
 use kotoconn_protocol::Scope;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream, UdpSocket},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::{TcpListener, UdpSocket},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -55,7 +55,7 @@ pub async fn bind(
     );
 
     let (address, tcp, udp) = bind_sockets(config).await?;
-    let responder = Arc::new(Responder { id, handler });
+    let responder = Arc::new(Responder::new(id, handler));
     let run = Box::pin(async move {
         let udp = async {
             match udp {
@@ -112,7 +112,10 @@ async fn serve_udp(
         let request = buffer[..length].to_vec();
         let (responder, socket) = (responder.clone(), socket.clone());
         scope.spawn(async move {
-            let Some(response) = responder.respond(request, source, Protocol::Udp).await else {
+            let Some(response) = responder
+                .respond(request, source, TransportProtocol::Udp)
+                .await
+            else {
                 return Ok(());
             };
             if let Err(error) = socket.send_to(&response, source).await {
@@ -134,7 +137,7 @@ async fn serve_tcp(
     {
         let (responder, stopping) = (responder.clone(), stopping.clone());
         scope.spawn(async move {
-            if let Err(error) = serve_connection(stream, source, &responder, &stopping).await {
+            if let Err(error) = serve_stream(stream, source, &responder, &stopping).await {
                 tracing::debug!(%source, error = %format_args!("{error:#}"), "DNS TCP connection failed");
             }
             Ok(())
@@ -143,9 +146,11 @@ async fn serve_tcp(
     Ok(())
 }
 
-/// Answers one message at a time, so one client cannot run unbounded policy calls.
-async fn serve_connection(
-    mut stream: TcpStream,
+/// Answers the DNS messages of one TCP connection, one at a time, so one client
+/// cannot run unbounded policy calls. Once `stopping` is cancelled, it reads no
+/// new message.
+pub async fn serve_stream(
+    mut stream: impl AsyncRead + AsyncWrite + Unpin,
     source: SocketAddr,
     responder: &Responder,
     stopping: &CancellationToken,
@@ -168,7 +173,10 @@ async fn serve_connection(
             },
         };
 
-        if let Some(response) = responder.respond(message, source, Protocol::Tcp).await {
+        if let Some(response) = responder
+            .respond(message, source, TransportProtocol::Tcp)
+            .await
+        {
             let length = u16::try_from(response.len()).context("DNS response too long")?;
             stream.write_all(&length.to_be_bytes()).await?;
             stream.write_all(&response).await?;
@@ -220,19 +228,28 @@ async fn bind_sockets(
     unreachable!("final bind attempt returns its result")
 }
 
-struct Responder {
-    id: InboundId,
+/// Answers DNS messages that `inbound` received with a policy handler.
+pub struct Responder {
+    inbound: InboundId,
     handler: Arc<dyn Handler>,
 }
 
 impl Responder {
+    pub fn new(inbound: InboundId, handler: Arc<dyn Handler>) -> Self {
+        Self { inbound, handler }
+    }
+
     /// The encoded response to one received message, if it gets any.
-    async fn respond(
+    pub async fn respond(
         &self,
         bytes: Vec<u8>,
         source: SocketAddr,
-        protocol: Protocol,
+        protocol: TransportProtocol,
     ) -> Option<Vec<u8>> {
+        let protocol = match protocol {
+            TransportProtocol::Udp => Protocol::Udp,
+            TransportProtocol::Tcp => Protocol::Tcp,
+        };
         // A message without a complete header is not a DNS query and gets no response.
         let header = Header::read(&mut BinDecoder::new(&bytes)).ok()?;
         // Answering a response could start a loop between two listeners.
@@ -274,7 +291,7 @@ impl Responder {
             let result = async {
                 let message = Message::from_vec(request.as_slice())?;
                 let info = DnsRequestInfo {
-                    inbound: self.id,
+                    inbound: self.inbound,
                     source,
                     protocol: match protocol {
                         Protocol::Udp => TransportProtocol::Udp,
@@ -288,7 +305,7 @@ impl Responder {
                 Ok(DnsHandlerResult::Drop) => return None,
                 Ok(DnsHandlerResult::Response(response)) => Ok(response),
                 Err(error) => {
-                    tracing::warn!(inbound_id = self.id.0.get(), %source, error = %format_args!("{error:#}"), "DNS policy failed");
+                    tracing::warn!(inbound_id = self.inbound.0.get(), %source, error = %format_args!("{error:#}"), "DNS policy failed");
                     Err(ResponseCode::ServFail)
                 }
             }
@@ -372,13 +389,14 @@ mod tests {
 
     #[tokio::test]
     async fn responses_get_no_reply() {
-        let responder = Responder {
-            id: InboundId(std::num::NonZeroU64::MIN),
-            handler: Arc::new(Unused),
-        };
+        let responder = Responder::new(InboundId(std::num::NonZeroU64::MIN), Arc::new(Unused));
         let response = vec![0x12, 0x34, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let reply = responder
-            .respond(response, "127.0.0.1:53".parse().unwrap(), Protocol::Udp)
+            .respond(
+                response,
+                "127.0.0.1:53".parse().unwrap(),
+                TransportProtocol::Udp,
+            )
             .await;
         assert!(reply.is_none(), "listener replied to a response: {reply:?}");
     }

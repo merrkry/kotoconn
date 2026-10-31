@@ -35,9 +35,19 @@ pub(crate) struct SessionHandler {
     pub sessions: sessions::Sessions,
     pub idle: std::time::Duration,
     pub sniff: Option<SniffConfig>,
+    /// The inbound's admission, which also ends DNS conversations it answers itself.
+    pub stopping: tokio_util::sync::CancellationToken,
 }
 
 impl SessionHandler {
+    pub(super) fn responder(&self, handler: DnsHandler) -> kotoconn_dns::Responder {
+        let handler = dns::Handler {
+            policy: self.policy.clone(),
+            handler,
+        };
+        kotoconn_dns::Responder::new(self.inbound, Arc::new(handler))
+    }
+
     fn dialer(&self, id: DialerId) -> Result<Arc<kotoconn_outbounds::Clients>> {
         self.manager
             .upgrade()
@@ -99,6 +109,17 @@ impl p::Handler for SessionHandler {
                             RouteDecision::Reject => {
                                 tracing::debug!("TCP session rejected");
                                 return Ok(());
+                            }
+                            RouteDecision::Dns { handler } => {
+                                tracing::debug!("TCP session answered by a DNS handler");
+                                let responder = self.responder(handler);
+                                return kotoconn_dns::serve_stream(
+                                    &mut stream,
+                                    source,
+                                    &responder,
+                                    &self.stopping,
+                                )
+                                .await;
                             }
                             // SAFETY: Policy::route rejects UDP decisions for TCP flows.
                             RouteDecision::Udp { .. } => {

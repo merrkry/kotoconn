@@ -5,5 +5,5 @@ mod runtime;
 mod server;
 mod service;
 
-pub use server::{BoundListener, Handler, bind};
+pub use server::{BoundListener, Handler, Responder, bind, serve_stream};
 pub use service::Service;

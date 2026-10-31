@@ -515,3 +515,115 @@ async fn dns_helpers_create_services_and_validate_cache_options() {
         Some(Ending::Drain(std::time::Duration::from_millis(10)))
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn groups_pick_members_from_health_checks() {
+    use kotoconn_config::{ProbeResult, ResourceId};
+    use std::{num::NonZeroU64, sync::Arc, time::Duration};
+
+    let recorder = Arc::new(resources::Recorder::default());
+    let healthy = |milliseconds, status: &str| {
+        Ok(ProbeResult {
+            latency: Duration::from_millis(milliseconds),
+            response: format!("HTTP/1.1 {status} OK\r\n").into_bytes(),
+        })
+    };
+    let id = |id| ResourceId(NonZeroU64::new(id).unwrap());
+    recorder.set_probe(id(1), healthy(50, "204"));
+    recorder.set_probe(id(2), healthy(20, "204"));
+    recorder.set_probe(id(3), Err("unreachable".into()));
+    recorder.set_probe(id(4), healthy(5, "500"));
+
+    resources::start_with(
+        recorder,
+        HashMap::from([(
+            "main.ts".to_owned(),
+            r#"
+            import { kotoconn as k } from '@kotoconn/bindings';
+            import { fallback, fastest, http_check, selector } from '@kotoconn/api';
+            const outbound = {resolve_handler: () => [], implementation: k.direct_outbound({})};
+            const dialers = [];
+            for (let index = 0; index < 4; index++) {
+                dialers.push(await k.dialer({carrier: k.host_network({}), outbound}));
+            }
+            const expect = (group, dialer, message) => {
+                if (!group.current.equals(dialer)) throw Error(message);
+            };
+            const check = http_check({target: k.domain('check.invalid', 80), timeout: k.timeout(1000)});
+            const interval = k.timeout(3_600_000);
+
+            const latest = fastest({dialers, check, interval});
+            await latest.check();
+            expect(latest, dialers[1], 'fastest healthy member');
+            const sticky = fastest({dialers, check, interval, tolerance: 40});
+            await sticky.check();
+            expect(sticky, dialers[0], 'tolerance keeps the current member');
+            sticky.update([dialers[2], dialers[0]]);
+            await sticky.check();
+            expect(sticky, dialers[0], 'update keeps a remaining member');
+
+            const ordered = fallback({dialers: [dialers[2], dialers[3], dialers[1], dialers[0]], check, interval});
+            await ordered.check();
+            expect(ordered, dialers[1], 'first healthy member');
+            const unhealthy = fallback({dialers: [dialers[2], dialers[3]], check, interval});
+            await unhealthy.check();
+            expect(unhealthy, dialers[2], 'first member without a healthy one');
+
+            const manual = selector(dialers);
+            expect(manual, dialers[0], 'selector starts with the first member');
+            manual.select(dialers[2]);
+            expect(manual, dialers[2], 'selected member');
+            manual.update([dialers[1]]);
+            expect(manual, dialers[1], 'update replaces a removed selection');
+            let rejected = false;
+            try { manual.select(dialers[0]); } catch { rejected = true; }
+            if (!rejected) throw Error('selected a dialer outside the group');
+            for (const group of [latest, sticky, ordered, unhealthy, manual]) group.close();
+        "#
+            .to_owned(),
+        )]),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subscriptions_create_new_dialers_before_draining_removed_ones() {
+    let (_script, recorder) = load(
+        r#"
+        import { kotoconn as k } from '@kotoconn/bindings';
+        import { subscription } from '@kotoconn/api';
+        const config = (port) => ({carrier: k.host_network({}), outbound: {
+            resolve_handler: () => [], implementation: k.socks5_outbound({server: k.domain('proxy.invalid', port)}),
+        }});
+        let entries = new Map([['a', config(1)], ['b', config(2)]]);
+        const updates = [];
+        const subscribed = await subscription({
+            load: async () => entries,
+            interval: k.timeout(3_600_000),
+            drain: k.timeout(1234),
+            update: dialers => updates.push(dialers),
+        });
+        const [a] = subscribed.dialers;
+
+        entries = new Map([['a', config(1)], ['c', config(3)]]);
+        await subscribed.refresh();
+        const [kept, added] = subscribed.dialers;
+        if (!kept.equals(a) || updates.length !== 2 || updates[1].length !== 2 || !updates[1][1].equals(added)) {
+            throw Error('subscription did not keep a and add c');
+        }
+        subscribed.close();
+    "#,
+    )
+    .await;
+
+    use kotoconn_config::ResourceId;
+    use std::{num::NonZeroU64, time::Duration};
+    let id = |id| ResourceId(NonZeroU64::new(id).unwrap());
+    assert_eq!(recorder.created().len(), 3);
+    assert_eq!(recorder.ended(id(1)), None);
+    assert_eq!(
+        recorder.ended(id(2)),
+        Some(Ending::Drain(Duration::from_millis(1234)))
+    );
+}

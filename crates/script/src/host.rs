@@ -282,6 +282,13 @@ api! {
             Ok(config::RouteDecision::Udp { dialer: dialer.value }.into())
         }
 
+        fn route_dns(self, handler: DnsHandler<'js>) -> Decision {
+            Ok(config::RouteDecision::Dns {
+                handler: self.register(handler.function)?,
+            }
+            .into())
+        }
+
         fn reject(self) -> Decision {
             Ok(config::RouteDecision::Reject.into())
         }
@@ -418,6 +425,22 @@ api! {
                 .await?
                 .map_err(invalid)?;
             Ok(response.into())
+        }
+
+        fn probe(self, dialer: Dialer, options: ProbeOptions) -> ProbeResult {
+            let probe = config::Probe {
+                target: options.target.value,
+                request: options.request.map(|request| request.0).unwrap_or_default(),
+                timeout: options.timeout.value,
+            };
+            let result = crate::task::run(self.resources.probe(dialer.value, probe))
+                .await?
+                .map_err(invalid)?;
+
+            Ok(ProbeResult {
+                latency: result.latency.as_secs_f64() * 1000.0,
+                response: Bytes(result.response),
+            })
         }
 
         fn lookup(self, name: String) -> Vec<IpAddr> {

@@ -21,6 +21,7 @@ pub(crate) fn declarations() -> String {
         Dialer::drain;
     let _: for<'js> fn(&Dialer, rquickjs::Ctx<'js>) -> rquickjs::Result<rquickjs::Promise<'js>> =
         Dialer::wait;
+
     let _: fn(&Target) -> u16 = Target::port;
     let _: fn(&Target) -> Option<String> = Target::domain;
     let _: fn(&Target) -> Option<IpAddr> = Target::ip;
@@ -40,6 +41,8 @@ pub(crate) fn declarations() -> String {
         Inbound::decl(&cfg),
         "interface Resource { close(): void; drain(options: DrainOptions): void; wait(): Promise<void>; }".into(),
         DrainOptions::decl(&cfg),
+        ProbeOptions::decl(&cfg),
+        ProbeResult::decl(&cfg),
         format!("type RoutingHandler = {};", host::RoutingHandler::name(&cfg)),
         format!("type ResolveHandler = {};", host::ResolveHandler::name(&cfg)),
         format!("type DnsHandler = {};", host::DnsHandler::name(&cfg)),
