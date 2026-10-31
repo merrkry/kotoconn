@@ -56,15 +56,28 @@ impl Clients {
                 Arc::new(anytls::Client::new(&options, carrier, resolver)?)
             }
             #[cfg(target_os = "linux")]
-            OutboundImpl::Naive(options) => Arc::new(naive::Client::new(
-                options.clone(),
-                Endpoint {
-                    address: options.server,
-                    resolver,
-                },
-                carrier,
-                tcp.clone(),
-            )?),
+            OutboundImpl::Naive(options) => {
+                // Naive carries only TCP, so closing its TCP clients also closes the
+                // engine's pooled sessions. They are not connections, so draining
+                // the clients does not wait for them.
+                let pool = scope.child();
+                let (closing, closed) = (pool.clone(), tcp.clone());
+                pool.spawn(async move {
+                    closed.cancelled().await;
+                    closing.close();
+                    Ok(())
+                })?;
+
+                Arc::new(naive::Client::new(
+                    options.clone(),
+                    Endpoint {
+                        address: options.server,
+                        resolver,
+                    },
+                    carrier,
+                    pool,
+                )?)
+            }
             #[cfg(not(target_os = "linux"))]
             OutboundImpl::Naive(_) => {
                 anyhow::bail!("Naive outbound requires the Linux SagerNet Cronet runtime")
