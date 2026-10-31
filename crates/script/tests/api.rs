@@ -5,6 +5,78 @@ use kotoconn_script::Script;
 use resources::{Ending, load};
 use std::collections::HashMap;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rejected_subscription_update_keeps_the_current_dialers() {
+    let result = evaluate(r#"
+        import { kotoconn as k } from '@kotoconn/bindings';
+        import { subscription } from '@kotoconn/api';
+        const config = {carrier: k.host_network({}), outbound: {
+            resolve_handler: () => [], implementation: k.direct_outbound({}),
+        }};
+        let entries = new Map([['a', config]]);
+        let reject = false;
+        const subscribed = await subscription({
+            load: async () => entries, interval: k.timeout(3600000), drain: k.timeout(1000),
+            update: () => { if (reject) throw Error('consumer could not apply update'); },
+        });
+        const [original] = subscribed.dialers;
+        entries = new Map([['b', config]]);
+        reject = true;
+        try { await subscribed.refresh(); } catch {}
+        subscribed.close();
+        if (!subscribed.dialers[0].equals(original)) throw Error('failed update replaced current dialers');
+    "#).await;
+    assert!(result.is_ok(), "{}", result.err().unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_removes_routes_that_an_installation_adds_meanwhile() {
+    let (script, recorder) = load(r#"
+        import { kotoconn as k } from '@kotoconn/bindings';
+        import { auto_route } from '@kotoconn/api';
+        let release;
+        let entered;
+        const installing = new Promise(resolve => { entered = resolve; });
+        const resume = new Promise(resolve => { release = resolve; });
+        const rules = new Set();
+        // Hooks run newest first, so the blocked command finishes after the preset's cleanup.
+        k.on_shutdown(() => release());
+        k.exec = async argv => {
+            const [, family, kind, operation] = argv;
+            if (kind === 'rule') {
+                const priority = argv[5];
+                const key = `${family}/${priority}`;
+                if (operation === 'del') {
+                    return {status: rules.delete(key) ? 0 : 2, stdout: '', stderr: ''};
+                }
+                if (family === '-6' && priority === '9002') {
+                    entered();
+                    await resume;
+                }
+                rules.add(key);
+            }
+            return {status: 0, stdout: '', stderr: ''};
+        };
+        await k.dialer({carrier: k.host_network({}), outbound: {
+            implementation: k.direct_outbound({}),
+            resolve_handler: () => {
+                if (rules.size !== 0) throw Error(`installation added rules after cleanup: ${[...rules]}`);
+                return [];
+            },
+        }});
+        auto_route({
+            interface: 'testtun0', mark: 8226,
+            inbound: {drain() {}, async wait() {}},
+        });
+        await installing;
+    "#).await;
+
+    script.shutdown().await.unwrap();
+    script.idle().await;
+    let result = script.resolve(&recorder.resolve_handler(), "check").await;
+    assert!(result.is_ok(), "{}", result.err().unwrap());
+}
+
 async fn evaluate(source: &str) -> Result<Script, kotoconn_script::Error> {
     resources::start(HashMap::from([("main.ts".to_owned(), source.to_owned())]))
         .await
@@ -514,4 +586,212 @@ async fn dns_helpers_create_services_and_validate_cache_options() {
         recorder.ended(*uncached_id),
         Some(Ending::Drain(std::time::Duration::from_millis(10)))
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn groups_pick_members_from_health_checks() {
+    use kotoconn_config::{ProbeResult, ResourceId};
+    use std::{num::NonZeroU64, sync::Arc, time::Duration};
+
+    let recorder = Arc::new(resources::Recorder::default());
+    let healthy = |milliseconds, status: &str| {
+        Ok(ProbeResult {
+            latency: Duration::from_millis(milliseconds),
+            response: format!("HTTP/1.1 {status} OK\r\n").into_bytes(),
+        })
+    };
+    let id = |id| ResourceId(NonZeroU64::new(id).unwrap());
+    recorder.set_probe(id(1), healthy(50, "204"));
+    recorder.set_probe(id(2), healthy(20, "204"));
+    recorder.set_probe(id(3), Err("unreachable".into()));
+    recorder.set_probe(id(4), healthy(5, "500"));
+
+    resources::start_with(
+        recorder,
+        HashMap::from([(
+            "main.ts".to_owned(),
+            r#"
+            import { kotoconn as k } from '@kotoconn/bindings';
+            import { fallback, fastest, http_check, selector } from '@kotoconn/api';
+            const outbound = {resolve_handler: () => [], implementation: k.direct_outbound({})};
+            const dialers = [];
+            for (let index = 0; index < 4; index++) {
+                dialers.push(await k.dialer({carrier: k.host_network({}), outbound}));
+            }
+            const expect = (group, dialer, message) => {
+                if (!group.current.equals(dialer)) throw Error(message);
+            };
+            const check = http_check({target: k.domain('check.invalid', 80), timeout: k.timeout(1000)});
+            const interval = k.timeout(3_600_000);
+
+            const latest = fastest({dialers, check, interval});
+            await latest.check();
+            expect(latest, dialers[1], 'fastest healthy member');
+            const sticky = fastest({dialers, check, interval, tolerance: 40});
+            await sticky.check();
+            expect(sticky, dialers[0], 'tolerance keeps the current member');
+            sticky.update([dialers[2], dialers[0]]);
+            await sticky.check();
+            expect(sticky, dialers[0], 'update keeps a remaining member');
+
+            const ordered = fallback({dialers: [dialers[2], dialers[3], dialers[1], dialers[0]], check, interval});
+            await ordered.check();
+            expect(ordered, dialers[1], 'first healthy member');
+            const unhealthy = fallback({dialers: [dialers[2], dialers[3]], check, interval});
+            await unhealthy.check();
+            expect(unhealthy, dialers[2], 'first member without a healthy one');
+
+            const manual = selector(dialers);
+            expect(manual, dialers[0], 'selector starts with the first member');
+            manual.select(dialers[2]);
+            expect(manual, dialers[2], 'selected member');
+            manual.update([dialers[1]]);
+            expect(manual, dialers[1], 'update replaces a removed selection');
+            let rejected = false;
+            try { manual.select(dialers[0]); } catch { rejected = true; }
+            if (!rejected) throw Error('selected a dialer outside the group');
+            for (const group of [latest, sticky, ordered, unhealthy, manual]) group.close();
+        "#
+            .to_owned(),
+        )]),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subscriptions_create_new_dialers_before_draining_removed_ones() {
+    let (_script, recorder) = load(
+        r#"
+        import { kotoconn as k } from '@kotoconn/bindings';
+        import { subscription } from '@kotoconn/api';
+        const config = (port) => ({carrier: k.host_network({}), outbound: {
+            resolve_handler: () => [], implementation: k.socks5_outbound({server: k.domain('proxy.invalid', port)}),
+        }});
+        let entries = new Map([['a', config(1)], ['b', config(2)]]);
+        const updates = [];
+        const subscribed = await subscription({
+            load: async () => entries,
+            interval: k.timeout(3_600_000),
+            drain: k.timeout(1234),
+            update: dialers => updates.push(dialers),
+        });
+        const [a] = subscribed.dialers;
+
+        entries = new Map([['a', config(1)], ['c', config(3)]]);
+        await subscribed.refresh();
+        const [kept, added] = subscribed.dialers;
+        if (!kept.equals(a) || updates.length !== 2 || updates[1].length !== 2 || !updates[1][1].equals(added)) {
+            throw Error('subscription did not keep a and add c');
+        }
+
+        // Refreshes apply one at a time, so each new dialer is created once.
+        entries = new Map([['a', config(1)], ['c', config(3)], ['d', config(4)]]);
+        await Promise.all([subscribed.refresh(), subscribed.refresh()]);
+        if (subscribed.dialers.length !== 3) throw Error('concurrent refreshes');
+
+        // Routing needs a dialer, so a load without any keeps the current ones.
+        entries = new Map();
+        let rejected = false;
+        try { await subscribed.refresh(); } catch { rejected = true; }
+        if (!rejected || subscribed.dialers.length !== 3 || updates.length !== 4) {
+            throw Error('an empty load replaced the dialers');
+        }
+        subscribed.close();
+    "#,
+    )
+    .await;
+
+    use kotoconn_config::ResourceId;
+    use std::{num::NonZeroU64, time::Duration};
+    let id = |id| ResourceId(NonZeroU64::new(id).unwrap());
+    assert_eq!(recorder.created().len(), 4);
+    assert_eq!(
+        recorder.ended(id(2)),
+        Some(Ending::Drain(Duration::from_millis(1234)))
+    );
+    for kept in [1, 3, 4] {
+        assert_eq!(recorder.ended(id(kept)), None);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_auto_route_installation_removes_what_it_added() {
+    evaluate(
+        r#"
+        import { kotoconn as k } from '@kotoconn/bindings';
+        import { auto_route } from '@kotoconn/api';
+        // Rules and routes the recorded `ip` commands leave, as family/kind/priority keys.
+        const installed = new Set();
+        k.exec = async argv => {
+            const [, family, kind, operation] = argv;
+            const key = `${family}/${kind}/${kind === 'rule' ? argv[5] : 'default'}`;
+            if (operation === 'del' || operation === 'flush') {
+                return {status: installed.delete(key) ? 0 : 2, stdout: '', stderr: ''};
+            }
+            // IPv6 is unavailable.
+            if (family === '-6') return {status: 2, stdout: '', stderr: 'IPv6 is disabled'};
+            installed.add(key);
+            return {status: 0, stdout: '', stderr: ''};
+        };
+
+        let rejected = false;
+        try {
+            await auto_route({interface: 'testtun0', mark: 8226, inbound: {drain() {}, async wait() {}}});
+        } catch (error) {
+            rejected = String(error).includes('IPv6 is disabled');
+        }
+        if (!rejected || installed.size !== 0) throw Error(`left ${[...installed]}`);
+    "#,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_checks_address_the_target_authority() {
+    load(r#"
+        import { kotoconn as k } from '@kotoconn/bindings';
+        import { http_check } from '@kotoconn/api';
+        const dialer = await k.dialer({carrier: k.host_network({}), outbound: {
+            resolve_handler: () => [], implementation: k.direct_outbound({}),
+        }});
+        k.probe = async (_, options) => {
+            const request = String.fromCharCode(...options.request);
+            if (!request.includes('\r\nHost: [::1]:8080\r\n')) {
+                throw Error(`incorrect HTTP authority: ${JSON.stringify(request)}`);
+            }
+            return {latency: 1, response: new Uint8Array([72,84,84,80,47,49,46,49,32,50,48,52])};
+        };
+        await http_check({target: k.ip_target(k.ip('::1'), 8080), timeout: k.timeout(1000)})(dialer);
+    "#).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_throwing_health_check_fails_only_its_member() {
+    load(
+        r#"
+        import { kotoconn as k } from '@kotoconn/bindings';
+        import { fallback } from '@kotoconn/api';
+        const config = {carrier: k.host_network({}), outbound: {
+            resolve_handler: () => [], implementation: k.direct_outbound({}),
+        }};
+        const a = await k.dialer(config);
+        const b = await k.dialer(config);
+        const group = fallback({
+            dialers: [a, b], interval: k.timeout(3600000),
+            check: dialer => {
+                if (dialer.equals(a)) throw Error('member is unavailable');
+                return Promise.resolve(10);
+            },
+        });
+        try {
+            await group.check();
+            if (!group.current.equals(b)) throw Error('healthy member was not selected');
+        } finally {
+            group.close();
+        }
+    "#,
+    )
+    .await;
 }

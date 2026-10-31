@@ -671,3 +671,74 @@ fn dialer_resolver(daemon: &Daemon, index: usize) -> ResolveHandler {
         .nth(index)
         .unwrap()
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routing_passes_dns_flows_to_a_handler_over_udp_and_tcp() -> Result<()> {
+    use kotoconn_config::{OutboundImpl, Socks5OutboundConfig};
+    use kotoconn_outbounds::{Clients, System, SystemResolver};
+    use kotoconn_protocol::{Carrier, Packet, Scope, target};
+    use std::sync::Arc;
+
+    tokio::time::timeout(LIMIT, async {
+        let daemon = start(
+            r#"
+            import {kotoconn as k} from '@kotoconn/bindings';
+            const protocols = [];
+            const inbound = await k.inbound({
+                implementation: k.socks5_inbound({listen: {address: k.ip('127.0.0.1'), port: 0}}),
+                udp_idle_timeout: k.timeout(10000),
+                routing_handler: flow => flow.dest.port === 53 ? k.route_dns(request => {
+                    if (!request.inbound.equals(inbound) || !request.source.address.is_loopback()) {
+                        throw Error('missing request context');
+                    }
+                    const bytes = k.request_bytes(request);
+                    bytes[2] |= 0x80;
+                    bytes[3] = request.protocol === 'tcp' ? 5 : 0;
+                    return k.respond(k.dns_response(bytes));
+                }) : k.reject(),
+            });
+        "#
+            .into(),
+        )
+        .await?;
+        let client = Clients::new(
+            OutboundImpl::Socks5(Socks5OutboundConfig {
+                server: target(listen(&daemon)),
+            }),
+            Arc::new(System::new(Scope::new(), Default::default())?),
+            Arc::new(SystemResolver),
+        )?;
+        let destination = target("192.0.2.53:53".parse()?);
+
+        let mut datagrams = client.udp(destination.clone()).await?;
+        datagrams
+            .tx
+            .send(Packet {
+                target: destination.clone(),
+                payload: query("example.", 7).to_vec()?.into(),
+            })
+            .await?;
+        let reply = datagrams.rx.recv().await.unwrap();
+        assert_eq!(reply.target, destination);
+        let answered = Message::from_vec(&reply.payload)?;
+        assert_eq!(answered.metadata.id, 7);
+        assert_eq!(answered.metadata.response_code, ResponseCode::NoError);
+
+        let mut stream = client.tcp(destination).await?;
+        let request = query("example.", 8).to_vec()?;
+        stream
+            .write_all(&u16::try_from(request.len())?.to_be_bytes())
+            .await?;
+        stream.write_all(&request).await?;
+        let length = stream.read_u16().await?;
+        let mut response = vec![0; usize::from(length)];
+        stream.read_exact(&mut response).await?;
+        let answered = Message::from_vec(&response)?;
+        assert_eq!(answered.metadata.id, 8);
+        assert_eq!(answered.metadata.response_code, ResponseCode::Refused);
+
+        assert_eq!(daemon.shutdown().await?, Shutdown::Drained);
+        Ok(())
+    })
+    .await?
+}

@@ -14,8 +14,8 @@ use kotoconn_config::{
 use kotoconn_protocol::Scope;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream, UdpSocket},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::{TcpListener, UdpSocket},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -55,7 +55,7 @@ pub async fn bind(
     );
 
     let (address, tcp, udp) = bind_sockets(config).await?;
-    let responder = Arc::new(Responder { id, handler });
+    let responder = Arc::new(Responder::new(id, handler));
     let run = Box::pin(async move {
         let udp = async {
             match udp {
@@ -112,7 +112,10 @@ async fn serve_udp(
         let request = buffer[..length].to_vec();
         let (responder, socket) = (responder.clone(), socket.clone());
         scope.spawn(async move {
-            let Some(response) = responder.respond(request, source, Protocol::Udp).await else {
+            let Some(response) = responder
+                .respond(request, source, TransportProtocol::Udp)
+                .await
+            else {
                 return Ok(());
             };
             if let Err(error) = socket.send_to(&response, source).await {
@@ -134,7 +137,7 @@ async fn serve_tcp(
     {
         let (responder, stopping) = (responder.clone(), stopping.clone());
         scope.spawn(async move {
-            if let Err(error) = serve_connection(stream, source, &responder, &stopping).await {
+            if let Err(error) = serve_stream(stream, source, &responder, &stopping).await {
                 tracing::debug!(%source, error = %format_args!("{error:#}"), "DNS TCP connection failed");
             }
             Ok(())
@@ -143,9 +146,11 @@ async fn serve_tcp(
     Ok(())
 }
 
-/// Answers one message at a time, so one client cannot run unbounded policy calls.
-async fn serve_connection(
-    mut stream: TcpStream,
+/// Answers the DNS messages of one TCP connection, one at a time, so one client
+/// cannot run unbounded policy calls. Once `stopping` is cancelled, it reads no
+/// new message. The connection ends with an orderly close of the write side.
+pub async fn serve_stream(
+    mut stream: impl AsyncRead + AsyncWrite + Unpin,
     source: SocketAddr,
     responder: &Responder,
     stopping: &CancellationToken,
@@ -159,21 +164,29 @@ async fn serve_connection(
         };
         let message = tokio::select! {
             biased;
-            _ = stopping.cancelled() => return Ok(()),
+            _ = stopping.cancelled() => break,
             message = tokio::time::timeout(TCP_IDLE_TIMEOUT, read) => match message {
                 Ok(Ok(message)) => message,
-                Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                Ok(Err(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Ok(Err(error)) => return Err(error.into()),
-                Err(_) => return Ok(()),
+                Err(_) => break,
             },
         };
 
-        if let Some(response) = responder.respond(message, source, Protocol::Tcp).await {
+        if let Some(response) = responder
+            .respond(message, source, TransportProtocol::Tcp)
+            .await
+        {
             let length = u16::try_from(response.len()).context("DNS response too long")?;
             stream.write_all(&length.to_be_bytes()).await?;
             stream.write_all(&response).await?;
+            // Buffering streams would hold the answer while the client waits for it.
+            stream.flush().await?;
         }
     }
+
+    stream.shutdown().await?;
+    Ok(())
 }
 
 async fn bind_sockets(
@@ -220,19 +233,28 @@ async fn bind_sockets(
     unreachable!("final bind attempt returns its result")
 }
 
-struct Responder {
-    id: InboundId,
+/// Answers DNS messages that `inbound` received with a policy handler.
+pub struct Responder {
+    inbound: InboundId,
     handler: Arc<dyn Handler>,
 }
 
 impl Responder {
+    pub fn new(inbound: InboundId, handler: Arc<dyn Handler>) -> Self {
+        Self { inbound, handler }
+    }
+
     /// The encoded response to one received message, if it gets any.
-    async fn respond(
+    pub async fn respond(
         &self,
         bytes: Vec<u8>,
         source: SocketAddr,
-        protocol: Protocol,
+        protocol: TransportProtocol,
     ) -> Option<Vec<u8>> {
+        let protocol = match protocol {
+            TransportProtocol::Udp => Protocol::Udp,
+            TransportProtocol::Tcp => Protocol::Tcp,
+        };
         // A message without a complete header is not a DNS query and gets no response.
         let header = Header::read(&mut BinDecoder::new(&bytes)).ok()?;
         // Answering a response could start a loop between two listeners.
@@ -274,7 +296,7 @@ impl Responder {
             let result = async {
                 let message = Message::from_vec(request.as_slice())?;
                 let info = DnsRequestInfo {
-                    inbound: self.id,
+                    inbound: self.inbound,
                     source,
                     protocol: match protocol {
                         Protocol::Udp => TransportProtocol::Udp,
@@ -288,7 +310,7 @@ impl Responder {
                 Ok(DnsHandlerResult::Drop) => return None,
                 Ok(DnsHandlerResult::Response(response)) => Ok(response),
                 Err(error) => {
-                    tracing::warn!(inbound_id = self.id.0.get(), %source, error = %format_args!("{error:#}"), "DNS policy failed");
+                    tracing::warn!(inbound_id = self.inbound.0.get(), %source, error = %format_args!("{error:#}"), "DNS policy failed");
                     Err(ResponseCode::ServFail)
                 }
             }
@@ -357,6 +379,177 @@ fn encode<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        pin::Pin,
+        sync::atomic::{AtomicBool, Ordering},
+        task::{Context, Poll},
+    };
+
+    /// Records whether the server closed its write side.
+    struct Closing<S> {
+        stream: S,
+        shut_down: Arc<AtomicBool>,
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for Closing<S> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.stream).poll_read(cx, buffer)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for Closing<S> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.stream).poll_write(cx, bytes)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.stream).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.shut_down.store(true, Ordering::Release);
+            Pin::new(&mut self.stream).poll_shutdown(cx)
+        }
+    }
+
+    /// Delivers written bytes only when flushed, like a framed protocol stream.
+    struct Buffering<S> {
+        stream: S,
+        pending: Vec<u8>,
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for Buffering<S> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.stream).poll_read(cx, buffer)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for Buffering<S> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.pending.extend_from_slice(bytes);
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            let this = &mut *self;
+            while !this.pending.is_empty() {
+                let written =
+                    std::task::ready!(Pin::new(&mut this.stream).poll_write(cx, &this.pending))?;
+                this.pending.drain(..written);
+            }
+            Pin::new(&mut this.stream).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            std::task::ready!(self.as_mut().poll_flush(cx))?;
+            Pin::new(&mut self.stream).poll_shutdown(cx)
+        }
+    }
+
+    struct Echo;
+
+    impl Handler for Echo {
+        fn handle(
+            &self,
+            request: DnsRequest,
+            _: DnsRequestInfo,
+        ) -> BoxFuture<'_, Result<DnsHandlerResult>> {
+            Box::pin(async move {
+                let (mut message, _) = request.into_parts();
+                message.metadata.message_type = MessageType::Response;
+                Ok(DnsHandlerResult::Response(
+                    hickory_server::proto::op::DnsResponse::from_message(message)?,
+                ))
+            })
+        }
+    }
+
+    // The client waits for each answer before it sends the next query.
+    #[tokio::test]
+    async fn each_answer_is_delivered_before_the_next_query_is_read() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let responder = Responder::new(InboundId(std::num::NonZeroU64::MIN), Arc::new(Echo));
+        let server = Buffering {
+            stream: server,
+            pending: Vec::new(),
+        };
+        let stopping = CancellationToken::new();
+        let serving = serve_stream(
+            server,
+            "127.0.0.1:53".parse().unwrap(),
+            &responder,
+            &stopping,
+        );
+        tokio::pin!(serving);
+
+        let mut query = Message::query();
+        query.metadata.id = 7;
+        query.queries.push(hickory_server::proto::op::Query::query(
+            "example.".parse().unwrap(),
+            RecordType::A,
+        ));
+        let query = query.to_vec().unwrap();
+        let exchange = async {
+            client
+                .write_u16(u16::try_from(query.len()).unwrap())
+                .await
+                .unwrap();
+            client.write_all(&query).await.unwrap();
+            let length = client.read_u16().await.unwrap();
+            let mut answer = vec![0; usize::from(length)];
+            client.read_exact(&mut answer).await.unwrap();
+            Message::from_vec(&answer).unwrap()
+        };
+
+        tokio::select! {
+            result = &mut serving => panic!("server stopped early: {result:?}"),
+            answer = exchange => assert_eq!(answer.metadata.id, 7),
+        }
+    }
+
+    // Some streams, such as TUN connections, abort unless their writer closes them.
+    #[tokio::test]
+    async fn a_client_half_close_ends_the_stream_in_order() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let shut_down = Arc::new(AtomicBool::new(false));
+        let responder = Responder::new(InboundId(std::num::NonZeroU64::MIN), Arc::new(Unused));
+        client.shutdown().await.unwrap();
+
+        serve_stream(
+            Closing {
+                stream: server,
+                shut_down: shut_down.clone(),
+            },
+            "127.0.0.1:53".parse().unwrap(),
+            &responder,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(shut_down.load(Ordering::Acquire));
+    }
 
     struct Unused;
 
@@ -372,13 +565,14 @@ mod tests {
 
     #[tokio::test]
     async fn responses_get_no_reply() {
-        let responder = Responder {
-            id: InboundId(std::num::NonZeroU64::MIN),
-            handler: Arc::new(Unused),
-        };
+        let responder = Responder::new(InboundId(std::num::NonZeroU64::MIN), Arc::new(Unused));
         let response = vec![0x12, 0x34, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let reply = responder
-            .respond(response, "127.0.0.1:53".parse().unwrap(), Protocol::Udp)
+            .respond(
+                response,
+                "127.0.0.1:53".parse().unwrap(),
+                TransportProtocol::Udp,
+            )
             .await;
         assert!(reply.is_none(), "listener replied to a response: {reply:?}");
     }

@@ -147,7 +147,7 @@ impl Target {
 }
 
 // QuickJS integer conversions truncate, so validate configuration numbers first.
-#[duplicate::duplicate_item(Wrapper Native; [Port] [u16]; [Milliseconds] [u32]; [Byte] [u8]; [Mtu] [u16]; [Capacity] [u32]; [Mark] [u32]; [TypeCode] [u16];)]
+#[duplicate::duplicate_item(Wrapper Native; [Port] [u16]; [Milliseconds] [u32]; [Byte] [u8]; [Mtu] [u16]; [Length] [u16]; [Capacity] [u32]; [Mark] [u32]; [TypeCode] [u16];)]
 mod checked_number {
     use super::*;
 
@@ -175,6 +175,7 @@ mod checked_number {
 
 pub(crate) use checked_number_byte::Byte;
 pub(crate) use checked_number_capacity::Capacity;
+pub(crate) use checked_number_length::Length;
 pub(crate) use checked_number_mark::Mark;
 pub(crate) use checked_number_milliseconds::Milliseconds;
 pub(crate) use checked_number_mtu::Mtu;
@@ -210,6 +211,25 @@ impl<'js> IntoJs<'js> for Bytes {
 pub(crate) struct DrainOptions {
     /// Accepted work that has not finished by then is aborted.
     pub timeout: Timeout,
+}
+
+/// A health check through a dialer: connect to `target`, send `request` and read
+/// `length` response bytes, 1 unless given. Latency is measured at the first byte.
+#[derive(rquickjs::FromJs, TS)]
+pub(crate) struct ProbeOptions {
+    pub target: Target,
+    #[ts(optional)]
+    pub request: Option<Bytes>,
+    #[ts(optional)]
+    pub length: Option<Length>,
+    pub timeout: Timeout,
+}
+
+#[derive(rquickjs::IntoJs, TS)]
+pub(crate) struct ProbeResult {
+    /// Milliseconds from the start of the probe to the first response bytes.
+    pub latency: f64,
+    pub response: Bytes,
 }
 
 #[duplicate::duplicate_item(Kind; [Dialer]; [Inbound]; [DnsServiceRef];)]

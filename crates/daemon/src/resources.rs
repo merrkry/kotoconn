@@ -20,7 +20,11 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{sync::watch, time::Instant};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::watch,
+    time::Instant,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
@@ -172,9 +176,17 @@ impl Manager {
 
     /// An open dialer for new work.
     pub fn dialer(&self, id: DialerId) -> Result<Arc<Clients>> {
-        match self.registry().native(id.into()) {
-            Some((Native::Dialer(clients), true)) => Ok(clients.clone()),
-            Some((Native::Dialer(_), false)) | None => bail!("dialer is closed"),
+        self.open_dialer(id).map(|(clients, _)| clients)
+    }
+
+    fn open_dialer(&self, id: DialerId) -> Result<(Arc<Clients>, Arc<Lifetime>)> {
+        let registry = self.registry();
+        let entry = registry.entries.get(&id.into());
+        match entry.and_then(|entry| Some((&entry.live.as_ref()?.native, &entry.lifetime))) {
+            Some((Native::Dialer(clients), lifetime)) if lifetime.is_open() => {
+                Ok((clients.clone(), lifetime.clone()))
+            }
+            Some((Native::Dialer(_), _)) | None => bail!("dialer is closed"),
             Some(_) => bail!("resource is not a dialer"),
         }
     }
@@ -320,6 +332,7 @@ impl Manager {
             sessions: self.sessions.clone(),
             idle: config.udp_idle_timeout,
             sniff: config.sniff.clone(),
+            stopping: lifetime.admission.clone(),
         });
 
         let bound = kotoconn_inbounds::bind(
@@ -468,6 +481,42 @@ impl Manager {
 
         let _query = service.queries.track()?;
         service.queries.run(service.service.query(request)).await
+    }
+
+    /// Connects through an open dialer. Closing or draining the dialer ends the probe.
+    async fn probe(&self, id: DialerId, probe: Probe) -> Result<ProbeResult> {
+        let (clients, lifetime) = self.open_dialer(id)?;
+
+        ensure!(probe.length > 0, "a probe reads at least one response byte");
+        let started = Instant::now();
+        let exchange = async {
+            let mut stream = clients.tcp_scoped(probe.target, Scope::new()).await?;
+            if !probe.request.is_empty() {
+                stream.write_all(&probe.request).await?;
+            }
+
+            let mut response = vec![0; probe.length];
+            let mut length = stream.read(&mut response).await?;
+            ensure!(length > 0, "connection closed before a response");
+            let latency = started.elapsed();
+
+            while length < response.len() {
+                match stream.read(&mut response[length..]).await? {
+                    0 => break,
+                    read => length += read,
+                }
+            }
+            response.truncate(length);
+            Ok(ProbeResult { latency, response })
+        };
+
+        tokio::select! {
+            biased;
+            _ = lifetime.admission.cancelled() => bail!("dialer is closed"),
+            result = tokio::time::timeout(probe.timeout, exchange) => {
+                result.context("probe timed out")?
+            }
+        }
     }
 
     /// Runs `work` in the resource scope. A failure starts daemon shutdown.
@@ -699,6 +748,20 @@ impl kotoconn_script::Resources for Manager {
 
     fn released(&self, id: ResourceId) -> kotoconn_script::NativeFuture<()> {
         Manager::released(self, id)
+    }
+
+    fn probe(
+        &self,
+        dialer: DialerId,
+        probe: Probe,
+    ) -> kotoconn_script::NativeFuture<std::result::Result<ProbeResult, String>> {
+        // SAFETY: the policy runtime holds this manager through an Arc.
+        let this = self.this.upgrade().expect("manager is shared");
+        Box::pin(async move {
+            this.probe(dialer, probe)
+                .await
+                .map_err(|error| format!("{error:#}"))
+        })
     }
 
     fn dns_query(

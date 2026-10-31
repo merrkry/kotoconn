@@ -36,6 +36,9 @@ pub trait Resources: Send + Sync + 'static {
     /// Completes once the resource has closed and released its native state.
     fn released(&self, id: ResourceId) -> NativeFuture<()>;
 
+    /// Ends early when the dialer closes or drains.
+    fn probe(&self, dialer: DialerId, probe: Probe) -> NativeFuture<Result<ProbeResult, String>>;
+
     fn dns_query(
         &self,
         service: DnsServiceId,

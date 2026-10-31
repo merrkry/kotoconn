@@ -238,7 +238,18 @@ def configure_routes():
         ip(family, "route", "replace", "default", "dev", NAME, "table", "100")
 
 
-def policy(path: Path, mtu: int, idle_ms: int = 30000, outbound: str = "direct"):
+# Fixed values of the automatic routing preset, as the lifecycle case checks them.
+ROUTE_TABLE = 2022
+ROUTE_PRIORITIES = (9000, 9001, 9002)
+
+
+def policy(
+    path: Path,
+    mtu: int,
+    idle_ms: int = 30000,
+    outbound: str = "direct",
+    auto_route: bool = False,
+):
     path.write_text(f"""import {{ kotoconn as k }} from '@kotoconn/bindings';
 const resolver = name => k.lookup(name);
 const direct = await k.dialer({{carrier: k.host_network({{}}), outbound: {{
@@ -246,7 +257,7 @@ const direct = await k.dialer({{carrier: k.host_network({{}}), outbound: {{
 }}}});
 const routing = flow => flow.protocol === 'udp'
     ? k.route_udp(direct) : k.route(direct, flow.dest);
-await k.inbound({{implementation: k.tun_inbound({{
+const tun = await k.inbound({{implementation: k.tun_inbound({{
     name: '{NAME}', mtu: {mtu}, addresses: [
     {{address: k.ip('192.0.2.1'), prefix: 30}},
     {{address: k.ip('fd00::1'), prefix: 126}}
@@ -254,7 +265,7 @@ await k.inbound({{implementation: k.tun_inbound({{
 """)
     if outbound == "socks5":
         source = path.read_text()
-        point = source.index("await k.inbound(")
+        point = source.index("const tun = await k.inbound(")
         relay = """await k.inbound({
     implementation: k.socks5_inbound({listen: {
         address: k.ip('127.0.0.1'), port: 9100
@@ -275,6 +286,16 @@ const tunRouting = flow => flow.protocol === 'udp'
             + source[point:].replace(
                 "routing_handler: routing", "routing_handler: tunRouting"
             )
+        )
+    if auto_route:
+        path.write_text(
+            path.read_text()
+            + f"""import {{ auto_route }} from '@kotoconn/api';
+await auto_route({{
+    interface: '{NAME}', inbound: tun, mark: 0x2022,
+    table: {ROUTE_TABLE}, priority: {ROUTE_PRIORITIES[0]},
+}});
+"""
         )
 
 
@@ -374,9 +395,10 @@ class Daemon(Process):
         shutdown_timeout: int = 5,
         idle_ms: int = 30000,
         outbound: str = "direct",
+        auto_route: bool = False,
     ):
         directory.mkdir(parents=True, exist_ok=False)
-        policy(directory / "main.ts", mtu, idle_ms, outbound)
+        policy(directory / "main.ts", mtu, idle_ms, outbound, auto_route)
         argv = [
             str(binary),
             "--log-format",

@@ -175,6 +175,7 @@ async fn session(
     debug_assert!(flow.sniff.is_none());
 
     let destination = flow.dest.clone();
+    let source = flow.source;
     let (lifetime, activity) = match shared_activity {
         Some(activity) => (None, activity),
         None => {
@@ -207,6 +208,39 @@ async fn session(
             // Rejection is a policy outcome, not a session failure.
             RouteDecision::Reject => {
                 tracing::debug!("UDP session rejected");
+                return Ok(());
+            }
+            RouteDecision::Dns { handler: dns } => {
+                tracing::debug!("UDP session answered by a DNS handler");
+                let responder = Arc::new(handler.responder(dns));
+                let mut batch = Vec::with_capacity(32);
+
+                while incoming.recv_many(&mut batch, 32).await != 0 {
+                    for packet in batch.drain(..) {
+                        activity.record();
+                        let responder = responder.clone();
+                        let (replies, activity) = (replies.clone(), activity.clone());
+                        let target = destination.clone();
+
+                        // Queries are answered concurrently, as an upstream server would.
+                        scope.spawn(async move {
+                            let response = responder
+                                .respond(packet.payload.to_vec(), source, TransportProtocol::Udp)
+                                .await;
+                            if let Some(response) = response
+                                && replies
+                                    .try_send(Packet {
+                                        target,
+                                        payload: response.into(),
+                                    })
+                                    .is_ok()
+                            {
+                                activity.record();
+                            }
+                            Ok(())
+                        })?;
+                    }
+                }
                 return Ok(());
             }
             // SAFETY: Policy::route rejects TCP decisions for UDP flows.

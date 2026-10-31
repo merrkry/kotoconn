@@ -10,6 +10,6 @@ Daemon shutdown and failed startup drain every open resource under the shutdown 
 
 Handlers are functions, not resources, and live while something references them. Policy changes behavior at runtime through state that its handlers capture, so there is no API for replacing a handler.
 
-Policy has timers for scheduled work and can probe a dialer for health checks. A probe belongs to its dialer and ends when the dialer closes.
+Policy has timers for scheduled work and can probe a dialer for health checks. A probe belongs to its dialer and ends when the dialer closes or drains. Outbound groups and subscription updates are `@kotoconn/api` helpers built from these, following [ADR 0001](0001-policy-and-native-boundary.md).
 
 Changing policy code requires a restart, because re-evaluating modules in the running context would retain old module state.

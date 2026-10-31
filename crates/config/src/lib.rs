@@ -5,6 +5,7 @@ mod flow;
 mod handler;
 mod inbound;
 mod outbound;
+mod probe;
 mod resource;
 mod route;
 mod sniff;
@@ -25,6 +26,7 @@ pub use inbound::{
     DirectInboundConfig, InboundConfig, InboundId, InboundImpl, TunAddress, TunInboundConfig,
 };
 pub use outbound::{DirectOutboundConfig, OutboundConfig, OutboundImpl, Socks5OutboundConfig};
+pub use probe::{Probe, ProbeResult};
 pub use resource::{ResourceConfig, ResourceId};
 pub use route::RouteDecision;
 pub use sniff::{SniffConfig, SniffProtocol, SniffResult};

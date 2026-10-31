@@ -47,6 +47,22 @@ service's dialer chain is resolved by the resolve handler of the dialer that
 names it. Such a handler must not depend on the same service, which would need
 its own connection to answer.
 
+## Answering routed flows
+
+A routing handler can return `k.route_dns(handler)` to answer a flow's DNS
+messages with a DNS handler instead of forwarding them, for example DNS that a
+TUN inbound captured. A UDP flow's datagrams are answered one by one, with
+replies from the original destination, and a TCP flow carries DNS over TCP.
+Requests expose the routing inbound, the client source and the protocol, like
+listener requests.
+
+```ts
+routing_handler: (flow) => {
+  if (flow.dest.port === 53) return k.route_dns(service.handler);
+  return flow.protocol === "udp" ? k.route_udp(dialer) : k.route(dialer, flow.dest);
+},
+```
+
 ## Resolving names
 
 `await service.resolve(name)` queries A and AAAA records through the service, so
