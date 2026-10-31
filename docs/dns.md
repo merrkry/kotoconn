@@ -2,7 +2,7 @@
 
 Kotoconn can listen for UDP and TCP DNS queries. Each query enters a JavaScript
 DNS handler, including queries answered from a service's cache. A handler may
-return a response, drop the request, or call a registered upstream service.
+return a response, drop the request, or call an upstream service.
 Resolve handlers can also resolve names through a service.
 
 See [the DNS example](../packages/api/examples/dns.ts) for a SOCKS5-backed service,
@@ -14,7 +14,7 @@ The DNS listener binds UDP and TCP at `127.0.0.1:1053`.
 import { kotoconn as k } from "@kotoconn/bindings";
 import { dns_service } from "@kotoconn/api";
 
-const service = dns_service({
+const service = await dns_service({
   upstream: {
     protocol: "tcp",
     server: { address: k.ip("1.1.1.1"), port: 53 },
@@ -22,16 +22,17 @@ const service = dns_service({
   dialer,
 });
 
-const handler = k.dns_handler(service.handler);
-k.dns_listener({
+await k.dns_listener({
   listen: { address: k.ip("127.0.0.1"), port: 1053 },
   protocols: ["udp", "tcp"],
-  dns_handler: handler,
+  dns_handler: service.handler,
 });
 ```
 
-`dialer` is an existing Kotoconn dialer reference. Every upstream connection uses
-that dialer. The upstream protocol is independent of the listener protocols.
+`dialer` is an open Kotoconn dialer reference. Every upstream connection uses
+that dialer, so the dialer cannot close before the service. The service is a
+resource with `close()`, `drain({ timeout })` and `wait()`; a drain lets queries
+in flight finish. The upstream protocol is independent of the listener protocols.
 UDP upstreams retry truncated responses over TCP through the same dialer. When
 the dialer cannot carry TCP to the upstream, the truncated response is returned
 as is, so the client can retry over TCP itself.
@@ -55,10 +56,10 @@ failure rejects. Like `service.handler`, it needs no `this`, so it serves direct
 resolve handler:
 
 ```ts
-const remote = k.dialer({
+const remote = await k.dialer({
   carrier: k.host_network({}),
   outbound: {
-    resolve_handler: k.resolve_handler(service.resolve),
+    resolve_handler: service.resolve,
     implementation: k.http_outbound({ server: k.domain("proxy.example.com", 8080) }),
   },
 });
@@ -66,8 +67,8 @@ const remote = k.dialer({
 
 ## Policy and responses
 
-`service.handler` is a function that can be registered or called without binding
-`this`. `await service.query(request)` returns a native response for wrapping with
+`service.handler` is a function that can serve as a DNS handler or be called
+without binding `this`. `await service.query(request)` returns a native response for wrapping with
 `k.respond`. Both share the same native service state.
 
 `request.query` exposes a normalized domain name, record type, and numeric DNS

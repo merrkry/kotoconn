@@ -5,7 +5,7 @@ Native code never changes host network configuration on its own. It creates exac
 Policy configures the host instead. `@kotoconn/api` offers presets for common setups, such as automatic routing for a TUN inbound. Following [ADR 0001](0001-policy-and-native-boundary.md), presets use only public low-level primitives, so users can inspect, replace or bypass each step:
 
 - `exec` runs a program from an argument vector without a shell and reports its exit status and output. A nonzero status is a result, not an error. Policy code is trusted and runs with the daemon's privileges, so `exec` is a general capability.
-- Shutdown hooks run in reverse registration order when shutdown starts, under the shutdown deadline. A failed inbound starts the same shutdown, so hooks can remove host configuration that depended on it. The daemon drains the resources that remain open only after the hooks finish, so a hook decides what to drain before it removes host configuration.
+- Shutdown hooks run in reverse registration order when shutdown starts, under the shutdown deadline. A failed inbound or a failed startup starts the same shutdown, so hooks can remove host configuration that depended on it. The daemon drains the resources that remain open only after the hooks finish, so a hook decides what to drain before it removes host configuration.
 - Dialers that reach the host network directly accept a socket mark and an interface binding. Loop avoidance needs these socket options, and commands cannot set them.
 - A routing decision can pass a flow to a DNS handler, so DNS traffic captured by TUN reaches DNS policy through an explicit decision.
 
