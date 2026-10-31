@@ -13,7 +13,10 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from e2e.tun_support.environment import (
     CLIENT,
+    NAME,
     REMOTE,
+    ROUTE_PRIORITIES,
+    ROUTE_TABLE,
     SERVER_PORTS,
     Daemon,
     add_arguments,
@@ -21,6 +24,7 @@ from e2e.tun_support.environment import (
     daemon_environment,
     digest,
     enter,
+    ip,
     network_snapshot,
     policy,
     resource,
@@ -150,6 +154,61 @@ def lifecycle(args: argparse.Namespace):
     assert result.returncode != 0 and "already exists" in result.stderr, result.stderr
     Daemon.assert_removed()
     print("PASS lifecycle: failed startup releases device", flush=True)
+    auto_route(args)
+
+
+def preset_routes():
+    """Rules at the preset's priorities and routes in its table, by family."""
+    rules = {
+        family: sorted(
+            rule["priority"]
+            for rule in json.loads(ip(family, "-j", "rule", "show"))
+            if rule.get("priority") in ROUTE_PRIORITIES
+        )
+        for family in ("-4", "-6")
+    }
+    routes = {
+        family: [
+            (route["dst"], route.get("dev"))
+            for route in json.loads(
+                ip(family, "-j", "route", "show", "table", str(ROUTE_TABLE))
+            )
+        ]
+        for family in ("-4", "-6")
+    }
+    return rules, routes
+
+
+def auto_route(args: argparse.Namespace):
+    installed = (
+        {family: list(ROUTE_PRIORITIES) for family in ("-4", "-6")},
+        {family: [("default", NAME)] for family in ("-4", "-6")},
+    )
+
+    # A killed daemon skips its shutdown hooks and leaves the rules behind.
+    daemon = Daemon(
+        args.binary, args.output / "auto-route-killed", 1500, auto_route=True
+    )
+    try:
+        assert preset_routes() == installed, preset_routes()
+        daemon.process.kill()
+        daemon.process.wait(timeout=15)
+        Daemon.assert_removed()
+    finally:
+        daemon.close()
+    assert preset_routes()[0] == installed[0], preset_routes()
+
+    # The next start replaces them, and a graceful shutdown removes them.
+    daemon = Daemon(args.binary, args.output / "auto-route", 1500, auto_route=True)
+    try:
+        assert preset_routes() == installed, preset_routes()
+        daemon.finish()
+    finally:
+        daemon.close()
+    assert preset_routes() == ({"-4": [], "-6": []}, {"-4": [], "-6": []}), (
+        preset_routes()
+    )
+    print("PASS lifecycle: routing preset repairs and removes routes", flush=True)
 
 
 def run(args: argparse.Namespace):

@@ -1,6 +1,6 @@
 # Linux TUN inbound
 
-The [example policy](../../packages/api/examples/tun.ts) creates `kototun0` and routes TCP and UDP through a direct outbound. Run it with access to `/dev/net/tun` and `CAP_NET_ADMIN`:
+The [example policy](../../packages/api/examples/tun.ts) creates `kototun0`, routes the host's traffic into it with the `auto_route` preset, answers DNS with a DNS service and sends other TCP and UDP through a direct outbound. Run it with access to `/dev/net/tun` and `CAP_NET_ADMIN`:
 
 ```sh
 mise exec -- moon run rust:build-linux-debug
@@ -9,7 +9,7 @@ sudo target/tun/debug/kotoconn run --config packages/api/examples/tun.ts
 
 `tun_inbound` takes an unused interface name, an MTU between 1280 and 65535, and an `addresses` array of native IP addresses and prefix lengths. An empty array leaves address assignment to the operator. One IPv4 address and multiple IPv6 addresses are supported. The interface is not persistent. Failed startup and completed shutdown release it. `Daemon::inbound_addresses()` reports its name; `listen_addresses()` reports only socket listeners.
 
-Routing remains explicit. For example, on a Linux gateway with IP forwarding enabled, these rules send traffic arriving on `lan0` through TUN while the daemon's outbound connections use the main routing table:
+Routing remains explicit: the daemon never changes host routes itself. The `auto_route` preset in `@kotoconn/api` routes all IPv4 and IPv6 traffic of the host into TUN with `ip` rules at fixed priorities and a fixed table. Traffic with its socket mark bypasses TUN, more specific routes of the main table such as local networks stay in use, and a start replaces the entries an earlier run left. Its shutdown hook drains TUN before it removes the routes, unless `drain_first` is false. Write the rules yourself for other setups. For example, on a Linux gateway with IP forwarding enabled, these rules send traffic arriving on `lan0` through TUN while the daemon's outbound connections use the main routing table:
 
 ```sh
 ip route add default dev kototun0 table 100
