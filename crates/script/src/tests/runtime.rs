@@ -48,34 +48,6 @@ async fn load() -> Script {
     script
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn handlers_stay_registered_until_their_last_reference_drops() {
-    let script = load().await;
-    let (first, second) = script
-        .context
-        .with(|ctx| {
-            let function: Function = ctx.eval("name => []").unwrap();
-            let handler: config::ResolveHandler = loader::host(&ctx)
-                .unwrap()
-                .borrow()
-                .register(function)
-                .unwrap();
-            (handler.clone(), handler)
-        })
-        .await;
-    let id = second.id();
-
-    drop(first);
-    assert!(script.resolve(&second, "name").await.unwrap().is_empty());
-
-    drop(second);
-    let registered = script
-        .context
-        .with(|ctx| loader::host(&ctx).unwrap().borrow().handler(id).is_ok())
-        .await;
-    assert!(!registered);
-}
-
 struct Pending {
     script: Script,
     started: oneshot::Receiver<()>,
@@ -204,6 +176,43 @@ async fn dropping_script_cancels_pending_native_tasks() {
         dropped.await.unwrap();
         // Hold the release sender until cancellation is observed.
         drop(release);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handlers_are_released_once_their_last_reference_drops() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let script = load().await;
+        let (dropped, released) = oneshot::channel();
+        let capture = OnDrop(Some(dropped));
+        let (first, second) = script
+            .context
+            .with(|ctx| {
+                let function = Function::new(ctx.clone(), move |_: String| {
+                    let _capture = &capture;
+                    Vec::<String>::new()
+                })
+                .unwrap();
+                let handler: config::ResolveHandler = loader::host(&ctx)
+                    .unwrap()
+                    .borrow()
+                    .register(function)
+                    .unwrap();
+                (handler.clone(), handler)
+            })
+            .await;
+
+        drop(first);
+        assert!(script.resolve(&second, "name").await.unwrap().is_empty());
+
+        // The driver unregisters the function, which frees what it captured.
+        drop(second);
+        tokio::select! {
+            _ = script.drive() => panic!("driver exited while its runtime was alive"),
+            result = released => result.unwrap(),
+        }
     })
     .await
     .unwrap();

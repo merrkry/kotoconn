@@ -158,6 +158,8 @@ impl Manager {
 
     /// Abort every resource, including ones still being created.
     pub fn abort(&self) {
+        let mut registry = self.registry();
+        registry.accepting = false;
         self.root.close();
     }
 
@@ -253,14 +255,16 @@ impl Manager {
         );
         drop(registry);
 
+        // The supervisor releases every registered entry, including one whose
+        // scope closed before its work could start.
+        tokio::spawn(
+            self.clone()
+                .supervise(id, lifetime.clone(), built.idle, built.on_drain)
+                .in_current_span(),
+        );
         if let Some(run) = built.run {
             self.run(id, &lifetime.scope, run)?;
         }
-        tokio::spawn(
-            self.clone()
-                .supervise(id, lifetime, built.idle, built.on_drain)
-                .in_current_span(),
-        );
         tracing::debug!(resource_id = id.0.get(), "resource created");
         Ok(id)
     }
@@ -700,5 +704,32 @@ fn panic_message(panic: &(dyn Any + Send)) -> &str {
         message
     } else {
         "unknown payload"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn creation_after_an_abort_registers_nothing() {
+        let (commands, _receiver) = tokio::sync::mpsc::channel(1);
+        let policy = Policy {
+            commands,
+            stopping: CancellationToken::new(),
+        };
+        let manager = Manager::new(policy, CancellationToken::new());
+        manager.abort();
+
+        let config = ResourceConfig::Inbound(InboundConfig {
+            implementation: InboundImpl::Socks5(Socks5InboundConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+            }),
+            routing_handler: RoutingHandler::new(std::num::NonZeroU64::MIN, Arc::new(())),
+            udp_idle_timeout: Duration::from_secs(1),
+            sniff: None,
+        });
+        assert!(manager.create(config).await.is_err());
+        assert!(manager.resources().is_empty());
     }
 }

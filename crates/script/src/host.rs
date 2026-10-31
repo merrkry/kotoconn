@@ -32,8 +32,7 @@ pub(crate) struct Host<'js> {
     /// Functions that native references keep registered.
     handlers: RefCell<HashMap<u64, Function<'js>>>,
     next_handler: Cell<u64>,
-    /// Handlers whose last native reference has dropped, possibly on another thread.
-    released: Arc<Mutex<Vec<NonZeroU64>>>,
+    pub released: Arc<Released>,
     pub creations: Rc<Creations>,
     /// Cancelled when shutdown starts; pending and later sleeps reject.
     pub shutdown: CancellationToken,
@@ -54,17 +53,27 @@ impl<'js> rquickjs::class::Trace<'js> for Host<'js> {
 /// Keeps a handler registered until the last native reference drops.
 struct Registration {
     id: NonZeroU64,
-    released: Arc<Mutex<Vec<NonZeroU64>>>,
+    released: Arc<Released>,
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
         // A poisoned list still holds valid IDs; a panic elsewhere must not leak handlers.
         self.released
+            .ids
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(self.id);
+        self.released.notify.notify_one();
     }
+}
+
+/// Handlers whose last native reference has dropped, possibly on another thread.
+#[derive(Default)]
+pub(crate) struct Released {
+    ids: Mutex<Vec<NonZeroU64>>,
+    /// Wakes the JS thread to unregister them.
+    pub notify: tokio::sync::Notify,
 }
 
 /// Counts resource creations that have not settled, so startup can wait for them.
@@ -129,8 +138,6 @@ impl<'js> Host<'js> {
     /// Registers a function for native calls until the returned reference and all
     /// its clones drop.
     pub fn register<K>(&self, function: Function<'js>) -> Result<config::Handler<K>> {
-        self.collect_released();
-
         let id = self
             .next_handler
             .get()
@@ -150,8 +157,6 @@ impl<'js> Host<'js> {
     /// Native callers hold a reference for the whole call, so a called handler is
     /// still registered.
     pub fn handler(&self, id: NonZeroU64) -> Result<Function<'js>> {
-        self.collect_released();
-
         self.handlers
             .borrow()
             .get(&id.get())
@@ -159,10 +164,12 @@ impl<'js> Host<'js> {
             .ok_or_else(|| invalid("handler is no longer registered"))
     }
 
-    fn collect_released(&self) {
+    /// Unregisters the handlers whose last native reference has dropped.
+    pub fn collect_released(&self) {
         let released = std::mem::take(
             &mut *self
                 .released
+                .ids
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         );

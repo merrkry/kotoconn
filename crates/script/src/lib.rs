@@ -54,6 +54,7 @@ pub struct Script {
     context: AsyncContext,
     runtime: AsyncRuntime,
     rejections: rejection::Tracker,
+    released: Arc<host::Released>,
 }
 
 impl Script {
@@ -77,13 +78,14 @@ impl Script {
             .await;
         let context = AsyncContext::full(&runtime).await.map_err(js_error)?;
 
-        context
+        let released = context
             .async_with(async |ctx| {
                 (async {
                     loader::install(&ctx, resources)?;
                     let module =
                         Module::declare_def::<loader::Native, _>(ctx.clone(), loader::MODULE_NAME)?;
-                    module.eval()?.1.into_future::<()>().await
+                    module.eval()?.1.into_future::<()>().await?;
+                    Ok(loader::host(&ctx)?.borrow().released.clone())
                 })
                 .await
                 .catch(&ctx)
@@ -95,6 +97,7 @@ impl Script {
             context,
             runtime,
             rejections,
+            released,
         })
     }
 
@@ -239,9 +242,25 @@ impl Script {
         self.runtime.idle().await;
     }
 
-    /// Continuously drive detached JS promises while the daemon waits for requests.
+    /// Continuously drive detached JS promises while the daemon waits for requests,
+    /// and unregister handlers once their last native reference drops.
     pub async fn drive(&self) {
-        self.runtime.drive().await;
+        let collect = async {
+            loop {
+                self.released.notify.notified().await;
+                let collected = self
+                    .with(async |ctx| {
+                        loader::host(&ctx)?.borrow().collect_released();
+                        Ok(())
+                    })
+                    .await;
+                if let Err(error) = collected {
+                    tracing::error!(%error, "releasing handlers failed");
+                }
+            }
+        };
+
+        tokio::join!(self.runtime.drive(), collect);
     }
 }
 

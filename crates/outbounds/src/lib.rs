@@ -61,22 +61,24 @@ impl Clients {
                 // engine's pooled sessions. They are not connections, so draining
                 // the clients does not wait for them.
                 let pool = scope.child();
-                let (closing, closed) = (pool.clone(), tcp.clone());
-                pool.spawn(async move {
-                    closed.cancelled().await;
-                    closing.close();
-                    Ok(())
-                })?;
-
-                Arc::new(naive::Client::new(
+                let client = naive::Client::new(
                     options.clone(),
                     Endpoint {
                         address: options.server,
                         resolver,
                     },
                     carrier,
-                    pool,
-                )?)
+                    pool.clone(),
+                )?;
+
+                let closing = pool.clone();
+                let closed = tcp.clone();
+                pool.spawn(async move {
+                    closed.cancelled().await;
+                    closing.close();
+                    Ok(())
+                })?;
+                Arc::new(client)
             }
             #[cfg(not(target_os = "linux"))]
             OutboundImpl::Naive(_) => {

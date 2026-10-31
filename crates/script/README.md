@@ -8,7 +8,7 @@ Handlers are plain functions in resource options, such as `routing_handler` of `
 
 `kotoconn.lookup(name)` runs the system resolver in an owned Tokio task and returns a promise of native IP values. Its queries leave through the host's own resolver configuration and routing, without a dialer or host network socket options, so routes that capture host traffic also capture them. Resolve through a DNS service when queries must use a chosen dialer.
 
-Poll `Script` only on its owning thread. Its shared-reference methods support concurrent awaits without holding exclusive borrows. Keep `drive()` polled to advance detached promises when no handler is waiting; `idle()` drains pending native futures and JS jobs. Dropping the runtime cancels its native tasks. Daemon owns cross-thread admission and shutdown deadlines.
+Poll `Script` only on its owning thread. Its shared-reference methods support concurrent awaits without holding exclusive borrows. Keep `drive()` polled to advance detached promises when no handler is waiting and to unregister released handlers; `idle()` drains pending native futures and JS jobs. Dropping the runtime cancels its native tasks. Daemon owns cross-thread admission and shutdown deadlines.
 
 `kotoconn.cidr(prefix).contains(address)` matches native IP addresses against IPv4
 or IPv6 CIDRs. Address families stay distinct, including IPv4-mapped IPv6 addresses.
