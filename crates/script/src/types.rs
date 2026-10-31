@@ -27,6 +27,7 @@ pub(crate) fn declarations() -> String {
         Port::decl(&cfg),
         Mtu::decl(&cfg),
         Byte::decl(&cfg),
+        Bytes::decl(&cfg),
         Milliseconds::decl(&cfg),
         Dialer::decl(&cfg),
         Inbound::decl(&cfg),

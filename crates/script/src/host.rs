@@ -316,8 +316,8 @@ api! {
             Ok(id.into())
         }
 
-        fn dns_response(self, bytes: Vec<Byte>) -> Response {
-            config::DnsResponse::from_buffer(bytes.into_iter().map(|b| b.0).collect())
+        fn dns_response(self, bytes: Bytes) -> Response {
+            config::DnsResponse::from_buffer(bytes.0)
                 .map(Into::into)
                 .map_err(|e| invalid(e.to_string()))
         }
@@ -326,12 +326,12 @@ api! {
             crate::dns::request(&name, record_type).map(Into::into)
         }
 
-        fn request_bytes(self, request: Request) -> Vec<u8> {
-            request.value.to_vec().map_err(|e| invalid(e.to_string()))
+        fn request_bytes(self, request: Request) -> Bytes {
+            request.value.to_vec().map(Bytes).map_err(|e| invalid(e.to_string()))
         }
 
-        fn response_bytes(self, response: Response) -> Vec<u8> {
-            response.value.to_vec().map_err(|e| invalid(e.to_string()))
+        fn response_bytes(self, response: Response) -> Bytes {
+            response.value.to_vec().map(Bytes).map_err(|e| invalid(e.to_string()))
         }
 
         fn log(self, level: LogLevel, message: String) -> Void {

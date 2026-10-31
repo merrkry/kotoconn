@@ -184,6 +184,30 @@ pub(crate) use checked_number_mtu::Mtu;
 pub(crate) use checked_number_port::Port;
 pub(crate) use checked_number_type_code::TypeCode;
 
+/// Binary data, exchanged with JS as a `Uint8Array`.
+#[derive(derive_more::From, derive_more::Into, TS)]
+#[ts(type = "Uint8Array")]
+pub(crate) struct Bytes(pub Vec<u8>);
+
+impl<'js> FromJs<'js> for Bytes {
+    fn from_js(_: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
+        let array = rquickjs::TypedArray::<u8>::from_value(value)
+            .map_err(|_| invalid("expected a Uint8Array"))?;
+
+        // SAFETY: the slice is copied before any JS can run and change the buffer.
+        let bytes = unsafe { array.as_bytes() }
+            .ok_or_else(|| invalid("Uint8Array buffer is detached"))?
+            .to_vec();
+        Ok(Self(bytes))
+    }
+}
+
+impl<'js> IntoJs<'js> for Bytes {
+    fn into_js(self, ctx: &Ctx<'js>) -> Result<Value<'js>> {
+        rquickjs::TypedArray::<u8>::new(ctx.clone(), self.0)?.into_js(ctx)
+    }
+}
+
 #[rquickjs::methods]
 impl Inbound {
     pub fn equals(&self, other: Self) -> bool {

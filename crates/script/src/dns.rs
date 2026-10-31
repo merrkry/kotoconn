@@ -1,6 +1,6 @@
 //! DNS messages exchanged with policy: request construction and read-only message views.
 
-use crate::native::{Inbound, IpAddr, TypeCode, invalid};
+use crate::native::{Bytes, Inbound, IpAddr, TypeCode, invalid};
 use hickory_proto::{
     op::{Message, Query},
     rr::{self, Name, RData, rdata},
@@ -146,7 +146,7 @@ enum RecordData {
     Address(IpAddr),
     Name(String),
     /// Uncompressed RDATA wire bytes.
-    Bytes(Vec<u8>),
+    Bytes(Bytes),
 }
 
 pub(crate) struct DnsRecord {
@@ -171,7 +171,7 @@ declared!(DnsRecord, cfg => {
          {{ readonly type: \"A\"; readonly data: Extract<IpAddr, {{ readonly version: 4 }}> }} | \
          {{ readonly type: \"AAAA\"; readonly data: Extract<IpAddr, {{ readonly version: 6 }}> }} | \
          {{ readonly type: {names}; readonly data: string }} | \
-         {{ readonly type: Exclude<{}, \"A\" | \"AAAA\" | {names}>; readonly data: readonly number[] }})",
+         {{ readonly type: Exclude<{}, \"A\" | \"AAAA\" | {names}>; readonly data: Uint8Array }})",
         <RecordType as TS>::name(cfg),
     )
 });
@@ -207,7 +207,7 @@ impl TryFrom<&rr::Record> for DnsRecord {
                 encoder.set_name_encoding(NameEncoding::Uncompressed);
                 data.emit(&mut encoder)
                     .map_err(|e| invalid(format!("DNS record data: {e}")))?;
-                RecordData::Bytes(bytes)
+                RecordData::Bytes(Bytes(bytes))
             }
         };
 
@@ -417,7 +417,7 @@ mod tests {
                 if (alias.ttl !== 300 || alias.class !== 1) throw Error('cname metadata');
                 if (v4.type !== 'A' || v4.data.version !== 4 || v4.data.toString() !== '192.0.2.1') throw Error('a');
                 if (v6.type !== 'AAAA' || v6.data.version !== 6 || v6.data.toString() !== '2001:db8::1') throw Error('aaaa');
-                const bytes = (record) => JSON.stringify(record.data);
+                const bytes = (record) => record.data instanceof Uint8Array && JSON.stringify(Array.from(record.data));
                 const mail = [4, 109, 97, 105, 108, 7, 101, 120, 97, 109, 112, 108, 101, 3, 99, 111, 109, 0];
                 if (mx.type !== 'MX' || bytes(mx) !== JSON.stringify([0, 10, ...mail])) throw Error('mx');
                 const names = [2, 110, 115, 7, 101, 120, 97, 109, 112, 108, 101, 0, 1, 104, 7, 101, 120, 97, 109, 112, 108, 101, 0];

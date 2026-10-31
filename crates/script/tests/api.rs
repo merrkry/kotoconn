@@ -355,16 +355,13 @@ async fn proxy_configuration_preserves_native_targets_and_optional_fields() {
 }
 
 #[tokio::test]
-async fn numeric_api_arguments_reject_truncation_and_dns_packets_require_a_header() {
+async fn numeric_api_arguments_reject_truncation_and_dns_packets_require_header_bytes() {
     load(r#"
         import { kotoconn as k } from '@kotoconn/bindings';
-        const bytes = Array(12).fill(0);
-        bytes[2] = 0x80;
         for (const [convert, max] of [
             [value => k.domain('example.com', value), 65535],
             [value => k.ip_target(k.ip('::1'), value), 65535],
             [value => k.timeout(value), 4294967295],
-            [value => k.dns_response(bytes.map((byte, index) => index === 0 ? value : byte)), 255],
         ]) {
             convert(0);
             convert(max);
@@ -378,9 +375,17 @@ async fn numeric_api_arguments_reject_truncation_and_dns_packets_require_a_heade
             }
         }
 
-        let rejected = false;
-        try { k.dns_response([]); } catch { rejected = true; }
-        if (!rejected) throw Error('accepted DNS packet without a header');
+        const header = new Uint8Array(12);
+        header[2] = 0x80;
+        k.dns_response(header);
+        for (const [bytes, message] of [
+            [new Uint8Array(), 'accepted DNS packet without a header'],
+            [Array.from(header), 'accepted a plain array as DNS bytes'],
+        ]) {
+            let rejected = false;
+            try { k.dns_response(bytes); } catch { rejected = true; }
+            if (!rejected) throw Error(message);
+        }
     "#).await;
 }
 

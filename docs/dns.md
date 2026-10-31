@@ -82,10 +82,11 @@ The type is a record type name or number, as in `request.query`.
 other RFC 1035 and RFC 2136 mnemonics, or a number. `response.answers` lists the
 answer records with a normalized `name`, `type`, numeric `class`, `ttl` and
 `data`. The data of A and AAAA records is an IP value; CNAME, NS, PTR and ANAME
-records carry a normalized domain name; other types carry their RDATA bytes with
-uncompressed names. Request and response properties are read-only;
-`k.request_bytes` and `k.response_bytes` provide explicit message access, for
-example to the authority and additional sections.
+records carry a normalized domain name; other types carry their RDATA as a
+`Uint8Array` with uncompressed names. Request and response properties are read-only;
+`k.request_bytes` and `k.response_bytes` return the wire message as a
+`Uint8Array`, and `k.dns_response` accepts one, for example to read or build the
+authority and additional sections.
 
 Forwarding preserves the query's DNS flags and EDNS information. The listener
 restores the client request ID and question and respects the client's UDP size
