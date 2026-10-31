@@ -3,7 +3,10 @@
 use crate::native::Timeout;
 use rquickjs::{FromJs, IntoJs};
 use std::{io, process::Stdio, time::Duration};
-use tokio::{io::AsyncWriteExt, process::Command};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    process::Command,
+};
 use ts_rs::TS;
 
 #[derive(FromJs, TS)]
@@ -24,8 +27,8 @@ pub(crate) struct ExecResult {
     pub stderr: String,
 }
 
-/// Run a program without a shell. Timing out or dropping the future kills the
-/// program and the processes it started.
+/// Run a program without a shell, until it exits and its output closes. Timing out
+/// or dropping the future before the program exits kills it and the processes it started.
 pub(crate) async fn exec(
     argv: Vec<String>,
     timeout: Option<Duration>,
@@ -62,30 +65,49 @@ pub(crate) async fn exec(
         "stdin is piped only for input"
     );
 
+    // SAFETY: both output streams are piped above, and nothing took them since spawning.
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+
     // Feed input while collecting output, so neither side can fill its pipe and stall.
     let run = async {
-        let (written, output) = tokio::join!(write(stdin, input), child.wait_with_output());
-        let output = output.map_err(|error| format!("wait for {program}: {error}"))?;
+        let exited = async {
+            let status = child.wait().await;
+            // Processes the program left running are its own business, even when
+            // they keep its output open.
+            if status.is_ok() {
+                group.release();
+            }
+            status
+        };
+        let (written, status, stdout, stderr) =
+            tokio::join!(write(stdin, input), exited, read(stdout), read(stderr));
+
+        let status = status.map_err(|error| format!("wait for {program}: {error}"))?;
+        let stdout = stdout.map_err(|error| format!("read output of {program}: {error}"))?;
+        let stderr = stderr.map_err(|error| format!("read output of {program}: {error}"))?;
         written.map_err(|error| format!("write input to {program}: {error}"))?;
 
         Ok(ExecResult {
-            status: output.status.code(),
-            signal: signal(output.status),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            status: status.code(),
+            signal: signal(status),
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
         })
     };
 
-    let result = match timeout {
+    match timeout {
         Some(timeout) => tokio::time::timeout(timeout, run)
             .await
             .map_err(|_| format!("{program} timed out after {} ms", timeout.as_millis()))?,
         None => run.await,
-    };
+    }
+}
 
-    // Processes the program left running after it finished are its own business.
-    group.release();
-    result
+async fn read(mut pipe: impl AsyncRead + Unpin) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    pipe.read_to_end(&mut bytes).await?;
+    Ok(bytes)
 }
 
 /// Kills the process group of a spawned program when dropped, unless released.
