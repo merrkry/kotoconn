@@ -5,6 +5,7 @@ import type {
   DnsUpstreamConfig,
   IpAddr,
   Request,
+  Resource,
   Response,
   Timeout,
 } from "@kotoconn/bindings";
@@ -18,7 +19,8 @@ export interface DnsServiceOptions {
   timeout?: Timeout;
 }
 
-export interface DnsService {
+/** A native DNS service; closing it ends its queries and cached state. */
+export interface DnsService extends Resource {
   readonly query: (request: Request) => Promise<Response>;
   readonly handler: DnsHandler;
   /**
@@ -31,8 +33,8 @@ export interface DnsService {
   readonly resolve: (name: string) => Promise<IpAddr[]>;
 }
 
-/** Register one upstream service. Querying is available after configuration loads. */
-export function dns_service(options: DnsServiceOptions): DnsService {
+/** Create one upstream service. */
+export async function dns_service(options: DnsServiceOptions): Promise<DnsService> {
   if (options.cache !== undefined && options.cache !== false) {
     const capacity = options.cache.capacity;
     if (!Number.isInteger(capacity) || capacity <= 0 || capacity > 0xffff_ffff) {
@@ -40,7 +42,7 @@ export function dns_service(options: DnsServiceOptions): DnsService {
     }
   }
 
-  const service = k.dns_service({
+  const service = await k.dns_service({
     upstream: options.upstream,
     dialer: options.dialer,
     cache_capacity: options.cache === false ? 0 : (options.cache?.capacity ?? 4096),
@@ -102,5 +104,12 @@ export function dns_service(options: DnsServiceOptions): DnsService {
     return addresses;
   };
 
-  return Object.freeze({ query, handler, resolve });
+  return Object.freeze({
+    query,
+    handler,
+    resolve,
+    close: () => service.close(),
+    drain: (options: { timeout: Timeout }) => service.drain(options),
+    wait: () => service.wait(),
+  });
 }

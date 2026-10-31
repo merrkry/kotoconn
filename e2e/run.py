@@ -78,7 +78,7 @@ def policy(
 ):
     source = """import { kotoconn as k } from '@kotoconn/bindings';
 import { destination } from './routing.ts';
-const resolver = k.resolve_handler(async name => await k.lookup(name));
+const resolver = async name => await k.lookup(name);
 const listenPort: number = await Promise.resolve(1080);
 """
     if naive is not None:
@@ -106,7 +106,7 @@ const listenPort: number = await Promise.resolve(1080);
             )
             config += "}"
         source += (
-            f"const d{index} = k.dialer({{carrier: {previous}, "
+            f"const d{index} = await k.dialer({{carrier: {previous}, "
             "outbound: {resolve_handler: resolver, "
             f"implementation: k.{kind}_outbound({config})}}}});\n"
         )
@@ -117,13 +117,13 @@ const listenPort: number = await Promise.resolve(1080);
         extra += f", password: '{KEY}'"
     elif inbound == "naive" and naive is not None:
         extra = f", ...naive, private_key: {json.dumps(naive['private_key'])}"
-    source += f"""const routing = k.routing_handler(async flow => {{
+    source += f"""const routing = async flow => {{
     {"if (flow.dest.port === 9002) return k.reject();" if rewrite else ""}
     const target = await destination(flow.dest);
     return flow.protocol === 'udp'
         ? k.route_udp({previous}) : k.route({previous}, target);
-}});
-k.inbound({{
+}};
+await k.inbound({{
     implementation: k.{inbound}_inbound({{
         listen: {{address: k.ip('0.0.0.0'), port: listenPort}}{extra}
     }}),

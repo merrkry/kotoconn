@@ -240,33 +240,34 @@ def configure_routes():
 
 def policy(path: Path, mtu: int, idle_ms: int = 30000, outbound: str = "direct"):
     path.write_text(f"""import {{ kotoconn as k }} from '@kotoconn/bindings';
-const resolver = k.resolve_handler(name => k.lookup(name));
-const direct = k.dialer({{carrier: k.host_network({{}}), outbound: {{
+const resolver = name => k.lookup(name);
+const direct = await k.dialer({{carrier: k.host_network({{}}), outbound: {{
     resolve_handler: resolver, implementation: k.direct_outbound({{}})
 }}}});
-const routing = k.routing_handler(flow => flow.protocol === 'udp'
-    ? k.route_udp(direct) : k.route(direct, flow.dest));
-k.inbound({{implementation: k.tun_inbound({{name: '{NAME}', mtu: {mtu}, addresses: [
+const routing = flow => flow.protocol === 'udp'
+    ? k.route_udp(direct) : k.route(direct, flow.dest);
+await k.inbound({{implementation: k.tun_inbound({{
+    name: '{NAME}', mtu: {mtu}, addresses: [
     {{address: k.ip('192.0.2.1'), prefix: 30}},
     {{address: k.ip('fd00::1'), prefix: 126}}
 ]}}), routing_handler: routing, udp_idle_timeout: k.timeout({idle_ms})}});
 """)
     if outbound == "socks5":
         source = path.read_text()
-        point = source.index("k.inbound(")
-        relay = """k.inbound({
+        point = source.index("await k.inbound(")
+        relay = """await k.inbound({
     implementation: k.socks5_inbound({listen: {
         address: k.ip('127.0.0.1'), port: 9100
     }}),
     routing_handler: routing, udp_idle_timeout: k.timeout(30000)
 });
-const proxy = k.dialer({carrier: k.host_network({}), outbound: {
+const proxy = await k.dialer({carrier: k.host_network({}), outbound: {
     resolve_handler: resolver, implementation: k.socks5_outbound({
         server: k.ip_target(k.ip('127.0.0.1'), 9100)
     })
 }});
-const tunRouting = k.routing_handler(flow => flow.protocol === 'udp'
-    ? k.route_udp(proxy) : k.route(proxy, flow.dest));
+const tunRouting = flow => flow.protocol === 'udp'
+    ? k.route_udp(proxy) : k.route(proxy, flow.dest);
 """
         path.write_text(
             source[:point]
