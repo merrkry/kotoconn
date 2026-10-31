@@ -181,7 +181,7 @@ export interface Selector extends Group {
 /** A group whose current member policy picks explicitly; it starts with the first one. */
 export function selector(dialers: readonly Dialer[]): Selector {
   let members = nonEmpty(dialers);
-  let current = members[0]!;
+  let current = members[0];
 
   return {
     get current() {
@@ -189,7 +189,7 @@ export function selector(dialers: readonly Dialer[]): Selector {
     },
     update(dialers) {
       members = nonEmpty(dialers);
-      if (!members.some((member) => member.equals(current))) current = members[0]!;
+      if (!members.some((member) => member.equals(current))) current = members[0];
     },
     select(dialer) {
       if (!members.some((member) => member.equals(dialer))) {
@@ -223,17 +223,17 @@ export interface FastestOptions extends CheckedGroupOptions {
 export function fastest(options: FastestOptions): CheckedGroup {
   const tolerance = options.tolerance ?? 0;
   return checked(options, (members, latencies, current) => {
-    let best: Dialer | undefined;
+    let best: { member: Dialer; latency: number } | undefined;
     for (const member of members) {
       const latency = latencies.get(member);
-      if (latency !== undefined && (best === undefined || latency < latencies.get(best)!)) {
-        best = member;
+      if (latency !== undefined && (best === undefined || latency < best.latency)) {
+        best = { member, latency };
       }
     }
     if (best === undefined) return current;
 
     const kept = latencies.get(current);
-    return kept !== undefined && kept - latencies.get(best)! <= tolerance ? current : best;
+    return kept !== undefined && kept - best.latency <= tolerance ? current : best.member;
   });
 }
 
@@ -241,17 +241,17 @@ export function fastest(options: FastestOptions): CheckedGroup {
 export function fallback(options: CheckedGroupOptions): CheckedGroup {
   return checked(
     options,
-    (members, latencies) => members.find((member) => latencies.has(member)) ?? members[0]!,
+    (members, latencies) => members.find((member) => latencies.has(member)) ?? members[0],
   );
 }
 
 /** Runs check rounds and picks the current member from the latencies of healthy members. */
 function checked(
   options: CheckedGroupOptions,
-  pick: (members: readonly Dialer[], latencies: Map<Dialer, number>, current: Dialer) => Dialer,
+  pick: (members: Members, latencies: Map<Dialer, number>, current: Dialer) => Dialer,
 ): CheckedGroup {
   let members = nonEmpty(options.dialers);
-  let current = members[0]!;
+  let current = members[0];
   let closed = false;
   let rounds = 0;
 
@@ -264,8 +264,9 @@ function checked(
     if (round !== rounds || checked !== members) return;
 
     const latencies = new Map<Dialer, number>();
-    results.forEach((result, index) => {
-      if (result.status === "fulfilled") latencies.set(checked[index]!, result.value);
+    checked.forEach((member, index) => {
+      const result = results[index];
+      if (result?.status === "fulfilled") latencies.set(member, result.value);
     });
     current = pick(members, latencies, current);
   };
@@ -285,7 +286,7 @@ function checked(
     },
     update(dialers) {
       members = nonEmpty(dialers);
-      if (!members.some((member) => member.equals(current))) current = members[0]!;
+      if (!members.some((member) => member.equals(current))) current = members[0];
       check().catch((error) => k.log("warn", `group check failed: ${String(error)}`));
     },
     check,
@@ -295,9 +296,13 @@ function checked(
   };
 }
 
-function nonEmpty(dialers: readonly Dialer[]): readonly Dialer[] {
-  if (dialers.length === 0) throw new Error("a group needs at least one dialer");
-  return [...dialers];
+/** Group members; a group always has a current member. */
+type Members = readonly [Dialer, ...Dialer[]];
+
+function nonEmpty(dialers: readonly Dialer[]): Members {
+  const [first, ...rest] = dialers;
+  if (first === undefined) throw new Error("a group needs at least one dialer");
+  return [first, ...rest];
 }
 
 export interface SubscriptionOptions {
@@ -439,16 +444,15 @@ export interface AutoRouteOptions {
 export async function auto_route(options: AutoRouteOptions): Promise<void> {
   const table = String(options.table ?? 2022);
   const priority = options.priority ?? 9000;
-  const priorities = [0, 1, 2].map((offset) => String(priority + offset));
-  const rules = [
-    ["fwmark", String(options.mark), "lookup", "main"],
-    ["lookup", "main", "suppress_prefixlength", "0"],
-    ["lookup", table],
+  const rules: [priority: string, selector: string[]][] = [
+    [String(priority), ["fwmark", String(options.mark), "lookup", "main"]],
+    [String(priority + 1), ["lookup", "main", "suppress_prefixlength", "0"]],
+    [String(priority + 2), ["lookup", table]],
   ];
 
   const remove = async () => {
     for (const family of ["-4", "-6"]) {
-      for (const priority of priorities) {
+      for (const [priority] of rules) {
         // Each deletion removes one rule; a failure means none is left.
         while ((await k.exec(["ip", family, "rule", "del", "priority", priority])).status === 0) {}
       }
@@ -472,8 +476,8 @@ export async function auto_route(options: AutoRouteOptions): Promise<void> {
   try {
     for (const family of ["-4", "-6"]) {
       await ip([family, "route", "replace", "default", "dev", options.interface, "table", table]);
-      for (const [index, rule] of rules.entries()) {
-        await ip([family, "rule", "add", "priority", priorities[index]!, ...rule!]);
+      for (const [priority, selector] of rules) {
+        await ip([family, "rule", "add", "priority", priority, ...selector]);
       }
     }
   } catch (error) {
