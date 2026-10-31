@@ -61,7 +61,9 @@ fn answer(request: &Message) -> Message {
                 RData::TXT(TXT::new(vec!["x".repeat(100)])),
             ));
         }
-    } else if name == "servfail.example." {
+    } else if name == "servfail.example."
+        || (name == "partial.example." && question.query_type == RecordType::AAAA)
+    {
         response.metadata.response_code = ResponseCode::ServFail;
     } else {
         let mut owner = question.name.clone();
@@ -604,6 +606,11 @@ async fn service_resolve_answers_resolve_handlers_and_dialer_server_names() -> R
     questions(&mut upstream, 2).await;
     let error = resolve("servfail.example").await.unwrap_err();
     assert!(error.to_string().contains("SERVFAIL"), "{error}");
+    questions(&mut upstream, 2).await;
+    assert_eq!(
+        resolve("partial.example").await?,
+        ["192.0.2.1".parse::<IpAddr>()?]
+    );
     questions(&mut upstream, 2).await;
 
     let response = udp_query(listen(&daemon), &query("example.", 1)).await?;

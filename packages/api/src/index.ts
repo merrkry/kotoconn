@@ -22,8 +22,10 @@ export interface DnsService {
   readonly query: (request: Request) => Promise<Response>;
   readonly handler: DnsHandler;
   /**
-   * A and AAAA addresses of a name. NXDOMAIN and NODATA give an empty list; other response
-   * codes reject. Usable directly as a resolve handler.
+   * A and AAAA addresses of a name. NXDOMAIN and NODATA give no addresses; other response
+   * codes and query errors fail that query. When one query fails and the other gives
+   * addresses, they are returned and the failure is logged as a warning; otherwise a failure
+   * rejects. Usable directly as a resolve handler.
    */
   readonly resolve: (name: string) => Promise<IpAddr[]>;
 }
@@ -47,21 +49,34 @@ export function dns_service(options: DnsServiceOptions): DnsService {
   const query = (request: Request) => k.dns_query(service, request);
   const handler: DnsHandler = async (request) => k.respond(await query(request));
 
+  const lookup = async (name: string, type: "A" | "AAAA") => {
+    const response = await query(k.dns_request(name, type));
+    if (response.code !== "NOERROR" && response.code !== "NXDOMAIN") {
+      throw new Error(`${type} query for ${name} returned ${response.code}`);
+    }
+
+    return response.answers.flatMap((record) =>
+      record.type === "A" || record.type === "AAAA" ? [record.data] : [],
+    );
+  };
+
   const resolve = async (name: string) => {
-    const responses = await Promise.all(
-      (["A", "AAAA"] as const).map((type) => query(k.dns_request(name, type))),
+    const results = await Promise.allSettled([lookup(name, "A"), lookup(name, "AAAA")]);
+    const addresses = results.flatMap((result) =>
+      result.status === "fulfilled" ? result.value : [],
+    );
+    const failures = results.flatMap((result) =>
+      result.status === "rejected"
+        ? [result.reason instanceof Error ? result.reason.message : String(result.reason)]
+        : [],
     );
 
-    const addresses: IpAddr[] = [];
-    for (const response of responses) {
-      if (response.code !== "NOERROR" && response.code !== "NXDOMAIN") {
-        throw new Error(`DNS resolution of ${name} failed with ${response.code}`);
-      }
-      for (const record of response.answers) {
-        if (record.type === "A" || record.type === "AAAA") {
-          addresses.push(record.data);
-        }
-      }
+    if (failures.length > 0 && addresses.length === 0) {
+      throw new Error(`DNS resolution of ${name} failed: ${failures.join("; ")}`);
+    }
+
+    for (const failure of failures) {
+      k.log("warn", `DNS resolution of ${name} ignored a failure: ${failure}`);
     }
     return addresses;
   };

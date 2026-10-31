@@ -46,8 +46,10 @@ its own connection to answer.
 
 `await service.resolve(name)` queries A and AAAA records through the service, so
 its cache and forwarding apply, and returns the addresses of both answers.
-NXDOMAIN and answers without addresses give an empty list; other response codes
-reject. Like `service.handler`, it needs no `this`, so it serves directly as a
+NXDOMAIN and answers without addresses give an empty list. When one query fails
+with another response code or an error while the other returns addresses, the
+addresses are returned and the failure is logged as a warning; otherwise the
+failure rejects. Like `service.handler`, it needs no `this`, so it serves directly as a
 resolve handler:
 
 ```ts
