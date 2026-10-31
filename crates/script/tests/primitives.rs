@@ -130,7 +130,7 @@ async fn exec_reports_results_and_rejects_failures() {
             await rejects(k.exec([]), 'needs a program');
             await rejects(k.exec(['/nonexistent/kotoconn-program']), 'spawn');
             await rejects(k.exec(
-                ['sh', '-c', 'echo $$ > "$1"; exec sleep 1000', 'sh', {pid_file:?}],
+                ['sh', '-c', 'sleep 1000 & echo $! > "$1"; wait', 'sh', {pid_file:?}],
                 {{ timeout: k.timeout(200) }},
             ), 'timed out');
             return [];
@@ -152,7 +152,8 @@ async fn exec_reports_results_and_rejects_failures() {
         .await
         .unwrap();
 
-    // The timeout can fire before the shell records its PID; then nothing is left to observe.
+    // The timeout kills the shell's background child too. It can fire before the shell
+    // records the child's PID; then nothing is left to observe.
     if let Some(pid) = std::fs::read_to_string(&pid_file)
         .ok()
         .and_then(|pid| pid.trim().parse::<u32>().ok())

@@ -24,7 +24,8 @@ pub(crate) struct ExecResult {
     pub stderr: String,
 }
 
-/// Run a program without a shell. Dropping the future kills the child.
+/// Run a program without a shell. Timing out or dropping the future kills the
+/// program and the processes it started.
 pub(crate) async fn exec(
     argv: Vec<String>,
     timeout: Option<Duration>,
@@ -45,20 +46,24 @@ pub(crate) async fn exec(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // Its own group also keeps terminal signals meant for the daemon away from it.
+    #[cfg(unix)]
+    command.process_group(0);
 
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("spawn {program}: {error}"))?;
+    let mut group = ProcessGroup::of(&child);
+
+    let stdin = child.stdin.take();
+    debug_assert_eq!(
+        stdin.is_some(),
+        input.is_some(),
+        "stdin is piped only for input"
+    );
+
+    // Feed input while collecting output, so neither side can fill its pipe and stall.
     let run = async {
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("spawn {program}: {error}"))?;
-
-        let stdin = child.stdin.take();
-        debug_assert_eq!(
-            stdin.is_some(),
-            input.is_some(),
-            "stdin is piped only for input"
-        );
-
-        // Feed input while collecting output, so neither side can fill its pipe and stall.
         let (written, output) = tokio::join!(write(stdin, input), child.wait_with_output());
         let output = output.map_err(|error| format!("wait for {program}: {error}"))?;
         written.map_err(|error| format!("write input to {program}: {error}"))?;
@@ -71,12 +76,46 @@ pub(crate) async fn exec(
         })
     };
 
-    match timeout {
+    let result = match timeout {
         Some(timeout) => tokio::time::timeout(timeout, run)
             .await
             .map_err(|_| format!("{program} timed out after {} ms", timeout.as_millis()))?,
         None => run.await,
+    };
+
+    // Processes the program left running after it finished are its own business.
+    group.release();
+    result
+}
+
+/// Kills the process group of a spawned program when dropped, unless released.
+struct ProcessGroup(Option<u32>);
+
+impl ProcessGroup {
+    fn of(child: &tokio::process::Child) -> Self {
+        Self(child.id())
     }
+
+    fn release(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ProcessGroup {
+    #[cfg(unix)]
+    fn drop(&mut self) {
+        use rustix::process::{Pid, Signal, kill_process_group};
+
+        // A process ID is not reused while it names a live group member, and an
+        // empty group makes the signal fail harmlessly.
+        let Some(group) = self.0.and_then(|id| Pid::from_raw(id.try_into().ok()?)) else {
+            return;
+        };
+        let _ = kill_process_group(group, Signal::KILL);
+    }
+
+    #[cfg(not(unix))]
+    fn drop(&mut self) {}
 }
 
 async fn write(stdin: Option<tokio::process::ChildStdin>, input: Option<String>) -> io::Result<()> {

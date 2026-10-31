@@ -1911,6 +1911,7 @@ dependencies = [
  "kotoconn-config",
  "kotoconn-typescript",
  "rquickjs",
+ "rustix",
  "structural-convert",
  "tempfile",
  "thiserror 2.0.20",
