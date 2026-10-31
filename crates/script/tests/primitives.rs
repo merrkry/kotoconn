@@ -162,51 +162,6 @@ async fn exec_reports_results_and_rejects_failures() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn exec_leaves_processes_alive_after_the_program_exits() {
-    let directory = tempfile::tempdir().unwrap();
-    let fifo = directory.path().join("fifo");
-    assert!(
-        std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .unwrap()
-            .success()
-    );
-    let (script, id) = load(&format!(
-        r#"
-        import {{ kotoconn as k }} from '@kotoconn/bindings';
-        k.resolve_handler(async () => {{
-            // The background reader keeps stderr open, so exec times out after the shell exits.
-            try {{
-                await k.exec(['sh', '-c', 'cat "$1" > /dev/null & exit 0', 'sh', {fifo:?}], {{ timeout: k.timeout(200) }});
-            }} catch (error) {{
-                if (String(error).includes('timed out')) return [];
-                throw error;
-            }}
-            throw Error('exec finished while its output was open');
-        }});
-    "#,
-        fifo = fifo.to_str().unwrap(),
-    ))
-    .await;
-
-    tokio::time::timeout(TIMEOUT, script.resolve(id, "run"))
-        .await
-        .unwrap()
-        .unwrap();
-
-    // Opening the FIFO for writing completes only while the background reader lives.
-    // A detached thread lets the test fail instead of waiting on a blocked open.
-    let (opened, written) = tokio::sync::oneshot::channel();
-    std::thread::spawn(move || opened.send(std::fs::write(fifo, "alive")));
-    tokio::time::timeout(TIMEOUT, written)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-}
-
 // SIGKILL delivery is asynchronous, and the child may stay a zombie until it is reaped.
 async fn exited(pid: u32) {
     loop {

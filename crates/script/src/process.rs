@@ -176,41 +176,12 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_after_an_unobserved_exit_leaves_its_processes_alone() {
-        let directory = tempfile::tempdir().unwrap();
-        let fifo = directory.path().join("fifo");
-        let pid = directory.path().join("pid");
-        assert!(
-            std::process::Command::new("mkfifo")
-                .arg(&fifo)
-                .status()
-                .unwrap()
-                .success()
-        );
-
-        let mut running = Box::pin(exec(
-            vec![
-                "sh".into(),
-                "-c".into(),
-                r#"cat "$1" > /dev/null & echo $$ > "$2.tmp" && mv "$2.tmp" "$2""#.into(),
-                "sh".into(),
-                fifo.to_str().unwrap().into(),
-                pid.to_str().unwrap().into(),
-            ],
-            None,
-            None,
-        ));
+        let program = BackgroundReader::new();
+        let mut running = Box::pin(exec(program.argv(), None, None));
         // Spawn the program, then stop polling so nothing observes its exit.
         assert!(poll_once(running.as_mut()).is_pending());
 
-        let pid = loop {
-            if let Some(pid) = std::fs::read_to_string(&pid)
-                .ok()
-                .and_then(|pid| pid.trim().parse::<u32>().ok())
-            {
-                break pid;
-            }
-            tokio::task::yield_now().await;
-        };
+        let pid = program.pid().await;
         while !std::fs::read_to_string(format!("/proc/{pid}/stat"))
             .unwrap()
             .rsplit_once(") ")
@@ -220,14 +191,81 @@ mod tests {
         }
         drop(running);
 
-        // Opening the FIFO for writing completes only while the background reader lives.
-        let (opened, written) = tokio::sync::oneshot::channel();
-        std::thread::spawn(move || opened.send(std::fs::write(fifo, "alive")));
-        tokio::time::timeout(Duration::from_secs(3), written)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        program.assert_alive().await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_after_the_program_is_reaped_leaves_its_processes_alone() {
+        let program = BackgroundReader::new();
+        let running = tokio::spawn(exec(program.argv(), None, None));
+
+        // Only `exec` reaps the program, which removes its process entry.
+        let pid = program.pid().await;
+        while std::fs::exists(format!("/proc/{pid}")).unwrap() {
+            tokio::task::yield_now().await;
+        }
+        // The background reader still holds the program's output open.
+        assert!(!running.is_finished());
+        running.abort();
+        assert!(running.await.is_err_and(|error| error.is_cancelled()));
+
+        program.assert_alive().await;
+    }
+
+    /// A shell that leaves a FIFO reader running in its group, records its PID and exits.
+    struct BackgroundReader {
+        directory: tempfile::TempDir,
+    }
+
+    impl BackgroundReader {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(directory.path().join("fifo"))
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            Self { directory }
+        }
+
+        fn argv(&self) -> Vec<String> {
+            let path = |name| self.directory.path().join(name).to_str().unwrap().into();
+            vec![
+                "sh".into(),
+                "-c".into(),
+                r#"cat "$1" > /dev/null & echo $$ > "$2.tmp" && mv "$2.tmp" "$2""#.into(),
+                "sh".into(),
+                path("fifo"),
+                path("pid"),
+            ]
+        }
+
+        async fn pid(&self) -> u32 {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(self.directory.path().join("pid"))
+                    .ok()
+                    .and_then(|pid| pid.trim().parse().ok())
+                {
+                    return pid;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+
+        /// Opening the FIFO for writing completes only while the reader lives. A
+        /// detached thread lets the test fail instead of waiting on a blocked open.
+        async fn assert_alive(&self) {
+            let fifo = self.directory.path().join("fifo");
+            let (opened, written) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || opened.send(std::fs::write(fifo, "alive")));
+            tokio::time::timeout(Duration::from_secs(3), written)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
     }
 
     fn poll_once<F: std::future::Future>(
