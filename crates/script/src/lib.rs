@@ -9,6 +9,7 @@ mod loader;
 mod log;
 mod native;
 mod process;
+mod rejection;
 mod task;
 mod types;
 
@@ -59,6 +60,9 @@ impl Script {
             .await;
         runtime
             .set_loader(loader::Resolver, loader::Loader(sources))
+            .await;
+        runtime
+            .set_host_promise_rejection_tracker(Some(rejection::tracker()))
             .await;
         let context = AsyncContext::full(&runtime).await.map_err(js_error)?;
 
