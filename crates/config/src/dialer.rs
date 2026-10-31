@@ -5,7 +5,7 @@ use crate::OutboundConfig;
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ts_rs::TS)]
 #[ts(rename = "Dialer")]
-#[ts(type = "{ readonly __brand: unique symbol }")]
+#[ts(type = "Resource & { equals(other: Dialer): boolean; readonly __brand: unique symbol }")]
 pub struct DialerId(pub NonZeroU64);
 
 #[derive(Debug, Clone, PartialEq, Eq, ts_rs::TS)]

@@ -53,7 +53,11 @@ macro_rules! api {
 
 pub(crate) use api;
 
-use rquickjs::function::{FromParam, Opt, ParamRequirement, ParamsAccessor};
+use rquickjs::{
+    function::{FromParam, Opt, ParamRequirement, ParamsAccessor},
+    promise::Promised,
+};
+use std::{future::Future, pin::Pin};
 use ts_rs::TS;
 
 /// A trailing argument that JS callers may omit.
@@ -106,5 +110,35 @@ impl<T: TS> Parameter for T {
 impl<T: TS> Parameter for Optional<T> {
     fn declaration(name: &str, cfg: &ts_rs::Config) -> String {
         format!("{name}?: {}", T::name(cfg))
+    }
+}
+
+/// A promise for native work that starts when the method is called. An async
+/// method only starts its work once the runtime first polls it.
+pub(crate) struct Started<'js, T>(Pin<Box<dyn Future<Output = rquickjs::Result<T>> + 'js>>);
+
+impl<'js, T> Started<'js, T> {
+    pub fn new(work: impl Future<Output = rquickjs::Result<T>> + 'js) -> Self {
+        Self(Box::pin(work))
+    }
+}
+
+// Named only inline: a declared alias would export a `Started` type.
+impl<T: TS> TS for Started<'_, T> {
+    type WithoutGenerics = Self;
+    type OptionInnerType = Self;
+
+    fn name(cfg: &ts_rs::Config) -> String {
+        format!("Promise<{}>", T::name(cfg))
+    }
+
+    fn inline(cfg: &ts_rs::Config) -> String {
+        Self::name(cfg)
+    }
+}
+
+impl<'js, T: rquickjs::IntoJs<'js> + 'js> rquickjs::IntoJs<'js> for Started<'js, T> {
+    fn into_js(self, ctx: &rquickjs::Ctx<'js>) -> rquickjs::Result<rquickjs::Value<'js>> {
+        Promised(self.0).into_js(ctx)
     }
 }

@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 struct Entry {
@@ -199,7 +200,7 @@ async fn session(
             None
         };
 
-        let decision = handler.policy.route(handler.routing, flow).await?;
+        let decision = handler.policy.route(&handler.routing, flow).await?;
 
         let dialer = match decision {
             RouteDecision::Udp { dialer } => dialer,
@@ -214,7 +215,7 @@ async fn session(
 
         tracing::debug!(dialer_id = dialer.0.get(), "UDP route selected");
 
-        let client = handler.clients.get(&dialer).context("unknown dialer")?;
+        let client = handler.dialer(dialer)?;
 
         client
             .control(TransportProtocol::Udp)

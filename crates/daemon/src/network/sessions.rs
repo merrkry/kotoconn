@@ -41,8 +41,8 @@ pub(crate) struct Sessions {
     tx: mpsc::UnboundedSender<Command>,
 }
 
-pub(super) struct Registration {
-    pub(super) id: SessionId,
+pub(crate) struct Registration {
+    pub(crate) id: SessionId,
     tx: mpsc::UnboundedSender<Command>,
 }
 
@@ -53,10 +53,11 @@ impl Drop for Registration {
 }
 
 impl Sessions {
-    pub fn new() -> (Self, impl Future<Output = ()> + Send) {
+    /// The registry task ends once the last handle drops.
+    pub fn new() -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        (Self { tx }, async move {
+        tokio::spawn(async move {
             let mut sessions = HashMap::new();
             let mut next = 0;
 
@@ -81,10 +82,11 @@ impl Sessions {
                     }
                 }
             }
-        })
+        });
+        Self { tx }
     }
 
-    pub(super) async fn register(
+    pub(crate) async fn register(
         &self,
         destination: Target,
         protocol: TransportProtocol,

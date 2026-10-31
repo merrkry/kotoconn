@@ -97,8 +97,7 @@ async fn run(Cli { command, .. }: Cli) -> Result<()> {
             };
             tracing::info!(
                 event = "daemon_ready",
-                inbounds = daemon.policy().config().inbounds.len(),
-                dialers = daemon.policy().config().dialers.len(),
+                resources = daemon.resources().len(),
                 "daemon ready"
             );
 

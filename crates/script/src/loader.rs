@@ -1,4 +1,4 @@
-use crate::host::Host;
+use crate::{Resources, host::Host};
 use rquickjs::{
     Class, Ctx, Module, Object, Result,
     module::{Declarations, Exports, ModuleDef},
@@ -6,6 +6,7 @@ use rquickjs::{
 use std::{
     collections::HashMap,
     path::{Component, Path},
+    sync::Arc,
 };
 
 pub(crate) const MODULE_NAME: &str = "@kotoconn/bindings";
@@ -21,9 +22,26 @@ impl ModuleDef for Native {
     }
 
     fn evaluate<'js>(ctx: &Ctx<'js>, exports: &Exports<'js>) -> Result<()> {
-        exports.export("kotoconn", Class::instance(ctx.clone(), Host::new())?)?;
+        let Installed(resources) = *ctx
+            .remove_userdata::<Installed>()
+            .map_err(|_| crate::native::invalid("resource manager is in use"))?
+            .ok_or_else(|| crate::native::invalid("resource manager is not installed"))?;
+        exports.export(
+            "kotoconn",
+            Class::instance(ctx.clone(), Host::new(resources))?,
+        )?;
         Ok(())
     }
+}
+
+/// Hands the resource manager to the native module, which is evaluated once.
+#[derive(rquickjs::JsLifetime)]
+struct Installed(Arc<dyn Resources>);
+
+pub(crate) fn install(ctx: &Ctx<'_>, resources: Arc<dyn Resources>) -> Result<()> {
+    ctx.store_userdata(Installed(resources))
+        .map_err(|_| crate::native::invalid("resource manager is in use"))?;
+    Ok(())
 }
 
 pub(crate) fn host<'js>(ctx: &Ctx<'js>) -> Result<Class<'js, Host<'js>>> {

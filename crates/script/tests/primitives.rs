@@ -1,20 +1,15 @@
-use kotoconn_config::ResolveHandlerId;
+#[path = "support/resources.rs"]
+mod resources;
+
+use kotoconn_config::ResolveHandler;
 use kotoconn_script::Script;
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
 
-async fn load(source: &str) -> (Script, ResolveHandlerId) {
-    let script = Script::load(
-        "main.ts",
-        HashMap::from([("main.ts".into(), source.into())]),
-    )
-    .await
-    .unwrap();
-    let config = script.config().await.unwrap();
-    let id = *config.resolve_handlers.iter().next().unwrap();
-
-    (script, id)
+async fn load(source: &str) -> (Script, ResolveHandler) {
+    let (script, recorder) = resources::load(source).await;
+    (script, recorder.resolve_handler())
 }
 
 // Policies record events in `log`; their resolve handler fails unless `log` matches `name`.
@@ -28,14 +23,14 @@ async fn sleep_waits_for_its_timeout_and_rejects_once_shutdown_starts() {
         const log = [];
         k.sleep(k.timeout(60000)).then(() => log.push('slept'));
         k.sleep(k.timeout(3600000)).then(() => log.push('woke'), () => log.push('pending rejected'));
-        k.resolve_handler(async name => {{
+        await k.dialer({{carrier: k.host_network({{}}), outbound: {{implementation: k.direct_outbound({{}}), resolve_handler: async name => {{
             if (name === 'late') {{
                 await k.sleep(k.timeout(60000)).then(() => log.push('late slept'), () => log.push('late rejected'));
                 return [];
             }}
             {CHECK_LOG}
             return [];
-        }});
+        }}}}}});
     "#
     ))
     .await;
@@ -45,13 +40,13 @@ async fn sleep_waits_for_its_timeout_and_rejects_once_shutdown_starts() {
         _ = script.drive() => unreachable!("driver lives while its runtime exists"),
         _ = tokio::time::sleep(Duration::from_secs(61)) => {}
     }
-    script.resolve(id, "slept").await.unwrap();
+    script.resolve(&id, "slept").await.unwrap();
 
     script.shutdown().await.unwrap();
     script.idle().await;
-    script.resolve(id, "late").await.unwrap();
+    script.resolve(&id, "late").await.unwrap();
     script
-        .resolve(id, "slept|pending rejected|late rejected")
+        .resolve(&id, "slept|pending rejected|late rejected")
         .await
         .unwrap();
 }
@@ -70,17 +65,17 @@ async fn shutdown_hooks_run_newest_first_one_at_a_time_despite_failures() {
             await k.sleep(k.timeout(0)).catch(() => log.push('sleep rejected'));
             log.push(`${{result.status}} ${{result.signal}} ${{result.stdout}} ${{result.stderr.trim()}}`);
         }});
-        k.resolve_handler(name => {{
+        await k.dialer({{carrier: k.host_network({{}}), outbound: {{implementation: k.direct_outbound({{}}), resolve_handler: name => {{
             if (name === 'register') k.on_shutdown(() => {{ log.push('registered later'); }});
             else if (name === 'register again') k.on_shutdown(() => {{}});
             else {CHECK_LOG}
             return [];
-        }});
+        }}}}}});
     "#
     ))
     .await;
 
-    script.resolve(id, "register").await.unwrap();
+    script.resolve(&id, "register").await.unwrap();
     tokio::time::timeout(TIMEOUT, script.shutdown())
         .await
         .unwrap()
@@ -88,12 +83,12 @@ async fn shutdown_hooks_run_newest_first_one_at_a_time_despite_failures() {
 
     script
         .resolve(
-            id,
+            &id,
             "registered later|sleep rejected|3 undefined input diagnostic|first",
         )
         .await
         .unwrap();
-    let error = script.resolve(id, "register again").await.unwrap_err();
+    let error = script.resolve(&id, "register again").await.unwrap_err();
     assert!(
         error
             .to_string()
@@ -117,7 +112,7 @@ async fn exec_reports_results_and_rejects_failures() {
             }}
             throw Error(`expected rejection: ${{message}}`);
         }};
-        k.resolve_handler(async name => {{
+        await k.dialer({{carrier: k.host_network({{}}), outbound: {{implementation: k.direct_outbound({{}}), resolve_handler: async name => {{
             if (name !== 'run') {{ {CHECK_LOG} return []; }}
 
             const empty = await k.exec(['cat']);
@@ -134,19 +129,19 @@ async fn exec_reports_results_and_rejects_failures() {
                 {{ timeout: k.timeout(200) }},
             ), 'timed out');
             return [];
-        }});
+        }}}}}});
     "#,
         pid_file = pid_file.to_str().unwrap(),
     ))
     .await;
 
-    tokio::time::timeout(TIMEOUT, script.resolve(id, "run"))
+    tokio::time::timeout(TIMEOUT, script.resolve(&id, "run"))
         .await
         .unwrap()
         .unwrap();
     script
         .resolve(
-            id,
+            &id,
             "0 undefined []|undefined 9|lossy|needs a program|spawn|timed out",
         )
         .await

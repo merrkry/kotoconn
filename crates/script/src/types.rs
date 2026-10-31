@@ -14,6 +14,13 @@ pub(crate) fn declarations() -> String {
     let _: fn(&Cidr, IpAddr) -> bool = Cidr::contains;
     let _: fn(&Cidr) -> String = Cidr::display;
     let _: fn(&Inbound, Inbound) -> bool = Inbound::equals;
+    let _: fn(&Dialer, Dialer) -> bool = Dialer::equals;
+    let _: fn(&DnsServiceRef, DnsServiceRef) -> bool = DnsServiceRef::equals;
+    let _: for<'js> fn(&Dialer, rquickjs::Ctx<'js>) -> rquickjs::Result<()> = Dialer::close;
+    let _: for<'js> fn(&Dialer, rquickjs::Ctx<'js>, DrainOptions) -> rquickjs::Result<()> =
+        Dialer::drain;
+    let _: for<'js> fn(&Dialer, rquickjs::Ctx<'js>) -> rquickjs::Result<rquickjs::Promise<'js>> =
+        Dialer::wait;
     let _: fn(&Target) -> u16 = Target::port;
     let _: fn(&Target) -> Option<String> = Target::domain;
     let _: fn(&Target) -> Option<IpAddr> = Target::ip;
@@ -31,9 +38,11 @@ pub(crate) fn declarations() -> String {
         Milliseconds::decl(&cfg),
         Dialer::decl(&cfg),
         Inbound::decl(&cfg),
-        Routing::decl(&cfg),
-        Resolve::decl(&cfg),
-        Dns::decl(&cfg),
+        "interface Resource { close(): void; drain(options: DrainOptions): void; wait(): Promise<void>; }".into(),
+        DrainOptions::decl(&cfg),
+        format!("type RoutingHandler = {};", host::RoutingHandler::name(&cfg)),
+        format!("type ResolveHandler = {};", host::ResolveHandler::name(&cfg)),
+        format!("type DnsHandler = {};", host::DnsHandler::name(&cfg)),
         DnsServiceRef::decl(&cfg),
         DnsServiceConfig::decl(&cfg),
         DnsUpstreamConfig::decl(&cfg),

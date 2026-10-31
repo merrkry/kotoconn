@@ -1,11 +1,11 @@
 mod anytls;
-mod config;
 mod dialer;
 mod dns;
 mod flow;
+mod handler;
 mod inbound;
 mod outbound;
-mod resolve;
+mod resource;
 mod route;
 mod sniff;
 mod target;
@@ -14,19 +14,19 @@ mod tls;
 pub use anytls::{AnyTlsInboundConfig, AnyTlsOutboundConfig};
 pub use tls::{TlsClientConfig, TlsServerConfig};
 
-pub use config::Config;
 pub use dialer::{CarrierConfig, DialerConfig, DialerId, HostNetworkConfig};
 pub use dns::{
-    DnsHandlerId, DnsHandlerResult, DnsListenerConfig, DnsRequest, DnsRequestInfo, DnsResponse,
-    DnsServiceConfig, DnsServiceId, DnsUpstreamConfig,
+    DnsHandlerResult, DnsListenerConfig, DnsRequest, DnsRequestInfo, DnsResponse, DnsServiceConfig,
+    DnsServiceId, DnsUpstreamConfig,
 };
 pub use flow::{Flow, TransportProtocol};
+pub use handler::{DnsHandler, Handler, ResolveHandler, RoutingHandler};
 pub use inbound::{
     DirectInboundConfig, InboundConfig, InboundId, InboundImpl, TunAddress, TunInboundConfig,
 };
 pub use outbound::{DirectOutboundConfig, OutboundConfig, OutboundImpl, Socks5OutboundConfig};
-pub use resolve::ResolveHandlerId;
-pub use route::{RouteDecision, RoutingHandlerId};
+pub use resource::{ResourceConfig, ResourceId};
+pub use route::RouteDecision;
 pub use sniff::{SniffConfig, SniffProtocol, SniffResult};
 pub use std::net::IpAddr;
 pub use target::Target;

@@ -1,7 +1,80 @@
-use crate::{Script, task};
+use crate::{NativeFuture, Resources, Script, loader, task};
+use kotoconn_config as config;
 use rquickjs::{Function, function::Async};
-use std::{cell::Cell, collections::HashMap, time::Duration};
+use std::{cell::Cell, collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::oneshot;
+
+/// Runtime tests need no resources.
+struct Unavailable;
+
+impl Resources for Unavailable {
+    fn create(
+        &self,
+        _: config::ResourceConfig,
+    ) -> NativeFuture<Result<config::ResourceId, String>> {
+        Box::pin(async { Err("unavailable".to_owned()) })
+    }
+
+    fn close(&self, _: config::ResourceId) -> Result<(), String> {
+        Err("unavailable".to_owned())
+    }
+
+    fn drain(&self, _: config::ResourceId, _: Duration) -> Result<(), String> {
+        Err("unavailable".to_owned())
+    }
+
+    fn released(&self, _: config::ResourceId) -> NativeFuture<()> {
+        Box::pin(async {})
+    }
+
+    fn dns_query(
+        &self,
+        _: config::DnsServiceId,
+        _: config::DnsRequest,
+    ) -> NativeFuture<Result<config::DnsResponse, String>> {
+        Box::pin(async { Err("unavailable".to_owned()) })
+    }
+}
+
+async fn load() -> Script {
+    let script = Script::new(
+        HashMap::from([("main.ts".into(), "export {};".into())]),
+        Arc::new(Unavailable),
+        || false,
+    )
+    .await
+    .unwrap();
+    script.evaluate("main.ts").await.unwrap();
+    script
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handlers_stay_registered_until_their_last_reference_drops() {
+    let script = load().await;
+    let (first, second) = script
+        .context
+        .with(|ctx| {
+            let function: Function = ctx.eval("name => []").unwrap();
+            let handler: config::ResolveHandler = loader::host(&ctx)
+                .unwrap()
+                .borrow()
+                .register(function)
+                .unwrap();
+            (handler.clone(), handler)
+        })
+        .await;
+    let id = second.id();
+
+    drop(first);
+    assert!(script.resolve(&second, "name").await.unwrap().is_empty());
+
+    drop(second);
+    let registered = script
+        .context
+        .with(|ctx| loader::host(&ctx).unwrap().borrow().handler(id).is_ok())
+        .await;
+    assert!(!registered);
+}
 
 struct Pending {
     script: Script,
@@ -21,12 +94,7 @@ impl Drop for OnDrop {
 
 // Install a sample operation without any application resources or daemon code.
 async fn pending() -> Pending {
-    let script = Script::load(
-        "main.ts",
-        HashMap::from([("main.ts".into(), "export {};".into())]),
-    )
-    .await
-    .unwrap();
+    let script = load().await;
     let (started, start) = oneshot::channel();
     let (release, released) = oneshot::channel();
     let (finish, finished) = oneshot::channel();

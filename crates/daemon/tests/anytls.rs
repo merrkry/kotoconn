@@ -1,5 +1,5 @@
 use anyhow::Result;
-use kotoconn_config::{InboundImpl, OutboundImpl, Socks5OutboundConfig};
+use kotoconn_config::{InboundId, InboundImpl, OutboundImpl, ResourceConfig, Socks5OutboundConfig};
 use kotoconn_daemon::Daemon;
 use kotoconn_outbounds::{Clients, System, SystemResolver};
 use kotoconn_protocol::*;
@@ -26,30 +26,33 @@ async fn typescript_anytls_routes_tcp_and_udp_over_an_http_carrier() -> Result<(
         let key = certificate.signing_key.serialize_pem();
         let server = start(format!(r#"
             import {{ kotoconn as k }} from '@kotoconn/bindings';
-            const resolver = k.resolve_handler(name => k.lookup(name));
-            const direct = k.dialer({{ carrier: k.host_network({{}}), outbound: {{resolve_handler: resolver, implementation: k.direct_outbound({{}})}} }});
-            const routing = k.routing_handler(flow => flow.protocol === 'udp' ? k.route_udp(direct) : k.route(direct, flow.dest));
+            const resolver = name => k.lookup(name);
+            const direct = await k.dialer({{ carrier: k.host_network({{}}), outbound: {{resolve_handler: resolver, implementation: k.direct_outbound({{}})}} }});
+            const routing = flow => flow.protocol === 'udp' ? k.route_udp(direct) : k.route(direct, flow.dest);
             const listen = {{address: k.ip('127.0.0.1'), port: 0}};
             for (const implementation of [
                 k.http_inbound({{listen}}),
                 k.anytls_inbound({{listen, password: 'secret', tls: {{certificate: {pem:?}, private_key: {key:?}}}, padding_scheme: 'stop=2\n0=32-32\n1=256-256'}}),
-            ]) k.inbound({{implementation, routing_handler: routing, udp_idle_timeout: k.timeout(30000)}});
+            ]) await k.inbound({{implementation, routing_handler: routing, udp_idle_timeout: k.timeout(30000)}});
         "#)).await?;
         let addresses = server.listen_addresses();
         let inbound = |anytls| {
-            let id = server.policy().config().inbounds.iter().find(|(_, config)| matches!(config.implementation, InboundImpl::AnyTls(_)) == anytls).unwrap().0;
-            addresses[id]
+            let id = server.resources().into_iter().find_map(|(id, config)| match config {
+                ResourceConfig::Inbound(config) if matches!(config.implementation, InboundImpl::AnyTls(_)) == anytls => Some(InboundId(id.0)),
+                _ => None,
+            }).unwrap();
+            addresses[&id]
         };
         let client = start(format!(r#"
             import {{ kotoconn as k }} from '@kotoconn/bindings';
-            const resolver = k.resolve_handler(name => k.lookup(name));
-            const lower = k.dialer({{carrier: k.host_network({{}}), outbound: {{resolve_handler: resolver, implementation: k.http_outbound({{server: k.ip_target(k.ip('127.0.0.1'), {})}})}}}});
-            const anytls = k.dialer({{carrier: lower, outbound: {{resolve_handler: resolver, implementation: k.anytls_outbound({{
+            const resolver = name => k.lookup(name);
+            const lower = await k.dialer({{carrier: k.host_network({{}}), outbound: {{resolve_handler: resolver, implementation: k.http_outbound({{server: k.ip_target(k.ip('127.0.0.1'), {})}})}}}});
+            const anytls = await k.dialer({{carrier: lower, outbound: {{resolve_handler: resolver, implementation: k.anytls_outbound({{
                 server: k.ip_target(k.ip('127.0.0.1'), {}), password: 'secret',
                 tls: {{server_name: 'localhost', certificate: {pem:?}}}, idle_session_timeout: k.timeout(60000),
             }})}}}});
-            const routing = k.routing_handler(flow => flow.protocol === 'udp' ? k.route_udp(anytls) : k.route(anytls, flow.dest));
-            k.inbound({{implementation: k.socks5_inbound({{listen: {{address: k.ip('127.0.0.1'), port: 0}}}}), routing_handler: routing, udp_idle_timeout: k.timeout(30000)}});
+            const routing = flow => flow.protocol === 'udp' ? k.route_udp(anytls) : k.route(anytls, flow.dest);
+            await k.inbound({{implementation: k.socks5_inbound({{listen: {{address: k.ip('127.0.0.1'), port: 0}}}}), routing_handler: routing, udp_idle_timeout: k.timeout(30000)}});
         "#, inbound(false).port(), inbound(true).port())).await?;
 
         let scope = Scope::new();

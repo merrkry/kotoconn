@@ -6,12 +6,11 @@ use hickory_proto::{
         rdata::{A, AAAA, CNAME, SOA, TXT, opt::EdnsOption},
     },
 };
-use kotoconn_config::ResolveHandlerId;
+use kotoconn_config::{ResolveHandler, ResourceConfig};
 use kotoconn_daemon::{Daemon, Shutdown};
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
-    num::NonZeroU64,
     time::Duration,
 };
 use tokio::{
@@ -181,26 +180,20 @@ async fn gateway(upstream: SocketAddr) -> Result<Daemon> {
     start(format!(r#"
         import {{kotoconn as k}} from '@kotoconn/bindings';
         let calls = 0;
-        const resolve = k.resolve_handler(() => [k.ip(`192.0.2.${{calls}}`)]);
-        const direct = k.dialer({{carrier: k.host_network({{}}), outbound: {{resolve_handler: resolve, implementation: k.direct_outbound({{}})}}}});
-        k.inbound({{implementation: k.socks5_inbound({{listen: {{address: k.ip('127.0.0.1'), port: 0}}}}), udp_idle_timeout: k.timeout(10000), routing_handler: k.routing_handler(flow => {{
+        const resolve = () => [k.ip(`192.0.2.${{calls}}`)];
+        const direct = await k.dialer({{carrier: k.host_network({{}}), outbound: {{resolve_handler: resolve, implementation: k.direct_outbound({{}})}}}});
+        await k.inbound({{implementation: k.socks5_inbound({{listen: {{address: k.ip('127.0.0.1'), port: 0}}}}), udp_idle_timeout: k.timeout(10000), routing_handler: flow => {{
             calls++;
             return flow.protocol === 'udp' ? k.route_udp(direct) : k.route(direct, k.ip_target(k.ip('{}'), {}));
-        }})}});
+        }}}});
     "#, upstream.ip(), upstream.port())).await
 }
 
 async fn gateway_calls(gateway: &Daemon) -> usize {
-    let resolver = *gateway
-        .policy()
-        .config()
-        .resolve_handlers
-        .iter()
-        .next()
-        .unwrap();
+    let resolver = resolve_handler(gateway);
     let address = gateway
         .policy()
-        .resolve(resolver, "count".into())
+        .resolve(&resolver, "count".into())
         .await
         .unwrap()[0];
     let std::net::IpAddr::V4(address) = address else {
@@ -221,13 +214,13 @@ fn source(
         import {{kotoconn as k}} from '@kotoconn/bindings';
         import {{dns_service}} from '@kotoconn/api';
         let calls = 0;
-        const resolve = k.resolve_handler(name => {{
+        const resolve = name => {{
             if (name === 'stats') return [k.ip(`192.0.2.${{calls}}`)];
             return k.lookup(name);
-        }});
-        const proxy = k.dialer({{carrier: k.host_network({{}}), outbound: {{resolve_handler: resolve, implementation: k.socks5_outbound({{server: k.ip_target(k.ip('{}'), {})}})}}}});
-        const service = dns_service({{dialer: proxy, upstream: {{protocol: '{protocol}', server: {server}}}, {cache} timeout: k.timeout({timeout})}});
-        const policy = k.dns_handler(async request => {{
+        }};
+        const proxy = await k.dialer({{carrier: k.host_network({{}}), outbound: {{resolve_handler: resolve, implementation: k.socks5_outbound({{server: k.ip_target(k.ip('{}'), {})}})}}}});
+        const service = await dns_service({{dialer: proxy, upstream: {{protocol: '{protocol}', server: {server}}}, {cache} timeout: k.timeout({timeout})}});
+        const policy = async request => {{
             calls++;
             if (!request.inbound.equals(listener) || !request.source.address.is_loopback() || request.source.port === 0) throw Error('missing DNS context');
             if (request.query.class !== 1 || !['udp', 'tcp'].includes(request.protocol)) throw Error('missing DNS question');
@@ -235,8 +228,8 @@ fn source(
             if (request.query.name === 'error.example') throw Error('policy error');
             if (request.query.name === 'wrapped.example') return k.respond(await service.query(request));
             return service.handler(request);
-        }});
-        const listener = k.dns_listener({{listen: {{address: k.ip('127.0.0.1'), port: 0}}, protocols: ['udp', 'tcp'], dns_handler: policy}});
+        }};
+        const listener = await k.dns_listener({{listen: {{address: k.ip('127.0.0.1'), port: 0}}, protocols: ['udp', 'tcp'], dns_handler: policy}});
     "#,
         proxy.ip(),
         proxy.port(),
@@ -351,15 +344,9 @@ async fn policy_runs_on_cache_hits_and_tcp_upstream_uses_the_selected_proxy() ->
         "TCP connection should be reused"
     );
 
-    let resolver = *daemon
-        .policy()
-        .config()
-        .resolve_handlers
-        .iter()
-        .next()
-        .unwrap();
+    let resolver = resolve_handler(&daemon);
     assert_eq!(
-        daemon.policy().resolve(resolver, "stats".into()).await?[0].to_string(),
+        daemon.policy().resolve(&resolver, "stats".into()).await?[0].to_string(),
         "192.0.2.6"
     );
     assert_eq!(daemon.shutdown().await?, Shutdown::Drained);
@@ -550,13 +537,13 @@ fn resolving_source(gateway: SocketAddr) -> String {
         r#"
         import {{kotoconn as k}} from '@kotoconn/bindings';
         import {{dns_service}} from '@kotoconn/api';
-        const unused = k.resolve_handler(() => {{ throw Error('IP servers need no resolution'); }});
-        const proxy = k.dialer({{carrier: k.host_network({{}}), outbound: {{resolve_handler: unused, implementation: k.socks5_outbound({{server: k.ip_target(k.ip('{}'), {})}})}}}});
-        const service = dns_service({{dialer: proxy, upstream: {{protocol: 'tcp', server: {upstream}}}}});
-        const resolve = k.resolve_handler(service.resolve);
-        const named = k.dialer({{carrier: k.host_network({{}}), outbound: {{resolve_handler: resolve, implementation: k.socks5_outbound({{server: k.domain('gateway.test', {})}})}}}});
-        const by_name = dns_service({{dialer: named, upstream: {{protocol: 'tcp', server: {upstream}}}, cache: false}});
-        k.dns_listener({{listen: {{address: k.ip('127.0.0.1'), port: 0}}, protocols: ['udp'], dns_handler: k.dns_handler(by_name.handler)}});
+        const unused = () => {{ throw Error('IP servers need no resolution'); }};
+        const proxy = await k.dialer({{carrier: k.host_network({{}}), outbound: {{resolve_handler: unused, implementation: k.socks5_outbound({{server: k.ip_target(k.ip('{}'), {})}})}}}});
+        const service = await dns_service({{dialer: proxy, upstream: {{protocol: 'tcp', server: {upstream}}}}});
+        const resolve = service.resolve;
+        const named = await k.dialer({{carrier: k.host_network({{}}), outbound: {{resolve_handler: resolve, implementation: k.socks5_outbound({{server: k.domain('gateway.test', {})}})}}}});
+        const by_name = await dns_service({{dialer: named, upstream: {{protocol: 'tcp', server: {upstream}}}, cache: false}});
+        await k.dns_listener({{listen: {{address: k.ip('127.0.0.1'), port: 0}}, protocols: ['udp'], dns_handler: by_name.handler}});
     "#,
         gateway.ip(),
         gateway.port(),
@@ -584,12 +571,9 @@ async fn service_resolve_answers_resolve_handlers_and_dialer_server_names() -> R
     let mut upstream = upstream(false).await?;
     let gateway = gateway(upstream.address).await?;
     let daemon = start(resolving_source(listen(&gateway))).await?;
-    // Registration order assigns IDs; `resolve` is the second resolve handler.
-    let resolve = |name: &str| {
-        daemon
-            .policy()
-            .resolve(ResolveHandlerId(NonZeroU64::new(2).unwrap()), name.into())
-    };
+    // `named` is the second dialer.
+    let resolver = dialer_resolver(&daemon, 1);
+    let resolve = |name: &str| daemon.policy().resolve(&resolver, name.into());
     let both: Vec<IpAddr> = vec!["192.0.2.1".parse()?, "2001:db8::1".parse()?];
 
     assert_eq!(resolve("Example").await?, both);
@@ -647,20 +631,15 @@ async fn shutdown_keeps_outbound_connections_for_pending_policy_calls() -> Resul
     let daemon = start(format!(r#"
         import {{kotoconn as k}} from '@kotoconn/bindings';
         import {{dns_service}} from '@kotoconn/api';
-        const unused = k.resolve_handler(() => []);
-        const direct = k.dialer({{carrier: k.host_network({{}}), outbound: {{resolve_handler: unused, implementation: k.direct_outbound({{}})}}}});
-        const service = dns_service({{dialer: direct, upstream: {{protocol: 'tcp', server: {server}}}, timeout: k.timeout(30000)}});
-        k.resolve_handler(service.resolve);
+        const unused = () => [];
+        const direct = await k.dialer({{carrier: k.host_network({{}}), outbound: {{resolve_handler: unused, implementation: k.direct_outbound({{}})}}}});
+        const service = await dns_service({{dialer: direct, upstream: {{protocol: 'tcp', server: {server}}}, timeout: k.timeout(30000)}});
+        await k.dialer({{carrier: k.host_network({{}}), outbound: {{implementation: k.direct_outbound({{}}), resolve_handler: service.resolve}}}});
     "#, server = ip_endpoint(address))).await?;
     let policy = daemon.policy().clone();
-    let pending = tokio::spawn(async move {
-        policy
-            .resolve(
-                ResolveHandlerId(NonZeroU64::new(2).unwrap()),
-                "pending.example".into(),
-            )
-            .await
-    });
+    let resolver = dialer_resolver(&daemon, 1);
+    let pending =
+        tokio::spawn(async move { policy.resolve(&resolver, "pending.example".into()).await });
     let (mut stream, _) = tokio::time::timeout(LIMIT, upstream.accept()).await??;
     // Both questions are now accepted policy work waiting on this TCP connection.
     tokio::time::timeout(LIMIT, read_message(&mut stream)).await??;
@@ -674,4 +653,21 @@ async fn shutdown_keeps_outbound_connections_for_pending_policy_calls() -> Resul
         "pending query was cancelled early: {result:?}"
     );
     Ok(())
+}
+
+fn resolve_handler(daemon: &Daemon) -> ResolveHandler {
+    dialer_resolver(daemon, 0)
+}
+
+/// The resolve handler of the dialer at `index` in creation order.
+fn dialer_resolver(daemon: &Daemon, index: usize) -> ResolveHandler {
+    daemon
+        .resources()
+        .into_iter()
+        .filter_map(|(_, config)| match config {
+            ResourceConfig::Dialer(dialer) => Some(dialer.outbound.resolve_handler),
+            _ => None,
+        })
+        .nth(index)
+        .unwrap()
 }

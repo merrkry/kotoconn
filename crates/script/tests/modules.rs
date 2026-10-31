@@ -1,4 +1,6 @@
-use kotoconn_script::Script;
+#[path = "support/resources.rs"]
+mod resources;
+
 use std::collections::HashMap;
 
 #[tokio::test]
@@ -24,7 +26,7 @@ async fn normalizes_imports_and_evaluates_shared_modules_once() {
         ),
     ]);
 
-    Script::load("main.ts", sources).await.unwrap();
+    resources::start(sources).await.unwrap();
 }
 
 #[tokio::test]
@@ -40,11 +42,7 @@ async fn propagates_module_resolution_syntax_and_execution_errors() {
             "job failed",
         ),
     ] {
-        let result = Script::load(
-            "main.ts",
-            HashMap::from([("main.ts".into(), source.into())]),
-        )
-        .await;
+        let result = resources::start(HashMap::from([("main.ts".into(), source.into())])).await;
         let error = result.err().expect("expected module loading to fail");
 
         assert!(error.to_string().contains(message), "{error}");

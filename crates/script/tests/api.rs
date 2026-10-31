@@ -1,40 +1,45 @@
+#[path = "support/resources.rs"]
+mod resources;
+
 use kotoconn_script::Script;
+use resources::{Ending, load};
 use std::collections::HashMap;
 
-async fn load(source: &str) -> Script {
-    Script::load(
-        "main.ts",
-        HashMap::from([("main.ts".into(), source.into())]),
-    )
-    .await
-    .unwrap()
+async fn evaluate(source: &str) -> Result<Script, kotoconn_script::Error> {
+    resources::start(HashMap::from([("main.ts".to_owned(), source.to_owned())]))
+        .await
+        .map(|(script, _)| script)
 }
 
-// Minimal registrations exercise the public Script entry points, without a proxy configuration.
+// Minimal resources exercise the public Script entry points, without a proxy configuration.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn seals_registration_after_native_await_and_calls_each_handler_family() {
+async fn resources_register_their_handlers_and_each_handler_family_is_callable() {
     use kotoconn_config::{
-        DnsHandlerResult, DnsRequest, Flow, RouteDecision, Target, TransportProtocol,
+        DnsHandlerResult, DnsRequest, Flow, ResourceConfig, RouteDecision, Target,
+        TransportProtocol,
     };
 
-    let script = load(r#"
+    let (script, recorder) = load(r#"
             import { kotoconn as k } from '@kotoconn/bindings';
             const addresses = await k.lookup('127.0.0.1');
-            const resolve = k.resolve_handler(async name => {
-                if (registrations[name]) registrations[name]();
-                return addresses;
-            });
-            const routing = k.routing_handler(flow => {
-                if (flow.protocol !== 'udp' || flow.dest.domain !== 'test.invalid' || flow.dest.port !== 53) {
-                    throw Error('flow was not preserved');
-                }
-                if (!flow.source.address.equals(k.ip('192.0.2.1')) || flow.source.port !== 12345) {
-                    throw Error('source was not preserved');
-                }
-                return k.reject();
+            const dialer = await k.dialer({carrier: k.host_network({}), outbound: {
+                resolve_handler: async name => addresses, implementation: k.direct_outbound({}),
+            }});
+            await k.inbound({
+                implementation: k.http_inbound({listen: {address: k.ip('127.0.0.1'), port: 0}}),
+                udp_idle_timeout: k.timeout(1000),
+                routing_handler: flow => {
+                    if (flow.protocol !== 'udp' || flow.dest.domain !== 'test.invalid' || flow.dest.port !== 53) {
+                        throw Error('flow was not preserved');
+                    }
+                    if (!flow.source.address.equals(k.ip('192.0.2.1')) || flow.source.port !== 12345) {
+                        throw Error('source was not preserved');
+                    }
+                    return k.reject();
+                },
             });
             let dnsCalls = 0;
-            k.dns_handler(request => {
+            await k.dns_listener({listen: {address: k.ip('127.0.0.1'), port: 0}, protocols: ['udp'], dns_handler: request => {
                 if (++dnsCalls === 2) return k.drop();
                 if (dnsCalls === 3) throw Error('dns handler failed');
                 const wire = k.request_bytes(request);
@@ -45,46 +50,31 @@ async fn seals_registration_after_native_await_and_calls_each_handler_family() {
                     throw Error('DNS bytes changed');
                 }
                 return k.respond(response);
-            });
-            const outbound = {resolve_handler: resolve, implementation: k.direct_outbound({})};
-            const inbound = {
-                implementation: k.http_inbound({listen: {address: k.ip('127.0.0.1'), port: 0}}),
-                routing_handler: routing, udp_idle_timeout: k.timeout(1000),
-            };
-            const registrations = {
-                resolve: () => k.resolve_handler(() => []),
-                routing: () => k.routing_handler(() => k.reject()),
-                dns: () => k.dns_handler(() => k.drop()),
-                dialer: () => k.dialer({carrier: k.host_network({}), outbound}),
-                inbound: () => k.inbound(inbound),
-            };
+            }});
         "#).await;
 
-    let config = script.config().await.unwrap();
-    let resolve = *config.resolve_handlers.iter().next().unwrap();
-    let routing = *config.routing_handlers.iter().next().unwrap();
-    let dns = *config.dns_handlers.iter().next().unwrap();
+    let created = recorder.created();
+    let [
+        (_, ResourceConfig::Dialer(dialer)),
+        (inbound, ResourceConfig::Inbound(routing)),
+        (_, ResourceConfig::DnsListener(listener)),
+    ] = created.as_slice()
+    else {
+        panic!("unexpected resources: {created:?}");
+    };
     assert_eq!(
-        script.resolve(resolve, "test").await.unwrap(),
+        script
+            .resolve(&dialer.outbound.resolve_handler, "test")
+            .await
+            .unwrap(),
         vec!["127.0.0.1".parse::<std::net::IpAddr>().unwrap()]
     );
-    for name in ["resolve", "routing", "dns", "dialer", "inbound"] {
-        assert!(
-            script
-                .resolve(resolve, name)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("registration has finished"),
-            "registration remained open for {name}"
-        );
-    }
     assert_eq!(
         script
             .route(
-                routing,
+                &routing.routing_handler,
                 Flow {
-                    inbound: kotoconn_config::InboundId(std::num::NonZeroU64::new(1).unwrap()),
+                    inbound: kotoconn_config::InboundId(inbound.0),
                     source: "192.0.2.1:12345".parse().unwrap(),
                     protocol: TransportProtocol::Udp,
                     sniff: None,
@@ -105,24 +95,86 @@ async fn seals_registration_after_native_await_and_calls_each_handler_family() {
             Default::default(),
         )
     };
-    let response = script.dns(dns, request()).await.unwrap();
+    let dns = &listener.dns_handler;
+    let response = script.dns(dns, request(), None).await.unwrap();
     let DnsHandlerResult::Response(response) = response else {
         panic!("expected a DNS response")
     };
     assert_eq!(response.to_vec().unwrap()[2] & 0x80, 0x80);
 
     assert!(matches!(
-        script.dns(dns, request()).await.unwrap(),
+        script.dns(dns, request(), None).await.unwrap(),
         DnsHandlerResult::Drop
     ));
     assert!(
         script
-            .dns(dns, request())
+            .dns(dns, request(), None)
             .await
             .unwrap_err()
             .to_string()
             .contains("dns handler failed")
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resources_close_drain_and_wait_through_their_references() {
+    use kotoconn_config::ResourceId;
+    use std::{num::NonZeroU64, time::Duration};
+
+    let (script, recorder) = load(r#"
+        import { kotoconn as k } from '@kotoconn/bindings';
+        const host = await k.dialer({carrier: k.host_network({}), outbound: {
+            resolve_handler: () => [], implementation: k.direct_outbound({}),
+        }});
+        const upper = await k.dialer({carrier: host, outbound: {
+            resolve_handler: () => [], implementation: k.socks5_outbound({server: k.domain('proxy.invalid', 1080)}),
+        }});
+        if (!upper.equals(upper) || upper.equals(host)) throw Error('dialer identity');
+        upper.drain({timeout: k.timeout(1500)});
+        upper.drain({timeout: k.timeout(10)});
+        host.close();
+        await upper.wait();
+        let rejected = false;
+        try {
+            await k.dialer({carrier: host, outbound: {resolve_handler: () => [], implementation: k.direct_outbound({})}});
+        } catch (error) {
+            rejected = String(error).includes('referenced resource is closed');
+        }
+        if (!rejected) throw Error('created a dialer on a closed carrier');
+    "#).await;
+
+    let id = |id| ResourceId(NonZeroU64::new(id).unwrap());
+    assert_eq!(recorder.ended(id(1)), Some(Ending::Abort));
+    assert_eq!(
+        recorder.ended(id(2)),
+        Some(Ending::Drain(Duration::from_millis(1500)))
+    );
+    assert_eq!(recorder.created().len(), 2);
+    drop(script);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_waits_for_creations_and_fails_on_unhandled_rejections() {
+    let policy = |floating: &str| {
+        format!(
+            r#"
+            import {{ kotoconn as k }} from '@kotoconn/bindings';
+            const outbound = {{resolve_handler: () => [], implementation: k.direct_outbound({{}})}};
+            const closed = await k.dialer({{carrier: k.host_network({{}}), outbound}});
+            closed.close();
+            // Evaluation ends before this creation settles.
+            k.dialer({{carrier: closed, outbound}}){floating};
+        "#
+        )
+    };
+
+    let error = evaluate(&policy("")).await.err().unwrap().to_string();
+    assert!(
+        error.contains("unhandled promise rejection during startup")
+            && error.contains("referenced resource is closed"),
+        "{error}"
+    );
+    evaluate(&policy(".catch(() => {})")).await.unwrap();
 }
 
 #[tokio::test]
@@ -271,12 +323,12 @@ async fn native_ip_and_target_views_preserve_address_families() {
 #[tokio::test]
 async fn proxy_configuration_preserves_native_targets_and_optional_fields() {
     use kotoconn_config::*;
-    use std::{num::NonZeroU64, time::Duration};
+    use std::time::Duration;
 
-    let script = load(r#"
+    let (_script, recorder) = load(r#"
         import { kotoconn as k } from '@kotoconn/bindings';
         const server = k.domain('proxy.invalid', 8443);
-        const resolve = k.resolve_handler(() => []);
+        const resolve_handler = () => [];
         let previous = k.host_network({mark: 0xffffffff, interface: 'eth0'});
         for (const implementation of [
             k.hysteria2_outbound({server, password: 'secret', server_name: 'server.invalid',
@@ -284,16 +336,15 @@ async fn proxy_configuration_preserves_native_targets_and_optional_fields() {
             k.shadowsocks2022_outbound({server, password: 'secret'}),
             k.socks5_outbound({server}),
         ]) {
-            previous = k.dialer({carrier: previous, outbound: {resolve_handler: resolve, implementation}});
+            previous = await k.dialer({carrier: previous, outbound: {resolve_handler, implementation}});
         }
-        const routing = k.routing_handler(flow => k.route(previous, flow.dest));
-        k.inbound({
+        await k.inbound({
             implementation: k.direct_inbound({listen: {address: k.ip('::1'), port: 10000},
                 target: k.ip_target(k.ip('2001:db8::1'), 443)}),
-            routing_handler: routing, sniff: {timeout: k.timeout(300)}, udp_idle_timeout: k.timeout(1000),
+            routing_handler: flow => k.route(previous, flow.dest),
+            sniff: {timeout: k.timeout(300)}, udp_idle_timeout: k.timeout(1000),
         });
     "#).await;
-    let config = script.config().await.unwrap();
     let server = Target::Domain {
         name: "proxy.invalid".into(),
         port: 8443,
@@ -313,16 +364,15 @@ async fn proxy_configuration_preserves_native_targets_and_optional_fields() {
         OutboundImpl::Socks5(Socks5OutboundConfig { server }),
     ];
 
-    assert_eq!(config.dialers.len(), expected.len());
-    for (index, implementation) in expected.into_iter().enumerate() {
-        let id = DialerId(NonZeroU64::new(index as u64 + 1).unwrap());
-        let dialer = &config.dialers[&id];
+    let created = recorder.created();
+    assert_eq!(created.len(), expected.len() + 1);
+    let mut lower = None;
+    for ((id, config), implementation) in created.iter().zip(expected) {
+        let ResourceConfig::Dialer(dialer) = config else {
+            panic!("expected a dialer: {config:?}");
+        };
         assert_eq!(dialer.outbound.implementation, implementation);
-        assert_eq!(
-            dialer.outbound.resolve_handler,
-            *config.resolve_handlers.iter().next().unwrap()
-        );
-        let carrier = match NonZeroU64::new(index as u64) {
+        let carrier = match lower {
             Some(lower) => CarrierConfig::Dialer(DialerId(lower)),
             None => CarrierConfig::Host(HostNetworkConfig {
                 mark: Some(u32::MAX),
@@ -330,13 +380,12 @@ async fn proxy_configuration_preserves_native_targets_and_optional_fields() {
             }),
         };
         assert_eq!(dialer.carrier, carrier);
+        lower = Some(id.0);
     }
 
-    let inbound = config.inbounds.values().next().unwrap();
-    assert_eq!(
-        inbound.routing_handler,
-        *config.routing_handlers.iter().next().unwrap()
-    );
+    let ResourceConfig::Inbound(inbound) = &created[3].1 else {
+        panic!("expected an inbound");
+    };
     assert_eq!(inbound.udp_idle_timeout, Duration::from_millis(1000));
     assert_eq!(
         inbound.sniff.as_ref().unwrap().timeout,
@@ -393,17 +442,17 @@ async fn numeric_api_arguments_reject_truncation_and_dns_packets_require_header_
 async fn tun_configuration_preserves_native_addresses_and_checks_numeric_ranges() {
     let source = r#"
         import { kotoconn as k } from '@kotoconn/bindings';
-        const routing = k.routing_handler(() => k.reject());
-        k.inbound({implementation: k.tun_inbound({name: 'test0', mtu: 1500, addresses: [
+        await k.inbound({implementation: k.tun_inbound({name: 'test0', mtu: 1500, addresses: [
             {address: k.ip('192.0.2.1'), prefix: 30}, {address: k.ip('fd00::1'), prefix: 126}
-        ]}), routing_handler: routing, udp_idle_timeout: k.timeout(1000)});
+        ]}), routing_handler: () => k.reject(), udp_idle_timeout: k.timeout(1000)});
     "#;
-    let script = load(source).await;
+    let (_script, recorder) = load(source).await;
 
-    let config = script.config().await.unwrap();
-    let kotoconn_config::InboundImpl::Tun(tun) =
-        &config.inbounds.values().next().unwrap().implementation
-    else {
+    let created = recorder.created();
+    let kotoconn_config::ResourceConfig::Inbound(inbound) = &created[0].1 else {
+        panic!("expected an inbound");
+    };
+    let kotoconn_config::InboundImpl::Tun(tun) = &inbound.implementation else {
         panic!("expected a TUN inbound");
     };
     assert_eq!(tun.name, "test0");
@@ -416,75 +465,53 @@ async fn tun_configuration_preserves_native_addresses_and_checks_numeric_ranges(
 
     for value in ["1.5", "65536", "-1", "NaN", "Infinity", "'1500'"] {
         let bad = source.replace("mtu: 1500", &format!("mtu: {value}"));
-        assert!(
-            Script::load("main.ts", HashMap::from([("main.ts".into(), bad)]))
-                .await
-                .is_err()
-        );
+        assert!(evaluate(&bad).await.is_err());
     }
 }
 
 #[tokio::test]
-async fn dns_helpers_register_shared_services_and_validate_cache_options() {
-    let script = load(r#"
+async fn dns_helpers_create_services_and_validate_cache_options() {
+    use kotoconn_config::ResourceConfig;
+
+    let (_script, recorder) = load(r#"
         import { kotoconn as k } from '@kotoconn/bindings';
         import { dns_service } from '@kotoconn/api';
-        const dialer = k.dialer({carrier: k.host_network({}), outbound: {
-            resolve_handler: k.resolve_handler(() => []), implementation: k.direct_outbound({})
+        const dialer = await k.dialer({carrier: k.host_network({}), outbound: {
+            resolve_handler: () => [], implementation: k.direct_outbound({})
         }});
         const options = {dialer, upstream: {protocol: 'tcp', server: {address: k.ip('192.0.2.53'), port: 53}}};
-        const service = dns_service(options);
-        dns_service({...options, cache: false, timeout: k.timeout(1234)});
+        const service = await dns_service(options);
+        const uncached = await dns_service({...options, cache: false, timeout: k.timeout(1234)});
         for (const capacity of [0, -1, 1.5, 4294967296, NaN, Infinity]) {
             let rejected = false;
-            try { dns_service({...options, cache: {capacity}}); } catch (error) {
+            try { await dns_service({...options, cache: {capacity}}); } catch (error) {
                 rejected = String(error).includes('cache capacity');
             }
             if (!rejected) throw Error('accepted invalid capacity');
         }
-        const dns = k.dns_handler(service.handler);
-        const listener = k.dns_listener({listen: {address: k.ip('127.0.0.1'), port: 1053}, protocols: ['udp', 'tcp'], dns_handler: dns});
-        k.inbound({implementation: k.http_inbound({listen: {address: k.ip('127.0.0.1'), port: 0}}), routing_handler: k.routing_handler(() => k.reject()), udp_idle_timeout: k.timeout(1000)});
-        k.resolve_handler(name => {
-            if (name === 'service') dns_service(options);
-            else k.dns_listener({listen: {address: k.ip('127.0.0.1'), port: 0}, protocols: ['udp'], dns_handler: dns});
-            return [];
-        });
+        await k.dns_listener({listen: {address: k.ip('127.0.0.1'), port: 1053}, protocols: ['udp', 'tcp'], dns_handler: service.handler});
+        uncached.drain({timeout: k.timeout(10)});
+        service.close();
     "#).await;
 
-    let config = script.config().await.unwrap();
-    assert_eq!(config.dns_services.len(), 2);
-    let cached = config
-        .dns_services
-        .values()
-        .find(|config| config.cache_capacity > 0)
-        .unwrap();
+    let services: Vec<_> = recorder
+        .created()
+        .into_iter()
+        .filter_map(|(id, config)| match config {
+            ResourceConfig::DnsService(service) => Some((id, service)),
+            _ => None,
+        })
+        .collect();
+    let [(cached_id, cached), (uncached_id, uncached)] = services.as_slice() else {
+        panic!("expected two DNS services: {services:?}");
+    };
     assert_eq!(cached.cache_capacity, 4096);
     assert_eq!(cached.timeout, std::time::Duration::from_secs(5));
-    let uncached = config
-        .dns_services
-        .values()
-        .find(|config| config.cache_capacity == 0)
-        .unwrap();
+    assert_eq!(uncached.cache_capacity, 0);
     assert_eq!(uncached.timeout, std::time::Duration::from_millis(1234));
-    assert_eq!(config.dns_listeners.len(), 1);
-    assert_ne!(
-        config.inbounds.keys().next(),
-        config.dns_listeners.keys().next()
+    assert_eq!(recorder.ended(*cached_id), Some(Ending::Abort));
+    assert_eq!(
+        recorder.ended(*uncached_id),
+        Some(Ending::Drain(std::time::Duration::from_millis(10)))
     );
-    let resolver = *config
-        .resolve_handlers
-        .iter()
-        .max_by_key(|id| id.0)
-        .unwrap();
-    for name in ["service", "listener"] {
-        assert!(
-            script
-                .resolve(resolver, name)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("registration has finished")
-        );
-    }
 }

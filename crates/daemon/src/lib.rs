@@ -2,8 +2,10 @@
 
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use kotoconn_config::*;
+pub use kotoconn_inbounds::InboundAddress;
 use kotoconn_script::{ModuleSource, Script};
-use std::{path::Path, sync::Arc, time::Duration};
+use resources::{Manager, Tier};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 use tokio::{
     runtime::{Handle, RuntimeFlavor},
     sync::{mpsc, oneshot, watch},
@@ -12,8 +14,8 @@ use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use tracing::Instrument;
 
 mod network;
+mod resources;
 mod source;
-pub use kotoconn_inbounds::InboundAddress;
 pub use network::{SessionHandle, SessionId};
 
 // Bound queued calls. Native I/O may call resolve policy again, so pending calls
@@ -49,71 +51,64 @@ pub enum Shutdown {
 type Reply<T> = oneshot::Sender<Result<T, Error>>;
 
 enum Command {
-    Route(RoutingHandlerId, Flow, Reply<RouteDecision>),
-    Resolve(ResolveHandlerId, String, Reply<Vec<IpAddr>>),
+    Route(RoutingHandler, Flow, Reply<RouteDecision>),
+    Resolve(ResolveHandler, String, Reply<Vec<IpAddr>>),
     Dns(
-        DnsHandlerId,
+        DnsHandler,
         Box<DnsRequest>,
         Option<DnsRequestInfo>,
         Reply<DnsHandlerResult>,
     ),
-    InstallDns(Arc<dyn kotoconn_script::DnsServices>, Reply<()>),
 }
 
 /// Cloneable shared reference. Only owned Rust values cross the JS thread boundary.
+/// A call holds its handler reference, so the handler stays registered meanwhile.
 #[derive(Clone)]
 pub struct Policy {
     commands: mpsc::Sender<(tracing::Span, Command)>,
     stopping: CancellationToken,
-    config: Arc<Config>,
 }
 
 impl Policy {
-    pub fn config(&self) -> &Config {
-        &self.config
-    }
-
-    #[tracing::instrument(skip_all, fields(handler_id = id.0.get()), err)]
-    pub async fn route(&self, id: RoutingHandlerId, flow: Flow) -> Result<RouteDecision, Error> {
-        let (reply, result) = oneshot::channel();
-        self.send(Command::Route(id, flow, reply)).await?;
-        result.await.map_err(|_| Error::Closed)?
-    }
-
-    #[tracing::instrument(skip_all, fields(handler_id = id.0.get(), %name), err)]
-    pub async fn resolve(&self, id: ResolveHandlerId, name: String) -> Result<Vec<IpAddr>, Error> {
-        let (reply, result) = oneshot::channel();
-        self.send(Command::Resolve(id, name, reply)).await?;
-        result.await.map_err(|_| Error::Closed)?
-    }
-
-    #[tracing::instrument(skip_all, fields(handler_id = id.0.get()), err)]
-    pub async fn dns(
+    #[tracing::instrument(skip_all, fields(handler_id = handler.id().get()), err)]
+    pub async fn route(
         &self,
-        id: DnsHandlerId,
-        request: DnsRequest,
-    ) -> Result<DnsHandlerResult, Error> {
-        self.dns_with_info(id, request, None).await
-    }
-
-    async fn dns_with_info(
-        &self,
-        id: DnsHandlerId,
-        request: DnsRequest,
-        info: Option<DnsRequestInfo>,
-    ) -> Result<DnsHandlerResult, Error> {
+        handler: &RoutingHandler,
+        flow: Flow,
+    ) -> Result<RouteDecision, Error> {
         let (reply, result) = oneshot::channel();
-        self.send(Command::Dns(id, Box::new(request), info, reply))
+        self.send(Command::Route(handler.clone(), flow, reply))
             .await?;
         result.await.map_err(|_| Error::Closed)?
     }
 
-    async fn install_dns_services(
+    #[tracing::instrument(skip_all, fields(handler_id = handler.id().get(), %name), err)]
+    pub async fn resolve(
         &self,
-        services: Arc<dyn kotoconn_script::DnsServices>,
-    ) -> Result<(), Error> {
+        handler: &ResolveHandler,
+        name: String,
+    ) -> Result<Vec<IpAddr>, Error> {
         let (reply, result) = oneshot::channel();
-        self.send(Command::InstallDns(services, reply)).await?;
+        self.send(Command::Resolve(handler.clone(), name, reply))
+            .await?;
+        result.await.map_err(|_| Error::Closed)?
+    }
+
+    #[tracing::instrument(skip_all, fields(handler_id = handler.id().get()), err)]
+    pub async fn dns(
+        &self,
+        handler: &DnsHandler,
+        request: DnsRequest,
+        info: Option<DnsRequestInfo>,
+    ) -> Result<DnsHandlerResult, Error> {
+        let (reply, result) = oneshot::channel();
+        self.send(Command::Dns(
+            handler.clone(),
+            Box::new(request),
+            info,
+            reply,
+        ))
+        .await?;
         result.await.map_err(|_| Error::Closed)?
     }
 
@@ -126,22 +121,26 @@ impl Policy {
     }
 }
 
-/// Owns the policy worker. Keep this alive while native components use its Policy.
-/// Explicit shutdown drains calls; dropping the owner requests immediate cancellation.
+/// Owns the policy worker and the resources policy creates. Keep this alive while
+/// native components use its Policy. Explicit shutdown drains calls and resources;
+/// dropping the owner requests immediate cancellation.
 pub struct Daemon {
     policy: Policy,
     worker: Worker,
-    network: network::Network,
+    resources: Arc<Manager>,
 }
 
 // Shutdown phases: `shutdown` starts the deadline and runs policy shutdown hooks
 // while admission stays open; the worker then cancels `stopping`, which closes
-// admission and drains the remaining work; `force` cancels whatever is left.
+// admission and drains entry points and policy calls, after which `calls` lets the
+// resources that serve them drain; `force` aborts whatever is left.
 struct Worker {
     shutdown: CancellationToken,
     stopping: CancellationToken,
     force: CancellationToken,
     finished: watch::Receiver<Option<Result<Shutdown, Error>>>,
+    /// Cancelled once every resource has been released after shutdown.
+    released: CancellationToken,
     _deadline: AbortOnDropHandle<()>,
 }
 
@@ -173,9 +172,17 @@ impl Daemon {
         let shutdown = CancellationToken::new();
         let stopping = CancellationToken::new();
         let force = CancellationToken::new();
+        let calls = CancellationToken::new();
+        let released = CancellationToken::new();
         let (commands, receiver) = mpsc::channel(CAPACITY);
         let (ready, started) = oneshot::channel();
         let (finished, completion) = watch::channel(None);
+
+        let policy = Policy {
+            commands,
+            stopping: stopping.clone(),
+        };
+        let resources = Manager::new(policy.clone(), shutdown.clone());
 
         let deadline = tokio::spawn({
             let shutdown = shutdown.clone();
@@ -187,93 +194,101 @@ impl Daemon {
             }
         });
 
+        // Detached, so that dropping the owner still aborts every resource.
+        tokio::spawn(
+            drain(
+                resources.clone(),
+                stopping.clone(),
+                calls.clone(),
+                force.clone(),
+                released.clone(),
+            )
+            .in_current_span(),
+        );
+
         // The guard also stops startup if its caller drops the start future.
         let worker = Worker {
             shutdown: shutdown.clone(),
             stopping: stopping.clone(),
             force: force.clone(),
             finished: completion,
+            released,
             _deadline: AbortOnDropHandle::new(deadline),
         };
 
         // The dedicated worker needs the caller's subscriber as well as its span.
         let span = tracing::Span::current();
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let manager = resources.clone();
         std::thread::Builder::new()
             .name("kotoconn-policy".into())
             .spawn(move || {
                 let _dispatch = tracing::dispatcher::set_default(&dispatch);
                 let _span = span.enter();
+                // Resources that serve policy calls drain once no call can start.
+                let _calls = calls.clone().drop_guard();
+                let tokens = Tokens {
+                    shutdown,
+                    stopping,
+                    force,
+                    calls,
+                };
+
                 let result = runtime.block_on(async {
-                    let interrupt = force.clone();
-
-                    let script = tokio::select! {
-                        biased;
-                        _ = force.cancelled() => return Ok(Shutdown::TimedOut),
-                        result = Script::load_with_interrupt(&entry, sources, move || interrupt.is_cancelled()) => {
-                            result?
-                        }
-                    };
-
-                    let config = Arc::new(script.config().await?);
-                    if ready.send(config).is_err() {
-                        return Ok(Shutdown::Drained);
-                    }
-                    serve(&script, receiver, shutdown, stopping, force).await
+                    let interrupt = tokens.force.clone();
+                    let script =
+                        Script::new(sources, manager, move || interrupt.is_cancelled()).await?;
+                    serve(&script, &entry, ready, receiver, &tokens).await
                 });
                 // The worker drops all JS state before reporting completion.
                 let _ = finished.send(Some(result));
             })
             .map_err(|error| Error::Worker(error.to_string()))?;
 
-        let config = match started.await {
-            Ok(config) => config,
-            Err(_) => return Err(worker.wait().await.err().unwrap_or(Error::Closed)),
-        };
-
-        let policy = Policy {
-            commands,
-            stopping: worker.stopping.clone(),
-            config,
-        };
-        let network = match network::Network::start(
-            policy.clone(),
-            worker.shutdown.clone(),
-            worker.stopping.clone(),
-            worker.force.clone(),
-        )
-        .await
-        {
-            Ok(network) => network,
-            Err(error) => {
-                // Evaluation may already have changed host configuration that its hooks undo.
-                worker.shutdown.cancel();
-                if let Err(hooks) = worker.wait().await {
-                    tracing::warn!(error = %hooks, "policy shutdown after a startup failure");
-                }
-                return Err(error);
-            }
-        };
-
-        Ok(Self {
+        let daemon = Self {
             policy,
             worker,
-            network,
-        })
+            resources,
+        };
+        match started.await {
+            Ok(Ok(())) => Ok(daemon),
+            // A failed startup still runs the shutdown hooks and releases the
+            // resources that evaluation created.
+            Ok(Err(error)) => {
+                if let Err(shutdown) = daemon.wait().await {
+                    tracing::warn!(error = %shutdown, "shutdown after a startup failure");
+                }
+                Err(error)
+            }
+            Err(_) => Err(daemon.worker.wait().await.err().unwrap_or(Error::Closed)),
+        }
     }
 
-    /// Actual bound addresses, including OS-assigned ports.
-    pub fn listen_addresses(&self) -> &std::collections::HashMap<InboundId, std::net::SocketAddr> {
-        &self.network.addresses
+    /// Actual bound socket addresses of open inbounds and DNS listeners, including
+    /// OS-assigned ports.
+    pub fn listen_addresses(&self) -> HashMap<InboundId, std::net::SocketAddr> {
+        self.resources
+            .inbound_addresses()
+            .into_iter()
+            .filter_map(|(id, address)| match address {
+                InboundAddress::Socket(address) => Some((id, address)),
+                InboundAddress::Tun(_) => None,
+            })
+            .collect()
     }
 
     /// Bound socket addresses and TUN interface names, indexed by inbound.
-    pub fn inbound_addresses(&self) -> &std::collections::HashMap<InboundId, InboundAddress> {
-        &self.network.inbound_addresses
+    pub fn inbound_addresses(&self) -> HashMap<InboundId, InboundAddress> {
+        self.resources.inbound_addresses()
+    }
+
+    /// Configurations of the resources that have not been released, by creation order.
+    pub fn resources(&self) -> Vec<(ResourceId, ResourceConfig)> {
+        self.resources.resources()
     }
 
     pub async fn sessions(&self) -> anyhow::Result<Vec<SessionHandle>> {
-        self.network.sessions.list().await
+        self.resources.sessions.list().await
     }
 
     pub fn client_control(
@@ -281,10 +296,7 @@ impl Daemon {
         id: DialerId,
         protocol: TransportProtocol,
     ) -> Option<kotoconn_protocol::Scope> {
-        self.network
-            .clients
-            .get(&id)
-            .map(|client| client.control(protocol))
+        self.resources.client_control(id, protocol)
     }
 
     pub fn policy(&self) -> &Policy {
@@ -305,18 +317,24 @@ impl Daemon {
 
     /// Also reports worker and inbound failures before a shutdown request.
     pub async fn wait(&self) -> Result<Shutdown, Error> {
-        // Network sessions drain while the policy worker finishes its outstanding
-        // handler calls. An inbound failure has already started the shutdown, so
-        // only a failed worker stops the network.
+        // Resources drain while the policy worker finishes its outstanding handler
+        // calls. An inbound failure has already started the shutdown, so only a
+        // failed worker aborts the resources.
         let policy = async {
             let result = self.worker.wait().await;
             if result.is_err() {
-                self.policy.stopping.cancel();
+                self.worker.stopping.cancel();
                 self.worker.force.cancel();
             }
             result
         };
-        let (policy, network) = self.network.wait(policy).await;
+        let (policy, ()) = tokio::join!(policy, self.worker.released.cancelled());
+
+        let network = match self.resources.failure() {
+            Some(error) => Err(Error::Network(error)),
+            None if self.worker.force.is_cancelled() => Ok(Shutdown::TimedOut),
+            None => Ok(Shutdown::Drained),
+        };
 
         let (policy, network) = (policy?, network?);
         Ok(
@@ -349,17 +367,70 @@ impl Drop for Worker {
     }
 }
 
-async fn serve(
-    script: &Script,
-    mut commands: mpsc::Receiver<(tracing::Span, Command)>,
+/// Drains resources in dependency order once admission stops: entry points first,
+/// then, once they are released and no policy call remains, the resources that
+/// served them. The shutdown deadline aborts the rest.
+async fn drain(
+    resources: Arc<Manager>,
+    stopping: CancellationToken,
+    calls: CancellationToken,
+    force: CancellationToken,
+    released: CancellationToken,
+) {
+    let ordered = async {
+        stopping.cancelled().await;
+        tracing::debug!("draining resources");
+        resources.drain_tier(Tier::EntryPoint);
+        tokio::join!(resources.released_tier(Tier::EntryPoint), calls.cancelled());
+        resources.drain_tier(Tier::Service);
+        resources.released_tier(Tier::Service).await;
+    };
+
+    tokio::select! {
+        biased;
+        _ = force.cancelled() => {
+            resources.abort();
+            tokio::join!(
+                resources.released_tier(Tier::EntryPoint),
+                resources.released_tier(Tier::Service),
+            );
+        }
+        _ = ordered => {}
+    }
+    released.cancel();
+}
+
+struct Tokens {
     shutdown: CancellationToken,
     stopping: CancellationToken,
     force: CancellationToken,
+    /// Cancelled once no policy call can start or remains.
+    calls: CancellationToken,
+}
+
+async fn serve(
+    script: &Script,
+    entry: &str,
+    ready: oneshot::Sender<Result<(), Error>>,
+    mut commands: mpsc::Receiver<(tracing::Span, Command)>,
+    tokens: &Tokens,
 ) -> Result<Shutdown, Error> {
+    let Tokens {
+        shutdown,
+        stopping,
+        force,
+        calls: drained,
+    } = tokens;
     let mut calls = FuturesUnordered::new();
     let mut exhausted = false;
     let driver = script.drive();
     tokio::pin!(driver);
+
+    // Handlers can serve calls while the entry module evaluates, for example to
+    // resolve a server name for a connection that evaluation awaits.
+    let evaluation = script.evaluate(entry);
+    tokio::pin!(evaluation);
+    let mut ready = Some(ready);
 
     // Hooks run while calls are still served, so they can rely on policy handlers
     // and decide what to stop before the daemon drains the rest.
@@ -377,7 +448,8 @@ async fn serve(
         // Admission normally stops after the hooks; a daemon failure or drop can stop it while they run.
         let hooks_running = shutdown.is_cancelled() && !hooks_finished;
 
-        if exhausted && calls.is_empty() && !hooks_running {
+        if exhausted && calls.is_empty() && !hooks_running && ready.is_none() {
+            drained.cancel();
             // Include native promises started without awaiting them in the handler.
             return tokio::select! {
                 biased;
@@ -389,6 +461,15 @@ async fn serve(
             biased;
             _ = force.cancelled() => {
                 return Ok(Shutdown::TimedOut);
+            }
+            result = &mut evaluation, if ready.is_some() => {
+                let result = result.map_err(Error::from);
+                if let Err(error) = &result {
+                    tracing::debug!(%error, "policy evaluation failed");
+                    shutdown.cancel();
+                }
+                // SAFETY: this branch runs only while the sender remains.
+                let _ = ready.take().expect("evaluation reports once").send(result);
             }
             result = &mut hooks, if !hooks_finished => {
                 hooks_finished = true;
@@ -415,24 +496,16 @@ async fn dispatch(script: &Script, command: Command) {
     tracing::debug!("dispatching policy call");
 
     match command {
-        Command::Route(id, flow, reply) => {
-            let _ = reply.send(script.route(id, flow).await.map_err(Into::into));
+        Command::Route(handler, flow, reply) => {
+            let _ = reply.send(script.route(&handler, flow).await.map_err(Into::into));
         }
-        Command::Resolve(id, name, reply) => {
-            let _ = reply.send(script.resolve(id, &name).await.map_err(Into::into));
+        Command::Resolve(handler, name, reply) => {
+            let _ = reply.send(script.resolve(&handler, &name).await.map_err(Into::into));
         }
-        Command::Dns(id, request, info, reply) => {
+        Command::Dns(handler, request, info, reply) => {
             let _ = reply.send(
                 script
-                    .dns_with_info(id, *request, info)
-                    .await
-                    .map_err(Into::into),
-            );
-        }
-        Command::InstallDns(services, reply) => {
-            let _ = reply.send(
-                script
-                    .install_dns_services(services)
+                    .dns(&handler, *request, info)
                     .await
                     .map_err(Into::into),
             );

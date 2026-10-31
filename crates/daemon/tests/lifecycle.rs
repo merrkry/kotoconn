@@ -1,4 +1,4 @@
-use kotoconn_config::ResolveHandlerId;
+use kotoconn_config::{ResolveHandler, ResourceConfig};
 use kotoconn_daemon::{Daemon, Error, Policy, Shutdown};
 use kotoconn_script::ModuleSource;
 use std::{collections::HashMap, time::Duration};
@@ -14,7 +14,7 @@ async fn pending_policy_calls_do_not_block_the_policy_that_releases_them() {
         let ready, release;
         const allEntered = new Promise(resolve => ready = resolve);
         const gate = new Promise(resolve => release = resolve);
-        k.resolve_handler(async name => {
+        await k.dialer({carrier: k.host_network({}), outbound: {implementation: k.direct_outbound({}), resolve_handler: async name => {
             if (name === 'release') {
                 await allEntered;
                 release();
@@ -23,20 +23,20 @@ async fn pending_policy_calls_do_not_block_the_policy_that_releases_them() {
             if (++entered === 80) ready();
             await gate;
             return [k.ip('192.0.2.1')];
-        });
+        }}});
     "#,
         TIMEOUT,
     )
     .await;
     let policy = daemon.policy().clone();
-    let id = handler(&policy);
+    let id = handler(&daemon);
     tokio::time::timeout(TIMEOUT, async {
         let mut calls = tokio::task::JoinSet::new();
         for _ in 0..80 {
-            let policy = policy.clone();
-            calls.spawn(async move { policy.resolve(id, "wait".into()).await });
+            let (policy, id) = (policy.clone(), id.clone());
+            calls.spawn(async move { policy.resolve(&id, "wait".into()).await });
         }
-        policy.resolve(id, "release".into()).await.unwrap();
+        policy.resolve(&id, "release".into()).await.unwrap();
         while let Some(result) = calls.join_next().await {
             assert_eq!(result.unwrap().unwrap()[0].to_string(), "192.0.2.1");
         }
@@ -60,8 +60,15 @@ async fn start(source: &str, grace: Duration) -> Daemon {
     .unwrap()
 }
 
-fn handler(policy: &Policy) -> ResolveHandlerId {
-    *policy.config().resolve_handlers.iter().next().unwrap()
+fn handler(daemon: &Daemon) -> ResolveHandler {
+    daemon
+        .resources()
+        .into_iter()
+        .find_map(|(_, config)| match config {
+            ResourceConfig::Dialer(dialer) => Some(dialer.outbound.resolve_handler),
+            _ => None,
+        })
+        .unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -79,10 +86,10 @@ async fn shutdown_drains_accepted_calls_and_closes_existing_handles() {
                 "main.ts".into(),
                 r#"
                 import { kotoconn as k } from '@kotoconn/bindings';
-                k.resolve_handler(async () => {
+                await k.dialer({carrier: k.host_network({}), outbound: {implementation: k.direct_outbound({}), resolve_handler: async () => {
                     await import('./gate.ts');
                     return [k.ip('127.0.0.1')];
-                });
+                }}});
             "#
                 .into(),
             ),
@@ -94,10 +101,10 @@ async fn shutdown_drains_accepted_calls_and_closes_existing_handles() {
         .unwrap();
 
     let policy = daemon.policy().clone();
-    let id = handler(&policy);
+    let id = handler(&daemon);
     let request = tokio::spawn({
-        let policy = policy.clone();
-        async move { policy.resolve(id, "work".into()).await }
+        let (policy, id) = (policy.clone(), id.clone());
+        async move { policy.resolve(&id, "work".into()).await }
     });
     tokio::time::timeout(TIMEOUT, waiting)
         .await
@@ -123,7 +130,7 @@ async fn shutdown_drains_accepted_calls_and_closes_existing_handles() {
     );
     assert_eq!(request.await.unwrap().unwrap().len(), 1);
     assert!(matches!(
-        policy.resolve(id, "work".into()).await,
+        policy.resolve(&id, "work".into()).await,
         Err(Error::Closed)
     ));
     assert_eq!(daemon.shutdown().await.unwrap(), Shutdown::Drained);
@@ -140,7 +147,7 @@ async fn shutdown_hooks_run_before_admission_closes_and_release_pending_sleeps()
         (async () => {{ while (true) await k.sleep(k.timeout(3_600_000)); }})().catch(() => {{}});
         let served;
         const handled = new Promise(resolve => served = resolve);
-        k.resolve_handler(() => {{ served(); return [k.ip('192.0.2.1')]; }});
+        await k.dialer({{carrier: k.host_network({{}}), outbound: {{implementation: k.direct_outbound({{}}), resolve_handler: () => {{ served(); return [k.ip('192.0.2.1')]; }}}}}});
         k.on_shutdown(async () => {{
             await handled;
             await k.exec(['sh', '-c', 'cat > "$1"', 'sh', {path:?}], {{ input: 'cleaned' }});
@@ -151,11 +158,11 @@ async fn shutdown_hooks_run_before_admission_closes_and_release_pending_sleeps()
     // The deadline equals the test timeout, so a sleep that holds the drain reports TimedOut.
     let daemon = start(&source, TIMEOUT).await;
     let policy = daemon.policy().clone();
-    let id = handler(&policy);
+    let id = handler(&daemon);
 
     daemon.stop();
     // The hook waits for this call, so admission is still open after the shutdown request.
-    let addresses = tokio::time::timeout(TIMEOUT, policy.resolve(id, "during hooks".into()))
+    let addresses = tokio::time::timeout(TIMEOUT, policy.resolve(&id, "during hooks".into()))
         .await
         .unwrap()
         .unwrap();
@@ -170,7 +177,7 @@ async fn shutdown_hooks_run_before_admission_closes_and_release_pending_sleeps()
     );
     assert_eq!(std::fs::read_to_string(&cleaned).unwrap(), "cleaned");
     assert!(matches!(
-        policy.resolve(id, "after hooks".into()).await,
+        policy.resolve(&id, "after hooks".into()).await,
         Err(Error::Closed)
     ));
 }
@@ -185,9 +192,9 @@ async fn shutdown_hooks_run_when_an_inbound_fails_to_bind() {
         r#"
         import {{ kotoconn as k }} from '@kotoconn/bindings';
         k.on_shutdown(() => k.exec(['sh', '-c', 'cat > "$1"', 'sh', {path:?}], {{ input: 'cleaned' }}));
-        k.inbound({{
+        await k.inbound({{
             implementation: k.socks5_inbound({{ listen: {{ address: k.ip('127.0.0.1'), port: {port} }} }}),
-            routing_handler: k.routing_handler(() => null),
+            routing_handler: () => null,
             udp_idle_timeout: k.timeout(1000),
         }});
     "#,
@@ -215,14 +222,14 @@ async fn deadline_cancels_unsettled_promises_and_interrupts_running_js() {
         let source = format!(
             r#"
             import {{ kotoconn as k }} from '@kotoconn/bindings';
-            k.resolve_handler(async () => {{ {body} return []; }});
+            await k.dialer({{carrier: k.host_network({{}}), outbound: {{implementation: k.direct_outbound({{}}), resolve_handler: async () => {{ {body} return []; }}}}}});
         "#
         );
         let daemon = start(&source, Duration::from_millis(30)).await;
         let policy = daemon.policy().clone();
-        let id = handler(&policy);
+        let id = handler(&daemon);
 
-        let request = policy.resolve(id, "work".into());
+        let request = policy.resolve(&id, "work".into());
         tokio::pin!(request);
         // Poll once to enqueue the call before shutdown, without a scheduling delay.
         tokio::select! {
