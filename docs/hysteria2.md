@@ -22,9 +22,6 @@ server-name verification remain enabled.
 const implementation = k.hysteria2_outbound({
   server: k.domain("proxy.example", 443),
   password: "replace-with-your-password",
-  server_name: undefined,
-  ca_certificate: undefined,
-  obfs_password: undefined,
 });
 ```
 
@@ -37,7 +34,6 @@ const implementation = k.hysteria2_inbound({
   password: "replace-with-your-password",
   certificate: certificatePem,
   private_key: privateKeyPem,
-  obfs_password: undefined,
 });
 ```
 
