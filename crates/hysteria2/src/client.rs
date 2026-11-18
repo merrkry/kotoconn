@@ -1,5 +1,5 @@
 use crate::{
-    runtime::{CloseConnection, CloseScope, ScopedRuntime},
+    runtime::{CloseConnection, ScopedRuntime},
     socket::{CarrierSocket, Salamander},
     stream, tls, udp, wire,
 };
@@ -8,7 +8,7 @@ use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use kotoconn_config::Hysteria2OutboundConfig;
 use kotoconn_protocol::{
-    self as p, BoxStream, Capabilities, Carrier, Datagram, Endpoint, Scope, Target,
+    self as p, BoxStream, Capabilities, Carrier, CloseScope, Datagram, Endpoint, Scope, Target,
 };
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
@@ -241,7 +241,7 @@ async fn manage(
 }
 
 async fn connect(settings: &Settings, scope: Scope) -> Result<Session> {
-    let close_scope = CloseScope(scope.clone());
+    let close_scope = scope.clone().close_on_drop();
     let server = settings
         .endpoint
         .target(settings.carrier.capabilities())
@@ -292,7 +292,7 @@ async fn connect(settings: &Settings, scope: Scope) -> Result<Session> {
         let connection = connection.clone();
         let owner = scope.clone();
         scope.spawn(async move {
-            let _close = CloseScope(owner);
+            let _close = owner.close_on_drop();
             udp::client(connection, receive).await
         })?;
         Some(registrations)

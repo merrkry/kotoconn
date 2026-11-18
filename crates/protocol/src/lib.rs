@@ -4,6 +4,7 @@ mod chunk;
 mod control;
 mod io;
 mod packet_io;
+pub mod pem;
 pub mod pool;
 pub mod queue;
 mod scoped;
@@ -14,7 +15,7 @@ pub mod stream_buffer;
 pub use activity::Activity;
 use anyhow::{Result, bail};
 pub use chunk::relay;
-pub use control::{Scope, WorkGuard};
+pub use control::{CloseScope, Scope, WorkGuard};
 use futures_util::future::BoxFuture;
 pub use io::{
     BoxStream, ChunkBuffer, Datagram, DatagramWorker, Packet, Stream, copy_bidirectional,

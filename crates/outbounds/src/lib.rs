@@ -185,15 +185,7 @@ impl Carrier for Clients {
 }
 
 fn follow_datagram(scope: Scope, lower: Scope) -> Result<()> {
-    struct Close(Scope);
-
-    impl Drop for Close {
-        fn drop(&mut self) {
-            self.0.close();
-        }
-    }
-
-    let close = Close(lower.clone());
+    let close = lower.clone().close_on_drop();
     let control = scope.clone();
     scope.spawn(async move {
         let close = close;

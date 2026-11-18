@@ -9,7 +9,7 @@ use futures_util::future::BoxFuture;
 use h2::{RecvStream, SendStream};
 use http::{Method, Response, StatusCode};
 use kotoconn_config::NaiveInboundConfig;
-use kotoconn_protocol::{self as p, BoundServer, BoxStream, Scope, ServerContext};
+use kotoconn_protocol::{self as p, BoundServer, BoxStream, ServerContext, pem};
 use std::{
     io,
     net::SocketAddr,
@@ -22,13 +22,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpListener,
 };
-use tokio_rustls::{
-    TlsAcceptor,
-    rustls::{
-        self,
-        pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
-    },
-};
+use tokio_rustls::{TlsAcceptor, rustls};
 use tokio_util::sync::CancellationToken;
 
 type Connection = h2::server::Connection<tokio_rustls::server::TlsStream<BoxStream>, Bytes>;
@@ -74,13 +68,8 @@ pub struct Server {
 
 impl Server {
     pub fn new(options: &NaiveInboundConfig) -> Result<Self> {
-        let certificates = CertificateDer::pem_slice_iter(options.certificate.as_bytes())
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        ensure!(
-            !certificates.is_empty(),
-            "Naive requires a PEM certificate chain"
-        );
-        let key = PrivateKeyDer::from_pem_slice(options.private_key.as_bytes())?;
+        let certificates = pem::certificates(&options.certificate)?;
+        let key = pem::private_key(&options.private_key)?;
 
         let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::aws_lc_rs::default_provider(),
@@ -94,14 +83,6 @@ impl Server {
             tls: TlsAcceptor::from(Arc::new(tls)),
             authorization: authorization(&options.username, &options.password)?,
         })
-    }
-}
-
-struct Close(Scope);
-
-impl Drop for Close {
-    fn drop(&mut self) {
-        self.0.close();
     }
 }
 
@@ -129,7 +110,7 @@ impl p::Server for Server {
                         let stopping = stopping.clone();
 
                         async move {
-                            let _close = Close(scope.clone());
+                            let _close = scope.clone().close_on_drop();
                             let Some(mut connection) = handshake(tls, io, &stopping).await? else {
                                 return Ok(());
                             };
