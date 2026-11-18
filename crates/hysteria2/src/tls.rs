@@ -1,14 +1,12 @@
 use anyhow::{Result, ensure};
 use kotoconn_config::{Hysteria2InboundConfig, Hysteria2OutboundConfig};
+use kotoconn_protocol::pem;
 use quinn::{
     TransportConfig,
     congestion::BbrConfig,
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
 };
-use rustls::{
-    RootCertStore,
-    pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
-};
+use rustls::RootCertStore;
 use std::{sync::Arc, time::Duration};
 
 pub const IO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -34,13 +32,6 @@ pub fn transport() -> Arc<TransportConfig> {
     Arc::new(config)
 }
 
-fn certificates(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
-    let chain = CertificateDer::pem_slice_iter(pem.as_bytes())
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    ensure!(!chain.is_empty(), "empty PEM certificate chain");
-    Ok(chain)
-}
-
 pub fn validate(password: &str, obfs: Option<&str>) -> Result<()> {
     ensure!(!password.is_empty(), "empty Hysteria password");
     http::HeaderValue::from_str(password)?;
@@ -55,8 +46,8 @@ pub fn client(options: &Hysteria2OutboundConfig) -> Result<quinn::ClientConfig> 
     validate(&options.password, options.obfs_password.as_deref())?;
 
     let mut roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    if let Some(pem) = &options.ca_certificate {
-        for certificate in certificates(pem)? {
+    if let Some(certificate) = &options.ca_certificate {
+        for certificate in pem::certificates(certificate)? {
             roots.add(certificate)?;
         }
     }
@@ -83,8 +74,8 @@ pub fn server(options: &Hysteria2InboundConfig) -> Result<quinn::ServerConfig> {
     .with_protocol_versions(&[&rustls::version::TLS13])?
     .with_no_client_auth()
     .with_single_cert(
-        certificates(&options.certificate)?,
-        PrivateKeyDer::from_pem_slice(options.private_key.as_bytes())?,
+        pem::certificates(&options.certificate)?,
+        pem::private_key(&options.private_key)?,
     )?;
     tls.alpn_protocols = vec![b"h3".to_vec()];
 

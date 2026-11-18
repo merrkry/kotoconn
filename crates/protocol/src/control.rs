@@ -11,6 +11,22 @@ pub struct Scope {
     trackers: Arc<Vec<TaskTracker>>,
 }
 
+/// Owns the request to close a scope when dropped.
+#[must_use]
+pub struct CloseScope(Scope);
+
+impl CloseScope {
+    pub fn is_closed(&self) -> bool {
+        self.0.is_closed()
+    }
+}
+
+impl Drop for CloseScope {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 /// Keeps synchronous work included in scope completion until its owner drops it.
 pub struct WorkGuard {
     _tokens: Vec<tokio_util::task::task_tracker::TaskTrackerToken>,
@@ -65,6 +81,10 @@ impl Scope {
     /// Request abort of this scope and its descendants; completion is separate.
     pub fn close(&self) {
         self.token.cancel();
+    }
+
+    pub fn close_on_drop(self) -> CloseScope {
+        CloseScope(self)
     }
 
     pub fn is_closed(&self) -> bool {

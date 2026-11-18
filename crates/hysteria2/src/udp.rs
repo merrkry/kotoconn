@@ -1,9 +1,6 @@
-use crate::{
-    runtime::CloseScope,
-    wire::{self, Fragment, Reassembly},
-};
+use crate::wire::{self, Fragment, Reassembly};
 use anyhow::{Result, ensure};
-use kotoconn_protocol::{Datagram, Packet, Scope, ServerContext, packet_pair, queue};
+use kotoconn_protocol::{CloseScope, Datagram, Packet, Scope, ServerContext, packet_pair, queue};
 use std::{
     collections::{BTreeSet, HashMap},
     sync::{
@@ -119,7 +116,7 @@ pub async fn client(
                 let Some(registration) = registration else {
                     return Ok(());
                 };
-                associations.retain(|_, value| !value.close.0.is_closed());
+                associations.retain(|_, value| !value.close.is_closed());
                 if next > u32::MAX as u64 {
                     let _ = registration.reply.send(Err(anyhow::anyhow!("Hysteria UDP session ID space exhausted")));
                     continue;
@@ -149,7 +146,7 @@ pub async fn client(
 
                 associations.insert(id, Association {
                     tx,
-                    close: CloseScope(scope),
+                    close: scope.close_on_drop(),
                     active: Instant::now(),
                 });
                 let _ = registration.reply.send(Ok(user));
@@ -208,7 +205,7 @@ fn associate(
 
     Ok(Association {
         tx,
-        close: CloseScope(scope),
+        close: scope.close_on_drop(),
         active: Instant::now(),
     })
 }
@@ -254,7 +251,7 @@ pub async fn server(
                     continue;
                 };
 
-                if associations.entries.get(&id).is_some_and(|value| value.close.0.is_closed()) {
+                if associations.entries.get(&id).is_some_and(|value| value.close.is_closed()) {
                     associations.remove(id);
                 }
                 if !associations.entries.contains_key(&id) {
@@ -306,7 +303,7 @@ mod tests {
         (
             Association {
                 tx,
-                close: CloseScope(scope.clone()),
+                close: scope.clone().close_on_drop(),
                 active: Instant::now(),
             },
             scope,

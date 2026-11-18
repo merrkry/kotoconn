@@ -25,14 +25,6 @@ impl Runtime for ScopedRuntime {
     }
 }
 
-pub struct CloseScope(pub Scope);
-
-impl Drop for CloseScope {
-    fn drop(&mut self) {
-        self.0.close();
-    }
-}
-
 pub struct CloseConnection(pub quinn::Connection);
 
 impl Drop for CloseConnection {

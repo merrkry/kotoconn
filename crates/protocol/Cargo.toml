@@ -10,6 +10,7 @@ bytes.workspace = true
 crossbeam-queue = "0.3"
 futures-util.workspace = true
 kotoconn-config.workspace = true
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "sync", "time", "rt"] }
 tokio-util = { workspace = true, features = ["rt"] }
 tracing.workspace = true

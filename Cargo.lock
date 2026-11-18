@@ -1896,6 +1896,7 @@ dependencies = [
  "crossbeam-queue",
  "futures-util",
  "kotoconn-config",
+ "rustls-pki-types",
  "tokio",
  "tokio-util",
  "tracing",

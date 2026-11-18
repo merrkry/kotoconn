@@ -1,6 +1,6 @@
 use crate::{
     http3,
-    runtime::{CloseConnection, CloseScope, ScopedRuntime},
+    runtime::{CloseConnection, ScopedRuntime},
     socket::{NativeSocket, Salamander},
     tls, udp, wire,
 };
@@ -45,7 +45,7 @@ impl p::Server for Server {
             let local_addr = socket.local_addr()?;
             let socket = Salamander::wrap(Arc::new(NativeSocket(socket)), self.obfs.as_deref());
             let endpoint_scope = context.scope.child();
-            let lifetime = Arc::new(CloseScope(endpoint_scope.clone()));
+            let lifetime = Arc::new(endpoint_scope.clone().close_on_drop());
             let endpoint = quinn::Endpoint::new_with_abstract_socket(
                 Default::default(),
                 Some(self.tls.clone()),
@@ -75,7 +75,7 @@ impl p::Server for Server {
                                 let lifetime = lifetime.clone();
 
                                 scope.spawn(async move {
-                                    let _scope = CloseScope(context.scope.clone());
+                                    let _scope = context.scope.clone().close_on_drop();
                                     let _endpoint = endpoint;
                                     let _lifetime = lifetime;
 
@@ -170,7 +170,7 @@ async fn serve(
                 let peer = connection.remote_address();
 
                 scope.spawn(async move {
-                    let _close = CloseScope(connection_scope.clone());
+                    let _close = connection_scope.clone().close_on_drop();
                     let target = tokio::time::timeout(tls::IO_TIMEOUT, async {
                         let target = wire::read_request(&mut stream).await?;
                         wire::response(&mut stream).await?;
