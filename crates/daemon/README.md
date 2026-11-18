@@ -22,6 +22,8 @@ TCP and UDP clients of a dialer expose independent close handles through `client
 
 Shadowsocks uses the single-user AES-128-GCM 2022 method in this version. The example key is public test data, not a deployment credential. HTTP supports CONNECT only; SOCKS5 supports CONNECT and UDP ASSOCIATE without authentication. UDP session routing uses `route_udp` and cannot override the destination. `route_dns` answers a TCP or UDP flow with a DNS handler; see [DNS forwarding](../../docs/dns.md#answering-routed-flows). `lookup` uses system DNS.
 
+HTTP CONNECT, SOCKS5 and Shadowsocks 2022 TCP inbounds close connections that fail to complete the protocol handshake within 15 seconds. Admitted connections follow their normal session lifetimes, including the SOCKS5 UDP association after its TCP success reply.
+
 A dialer's `carrier` is either another dialer or the host network, `k.host_network({ mark, interface })`. The host network requires IP targets and never resolves domains. On Linux, `mark` sets `SO_MARK` and `interface` sets `SO_BINDTODEVICE` on every TCP and UDP socket the dialer opens; on other platforms, creating a dialer with these options fails. Proxy outbounds carry domain targets in their own protocol, and direct inherits its carrier's behavior. A dialer's resolve handler therefore resolves its server name only when its carrier requires IP targets; otherwise the carrier, such as an upstream proxy, receives the name.
 
 Routing handlers receive `flow.inbound`, `flow.source.address` and `flow.source.port`.
