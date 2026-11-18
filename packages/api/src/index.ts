@@ -411,7 +411,7 @@ export async function subscription(options: SubscriptionOptions): Promise<Subscr
 export interface AutoRouteOptions {
   /** The TUN interface name given to `k.tun_inbound`. */
   interface: string;
-  /** The TUN inbound. At shutdown it drains before the routes are removed. */
+  /** The TUN inbound to route traffic through. */
   inbound: Inbound;
   /**
    * Socket mark of traffic that bypasses the TUN. Set the same `mark` on the
@@ -425,21 +425,26 @@ export interface AutoRouteOptions {
   /** Deadline for the TUN to drain before the routes are removed. Defaults to 5000 milliseconds. */
   drain?: Timeout;
   /**
-   * Whether the TUN drains before the routes are removed at shutdown, the default.
-   * Traffic then cannot bypass the proxy while routes are removed, and new
-   * connections fail meanwhile. Otherwise the routes are removed first and the
-   * daemon drains the TUN after the shutdown hooks.
+   * By default, the TUN keeps its routes while it drains to prevent traffic
+   * from bypassing the proxy. New connections through the TUN fail during the
+   * drain. Set to `false` to remove the routes first and allow traffic to bypass
+   * the proxy during the drain.
    */
   drain_first?: boolean;
 }
 
 /**
- * Routes the host's IPv4 and IPv6 traffic through a TUN inbound with Linux policy
- * routing, through the `ip` program. Marked traffic bypasses the TUN, and routes in
- * the main table that are more specific than a default route, such as local networks,
- * stay in use. The preset first removes what an earlier run left in its table and
- * priorities, so a start after a crash repairs them. A shutdown hook removes the
- * rules and the table's routes.
+ * Routes host IPv4 and IPv6 traffic through a TUN inbound. Requires Linux, the
+ * `ip` command, and permission to change routes and policy rules. Traffic with
+ * the configured mark bypasses the TUN. Routes in the main table that are more
+ * specific than a default route, such as local network routes, stay in use.
+ *
+ * Reserve the routing table and all three rule priorities exclusively for this
+ * instance in both IPv4 and IPv6. Startup and graceful shutdown clear every
+ * route in the table and every rule at those priorities, regardless of who
+ * created them. A crash or forced stop can leave entries that affect routing.
+ * Restart with the same table and priorities to clear them, or remove the old
+ * entries manually before switching to different values.
  */
 export async function auto_route(options: AutoRouteOptions): Promise<void> {
   const table = String(options.table ?? 2022);

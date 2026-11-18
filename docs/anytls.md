@@ -1,29 +1,15 @@
 # AnyTLS
 
-The `kotoconn-anytls` adapter implements AnyTLS v2 inbound and outbound TCP, with
+Kotoconn implements AnyTLS v2 inbound and outbound TCP, with
 sing-box UDP-over-TCP v2 for UDP. Outbound UDP uses connected mode, matching
 Kotoconn's destination-specific sessions. Inbound UDP also accepts datagram mode,
 including IPv4, IPv6, domains and empty payloads. Only a TCP carrier is required.
 
-`anytls` supplies frame encoding/decoding, command validation, settings negotiation
-and padding schedule generation. The adapter drives that core with Kotoconn I/O
-and cancellation scopes. TLS uses `rustls` with `ring` through `tokio-rustls`;
-password hashing uses RustCrypto `sha2`, and comparison uses `subtle`. SOCKS address
-encoding and parsing use `fast-socks5`. UoT framing maps its datagram address types
-to that codec. No dependency is forked.
-
-The `anytls` crate's bundled runtime is not used. Kotoconn must own task completion
-and carrier selection, preserve padding updates per configured client, and honor
-AnyTLS FIN's full-close semantics. Its bundled UoT datagram codec also uses SOCKS
-family values rather than UoT's distinct family values. Tests cover the latter
-with independent wire vectors.
-
 A client reuses the TLS session that most recently became idle before connecting
-again. Concurrent requests open separate TLS sessions. Each session assigns
-increasing stream IDs.
+again. Concurrent requests open separate TLS sessions.
 The default idle timeout is 60 seconds; `idle_session_timeout` can override it.
-Sessions never share state across configured clients. Dropping a logical stream
-releases its session; closing the carrier cancels all dependent sessions.
+Sessions never share state across configured clients. Closing the carrier cancels
+all dependent sessions.
 During daemon shutdown, clients release idle sessions and stop pooling connections;
 inbounds close idle sessions and let admitted streams finish.
 
@@ -39,10 +25,9 @@ by [ADR 0006](adr/0006-independent-inbound-admission.md). FIN closes both direct
 TLS/authentication/target setup has a 15-second network deadline, and stalled TLS
 writes have a 30-second deadline. The inbound allows at most 128 logical streams
 per TLS session, with a shared 4 MiB receive budget including message overhead.
-A stream that exhausts receive capacity is closed. The adapter requires v2 peers,
-matching the dependency's minimum supported protocol version, and bounds the wait
-for SYNACK by the handshake deadline. HTTP fallback and TLS fingerprint impersonation
-are not implemented.
+A stream that exhausts receive capacity is closed. The adapter requires v2 peers
+and bounds the wait for SYNACK by the handshake deadline. HTTP fallback and TLS
+fingerprint impersonation are not implemented.
 
 See [the TypeScript outbound example](../packages/api/examples/anytls.ts). An inbound
 uses `k.anytls_inbound({ listen, password, tls: { certificate, private_key } })`.
@@ -61,12 +46,8 @@ To run just the AnyTLS scenarios from the repository root:
 mise exec -- moon run docker:test -- anytls
 ```
 
-The task builds the Go peer with the mise-pinned toolchain and compiles the Rust
-test harness with `interop-tests`. Both run in an isolated container with no
-external network access. The helper binds an ephemeral loopback port and reports
-readiness after binding. Tests generate temporary certificates and terminate child
-processes on exit. Each direction's output is saved in its e2e artifact directory.
+The tests run in an isolated container with no external network access.
+Each direction's output is saved in its e2e artifact directory.
 
 References: [AnyTLS protocol](https://github.com/anytls/anytls-go/blob/main/docs/protocol.md),
-[sing-box UoT](https://sing-box.sagernet.org/configuration/shared/udp-over-tcp/),
-[anytls crate](https://docs.rs/anytls/0.3.17/anytls/).
+[sing-box UoT](https://sing-box.sagernet.org/configuration/shared/udp-over-tcp/).
