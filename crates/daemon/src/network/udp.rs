@@ -2,6 +2,8 @@ use super::*;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
+const SESSION_LIMIT: usize = 1024;
+
 struct Entry {
     tx: kotoconn_protocol::queue::Sender<Packet>,
     scope: Scope,
@@ -74,6 +76,7 @@ async fn route_packets(
     let mut sessions = HashMap::<Target, Entry>::new();
     let (completed, mut completions) = mpsc::unbounded_channel();
     let mut generation = 0u64;
+    let mut session_limit_drops = 0u64;
 
     let mut batch = Vec::with_capacity(32);
     loop {
@@ -104,7 +107,18 @@ async fn route_packets(
                     }
 
                     if !sessions.contains_key(&target) {
-                        if sessions.len() >= 1024 {
+                        if sessions.len() >= SESSION_LIMIT {
+                            session_limit_drops = session_limit_drops.saturating_add(1);
+                            // Report the first drop and keep log volume bounded as drops accumulate.
+                            if session_limit_drops.is_power_of_two() {
+                                tracing::debug!(
+                                    inbound_id = handler.inbound.0.get(),
+                                    %source,
+                                    limit = SESSION_LIMIT,
+                                    dropped_packets = session_limit_drops,
+                                    "UDP association dropped packets at its session limit"
+                                );
+                            }
                             continue;
                         }
 

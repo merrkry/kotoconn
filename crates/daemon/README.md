@@ -67,4 +67,6 @@ CLI lifecycle events have stable `event` fields: `daemon_ready`, `daemon_stoppin
 
 Info events report startup, bound inbound addresses and shutdown. Warnings report connection and datagram failures; errors report policy call failures and fatal CLI failures. Debug events include session start and completion, routing decisions, TCP byte counts and UDP idle expiry. Session spans carry the transport, destination and registry session ID. Inbound and accepted TCP connection spans add the inbound ID and peer/local addresses. Policy calls retain their parent span across the worker queue, and spawned protocol and native tasks inherit the current span.
 
+When a UDP association reaches its destination session limit, debug events report the cumulative dropped-packet count at 1, 2, 4, and successive powers of two.
+
 Logs do not dump configuration objects, credentials, source code or packet payloads. Addresses and domains appear in spans, and error text may include details supplied by user policy. Libraries emit tracing events without installing a subscriber; applications embedding `Daemon` configure their own subscriber.
