@@ -2,10 +2,14 @@ use super::*;
 use fast_socks5::{ReplyError, Socks5Command, server::Socks5ServerProtocol};
 use futures_util::future::BoxFuture;
 use kotoconn_protocol::{self as p, *};
+use std::time::Duration;
 use tokio::{
     io::AsyncReadExt,
     net::{TcpListener, UdpSocket},
+    time::{Instant, timeout_at},
 };
+
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 async fn receive_packet(
     socket: &UdpSocket,
@@ -47,22 +51,32 @@ impl p::Server for Server {
                         let stopping = stopping.clone();
 
                         async move {
-                            let (protocol, command, destination) =
+                            let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+                            let (protocol, command, destination) = timeout_at(deadline, async {
                                 Socks5ServerProtocol::accept_no_auth(stream)
                                     .await?
                                     .read_command()
-                                    .await?;
+                                    .await
+                            })
+                            .await??;
 
                             match command {
                                 Socks5Command::TCPConnect => {
-                                    let stream = protocol.reply_success(local).await?;
+                                    let stream =
+                                        timeout_at(deadline, protocol.reply_success(local)).await??;
 
                                     handler.tcp(peer, from_address(destination), stream, scope).await
                                 }
                                 Socks5Command::UDPAssociate => {
-                                    let socket =
-                                        UdpSocket::bind(SocketAddr::new(local.ip(), 0)).await?;
-                                    let mut control = protocol.reply_success(socket.local_addr()?).await?;
+                                    let socket = timeout_at(
+                                        deadline,
+                                        UdpSocket::bind(SocketAddr::new(local.ip(), 0)),
+                                    )
+                                    .await??;
+                                    let mut control =
+                                        timeout_at(deadline, protocol.reply_success(socket.local_addr()?))
+                                            .await??;
+
                                     let mut buffer = vec![0; 65536];
                                     let mut byte = [0];
 
@@ -117,9 +131,11 @@ impl p::Server for Server {
                                     }
                                 }
                                 _ => {
-                                    protocol
-                                        .reply_error(&ReplyError::CommandNotSupported)
-                                        .await?;
+                                    timeout_at(
+                                        deadline,
+                                        protocol.reply_error(&ReplyError::CommandNotSupported),
+                                    )
+                                    .await??;
                                     Ok(())
                                 }
                             }

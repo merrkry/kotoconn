@@ -272,6 +272,81 @@ async fn http_admission_preserves_pipelined_bytes_and_rejects_bad_headers() -> R
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_handshake_deadlines_leave_admitted_sessions_open() -> Result<()> {
+    tokio::time::timeout(LIMIT, async {
+        let daemon = daemon().await?;
+        let scope = Scope::new();
+        let (tcp, udp) = echoes(&scope).await?;
+        let system: Arc<dyn Carrier> = Arc::new(System::new(scope.clone(), Default::default())?);
+
+        let kinds = ["http", "socks5", "shadowsocks2022"];
+        let mut admitted = Vec::new();
+        let mut association = None;
+        for kind in kinds {
+            let client = Clients::new(
+                outbound(kind, address(&daemon, kind)),
+                system.clone(),
+                Arc::new(SystemResolver),
+            )?;
+            let mut stream = client.tcp(tcp.clone()).await?;
+            let mut greeting = [0; 5];
+            stream.read_exact(&mut greeting).await?;
+            assert_eq!(&greeting, b"hello", "{kind}");
+            admitted.push((kind, stream));
+
+            if kind == "socks5" {
+                association = Some(client.udp(udp.clone()).await?);
+            }
+        }
+        let mut association = association.unwrap();
+
+        // All of these handshakes start after the TCP streams and UDP association above.
+        futures_util::future::try_join_all(kinds.map(|kind| {
+            let endpoint = address(&daemon, kind);
+            async move {
+                let mut stream = TcpStream::connect(socket_addr(&endpoint)?).await?;
+                if kind == "socks5" {
+                    stream.write_all(&[5, 1, 0]).await?;
+                    let mut method = [0; 2];
+                    stream.read_exact(&mut method).await?;
+                    assert_eq!(method, [5, 0]);
+                }
+
+                assert_eq!(stream.read(&mut [0]).await?, 0, "{kind}");
+                Ok::<_, anyhow::Error>(())
+            }
+        }))
+        .await?;
+
+        for (kind, mut stream) in admitted {
+            stream.write_all(b"still open").await?;
+            let mut echoed = [0; 10];
+            stream.read_exact(&mut echoed).await?;
+            assert_eq!(&echoed, b"still open", "{kind}");
+        }
+
+        association
+            .tx
+            .send(Packet {
+                target: udp.clone(),
+                payload: b"first datagram".to_vec().into(),
+            })
+            .await?;
+        let response = association.rx.recv().await.unwrap();
+        assert_eq!(response.target, udp);
+        assert_eq!(&response.payload[..], b"first datagram");
+
+        drop(association);
+        scope.close();
+        scope.wait().await;
+        daemon.shutdown().await?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sessions_split_by_destination_and_close_without_killing_association() -> Result<()> {
     for kind in ["socks5", "hysteria2"] {

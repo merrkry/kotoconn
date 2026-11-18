@@ -2,10 +2,11 @@
 use anyhow::{Result, bail, ensure};
 use futures_util::future::BoxFuture;
 use kotoconn_protocol::{self as p, *};
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
+    time::timeout,
 };
 
 pub struct Client {
@@ -66,6 +67,8 @@ impl p::Client for Client {
 
 pub struct Server;
 
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
 impl p::Server for Server {
     fn bind(
         &self,
@@ -85,27 +88,10 @@ impl p::Server for Server {
                         let handler = handler.clone();
 
                         async move {
-                            let mut stream = BufReader::new(stream);
-                            let request = header(&mut stream).await?;
+                            let (destination, stream) =
+                                timeout(HANDSHAKE_TIMEOUT, handshake(stream)).await??;
 
-                            let destination = match destination(&request) {
-                                Ok(destination) => destination,
-                                Err(error) => {
-                                    stream
-                                        .write_all(
-                                            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                                        )
-                                        .await?;
-                                    return Err(error);
-                                }
-                            };
-
-                            // This acknowledges admission to Kotoconn, independently of routing.
-                            stream
-                                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                                .await?;
-                            stream.flush().await?;
-                            handler.tcp(peer, destination, p::prefix(stream.buffer().to_vec().into(), stream.into_inner()), scope).await
+                            handler.tcp(peer, destination, stream, scope).await
                         }
                     })
                     .await
@@ -113,6 +99,32 @@ impl p::Server for Server {
             })
         })
     }
+}
+
+async fn handshake(stream: BoxStream) -> Result<(Target, BoxStream)> {
+    let mut stream = BufReader::new(stream);
+    let request = header(&mut stream).await?;
+
+    let destination = match destination(&request) {
+        Ok(destination) => destination,
+        Err(error) => {
+            stream
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await?;
+            return Err(error);
+        }
+    };
+
+    // This acknowledges admission to Kotoconn, independently of routing.
+    stream
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .await?;
+    stream.flush().await?;
+
+    let stream = p::prefix(stream.buffer().to_vec().into(), stream.into_inner());
+    Ok((destination, stream))
 }
 
 fn authority(target: &Target) -> Result<String> {

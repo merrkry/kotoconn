@@ -11,8 +11,10 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{
     net::{TcpListener, UdpSocket},
     sync::mpsc,
-    time::Instant,
+    time::{Instant, timeout},
 };
+
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct Server {
     crypto: Arc<Crypto>,
@@ -54,11 +56,12 @@ impl p::Server for Server {
                                     METHOD,
                                     crypto.config.key(),
                                 );
-                                let destination = from_address(stream.handshake().await?);
+                                let destination =
+                                    timeout(HANDSHAKE_TIMEOUT, stream.handshake()).await??;
                                 let stream = super::buffered::Buffered::new(stream);
 
                                 handler
-                                    .tcp(peer, destination, Box::pin(stream), scope)
+                                    .tcp(peer, from_address(destination), Box::pin(stream), scope)
                                     .await
                             }
                         })
