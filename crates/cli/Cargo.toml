@@ -18,3 +18,8 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 
 [dev-dependencies]
 serde_json.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { workspace = true, features = ["process"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "process", "time"] }
