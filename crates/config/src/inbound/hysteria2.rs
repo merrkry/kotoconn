@@ -7,5 +7,6 @@ pub struct Hysteria2InboundConfig {
     pub certificate: String,
     /// PEM private key matching the leaf certificate.
     pub private_key: String,
+    #[ts(optional)]
     pub obfs_password: Option<String>,
 }
