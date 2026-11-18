@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use kotoconn_daemon::{Daemon, Shutdown};
-use std::{io::IsTerminal, path::PathBuf, time::Duration};
+use std::{future::Future, io::IsTerminal, path::PathBuf, time::Duration};
 
 #[derive(Parser)]
 #[command(name = "kotoconn", version, about = "Programmable proxy daemon")]
@@ -26,7 +26,7 @@ enum Command {
         /// TypeScript entry file; relative imports stay inside its directory.
         #[arg(short, long)]
         config: PathBuf,
-        /// Seconds to drain accepted calls before cancelling remaining work.
+        /// Seconds to run shutdown hooks and drain accepted work.
         #[arg(long, default_value_t = 30)]
         shutdown_timeout: u64,
     },
@@ -84,38 +84,30 @@ async fn run(Cli { command, .. }: Cli) -> Result<()> {
             config,
             shutdown_timeout,
         } => {
-            let signal = shutdown_signal();
-            tokio::pin!(signal);
+            let signal = shutdown_signal()?;
+            let daemon = Daemon::launch(config, Duration::from_secs(shutdown_timeout))?;
 
-            let daemon = tokio::select! {
-                biased;
-                result = &mut signal => {
-                    result?;
-                    return Ok(());
-                }
-                result = Daemon::start(config, Duration::from_secs(shutdown_timeout)) => result?,
+            let running = async {
+                daemon.wait_ready().await?;
+                tracing::info!(
+                    event = "daemon_ready",
+                    resources = daemon.resources().len(),
+                    "daemon ready"
+                );
+
+                daemon.wait().await?;
+                bail!("policy worker stopped unexpectedly");
             };
-            tracing::info!(
-                event = "daemon_ready",
-                resources = daemon.resources().len(),
-                "daemon ready"
-            );
-
             tokio::select! {
-                result = &mut signal => {
-                    daemon.stop();
-                    tracing::info!(event = "daemon_stopping", "daemon stopping");
-                    // Even a signal registration error must finish cleanup.
-                    let shutdown = daemon.wait().await?;
-                    result?;
-                    if shutdown == Shutdown::TimedOut {
-                        bail!("shutdown deadline exceeded; remaining policy work was cancelled");
-                    }
-                }
-                result = daemon.wait() => {
-                    result?;
-                    bail!("policy worker stopped unexpectedly");
-                }
+                biased;
+                _ = signal => {}
+                result = running => return result,
+            }
+
+            daemon.stop();
+            tracing::info!(event = "daemon_stopping", "daemon stopping");
+            if daemon.wait().await? == Shutdown::TimedOut {
+                bail!("shutdown deadline exceeded; remaining policy work was cancelled");
             }
             tracing::info!(event = "daemon_stopped", "daemon stopped");
         }
@@ -123,16 +115,25 @@ async fn run(Cli { command, .. }: Cli) -> Result<()> {
     Ok(())
 }
 
-async fn shutdown_signal() -> Result<()> {
+fn shutdown_signal() -> Result<impl Future<Output = ()>> {
     #[cfg(unix)]
     {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result.context("listen for Ctrl-C"),
-            _ = terminate.recv() => Ok(()),
-        }
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut interrupt = signal(SignalKind::interrupt()).context("listen for Ctrl-C")?;
+        let mut terminate = signal(SignalKind::terminate()).context("listen for SIGTERM")?;
+        Ok(async move {
+            tokio::select! {
+                _ = interrupt.recv() => {}
+                _ = terminate.recv() => {}
+            }
+        })
     }
-    #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await.context("listen for Ctrl-C")
+    #[cfg(windows)]
+    {
+        let mut interrupt = tokio::signal::windows::ctrl_c().context("listen for Ctrl-C")?;
+        Ok(async move {
+            interrupt.recv().await;
+        })
+    }
 }

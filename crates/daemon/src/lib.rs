@@ -128,6 +128,7 @@ pub struct Daemon {
     policy: Policy,
     worker: Worker,
     resources: Arc<Manager>,
+    readiness: watch::Receiver<Option<Result<(), Error>>>,
 }
 
 // Shutdown phases: `shutdown` starts the deadline and runs policy shutdown hooks
@@ -148,15 +149,34 @@ impl Daemon {
     /// Read a TypeScript policy file and its imports, then start its worker.
     /// Must run inside a Tokio multi-thread runtime.
     pub async fn start(path: impl AsRef<Path>, shutdown_timeout: Duration) -> Result<Self, Error> {
+        let daemon = Self::launch(path, shutdown_timeout)?;
+        daemon.wait_ready().await?;
+        Ok(daemon)
+    }
+
+    /// Start loading a policy and return its owner before evaluation finishes.
+    /// Use `wait_ready` to observe startup and `stop` to request shutdown during it.
+    /// Must run inside a Tokio multi-thread runtime.
+    pub fn launch(path: impl AsRef<Path>, shutdown_timeout: Duration) -> Result<Self, Error> {
         let path = path.as_ref();
         let (entry, source) = source::Files::open(path)
             .map_err(|error| Error::Config(format!("{}: {error}", path.display())))?;
 
-        Self::start_with_sources(entry, source, shutdown_timeout).await
+        Self::launch_with_sources(entry, source, shutdown_timeout)
     }
 
     /// Embed a source provider without filesystem access. Startup may use top-level await.
     pub async fn start_with_sources(
+        entry: String,
+        sources: impl ModuleSource + Send + 'static,
+        shutdown_timeout: Duration,
+    ) -> Result<Self, Error> {
+        let daemon = Self::launch_with_sources(entry, sources, shutdown_timeout)?;
+        daemon.wait_ready().await?;
+        Ok(daemon)
+    }
+
+    fn launch_with_sources(
         entry: String,
         sources: impl ModuleSource + Send + 'static,
         shutdown_timeout: Duration,
@@ -175,7 +195,7 @@ impl Daemon {
         let calls = CancellationToken::new();
         let released = CancellationToken::new();
         let (commands, receiver) = mpsc::channel(CAPACITY);
-        let (ready, started) = oneshot::channel();
+        let (ready, readiness) = watch::channel(None);
         let (finished, completion) = watch::channel(None);
 
         let policy = Policy {
@@ -245,22 +265,36 @@ impl Daemon {
             })
             .map_err(|error| Error::Worker(error.to_string()))?;
 
-        let daemon = Self {
+        Ok(Self {
             policy,
             worker,
             resources,
-        };
-        match started.await {
-            Ok(Ok(())) => Ok(daemon),
-            // A failed startup still runs the shutdown hooks and releases the
-            // resources that evaluation created.
-            Ok(Err(error)) => {
-                if let Err(shutdown) = daemon.wait().await {
+            readiness,
+        })
+    }
+
+    /// Wait for policy evaluation and the initial resource creations to settle.
+    /// On startup failure, wait for shutdown before returning the error.
+    pub async fn wait_ready(&self) -> Result<(), Error> {
+        let mut readiness = self.readiness.clone();
+        let result = readiness
+            .wait_for(Option::is_some)
+            .await
+            .ok()
+            .and_then(|result| result.clone());
+
+        match result {
+            Some(Ok(())) => Ok(()),
+            Some(Err(error)) => {
+                if let Err(shutdown) = self.wait().await {
                     tracing::warn!(error = %shutdown, "shutdown after a startup failure");
                 }
                 Err(error)
             }
-            Err(_) => Err(daemon.worker.wait().await.err().unwrap_or(Error::Closed)),
+            None => {
+                self.wait().await?;
+                Err(Error::Closed)
+            }
         }
     }
 
@@ -411,7 +445,7 @@ struct Tokens {
 async fn serve(
     script: &Script,
     entry: &str,
-    ready: oneshot::Sender<Result<(), Error>>,
+    ready: watch::Sender<Option<Result<(), Error>>>,
     mut commands: mpsc::Receiver<(tracing::Span, Command)>,
     tokens: &Tokens,
 ) -> Result<Shutdown, Error> {
@@ -428,8 +462,7 @@ async fn serve(
 
     // Handlers can serve calls while the entry module evaluates, for example to
     // resolve a server name for a connection that evaluation awaits.
-    let evaluation = script.evaluate(entry);
-    tokio::pin!(evaluation);
+    let mut evaluation = Box::pin(script.evaluate(entry));
     let mut ready = Some(ready);
 
     // Hooks run while calls are still served, so they can rely on policy handlers
@@ -445,10 +478,9 @@ async fn serve(
     let mut hooks_finished = false;
 
     loop {
-        // Admission normally stops after the hooks; a daemon failure or drop can stop it while they run.
-        let hooks_running = shutdown.is_cancelled() && !hooks_finished;
-
-        if exhausted && calls.is_empty() && !hooks_running && ready.is_none() {
+        if hooks_finished && exhausted && calls.is_empty() {
+            // A pending top-level await can outlive all remaining native work.
+            drop(evaluation);
             drained.cancel();
             // Include native promises started without awaiting them in the handler.
             return tokio::select! {
@@ -469,7 +501,7 @@ async fn serve(
                     shutdown.cancel();
                 }
                 // SAFETY: this branch runs only while the sender remains.
-                let _ = ready.take().expect("evaluation reports once").send(result);
+                let _ = ready.take().expect("evaluation reports once").send(Some(result));
             }
             result = &mut hooks, if !hooks_finished => {
                 hooks_finished = true;
