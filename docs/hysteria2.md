@@ -2,11 +2,9 @@
 
 `hysteria2_inbound` and `hysteria2_outbound` implement authenticated TCP and UDP
 proxying, including UDP fragmentation and optional Salamander obfuscation.
-Quinn supplies QUIC and BBR, rustls with ring supplies TLS 1.3, h3 and h3-quinn
-supply HTTP/3, and RustCrypto supplies BLAKE2b. None of these dependencies is
-forked. The adapter implements Hysteria messages and adapts public I/O traits.
+The proxy runs over QUIC with TLS 1.3.
 
-Both directions use Quinn's BBR controller. The client advertises
+Both directions use BBR congestion control. The client advertises
 `Hysteria-CC-RX: 0`; the server returns `Hysteria-CC-RX: auto`. There is no Brutal
 controller or bandwidth setting. Negotiation follows the
 [Hysteria 2 specification](https://v2.hysteria.network/docs/developers/Protocol/).
