@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use futures_util::future::BoxFuture;
 use kotoconn_config::*;
-use kotoconn_outbounds::{Clients, System, SystemResolver};
+use kotoconn_outbounds::{Outbound, System, SystemResolver};
 use kotoconn_protocol::*;
 use std::{
     net::IpAddr,
@@ -18,7 +18,7 @@ const KEY: &str = "AAECAwQFBgcICQoLDA0ODw==";
 struct Recording {
     scope: Scope,
     capabilities: Capabilities,
-    requests: Mutex<Vec<Target>>,
+    requests: Mutex<Vec<Endpoint>>,
 }
 
 impl Recording {
@@ -33,12 +33,12 @@ impl Recording {
         })
     }
 
-    fn record(&self, target: Target) {
+    fn record(&self, target: Endpoint) {
         self.requests.lock().unwrap().push(target);
     }
 }
 
-impl Carrier for Recording {
+impl Connector for Recording {
     fn capabilities(&self) -> Capabilities {
         self.capabilities
     }
@@ -47,12 +47,12 @@ impl Carrier for Recording {
         &self.scope
     }
 
-    fn tcp_scoped(&self, target: Target, _: Scope) -> BoxFuture<'_, Result<BoxStream>> {
+    fn tcp_scoped(&self, target: Endpoint, _: Scope) -> BoxFuture<'_, Result<BoxStream>> {
         self.record(target);
         Box::pin(async { bail!("recorded") })
     }
 
-    fn udp_scoped(&self, target: Target, _: Scope) -> BoxFuture<'_, Result<Datagram>> {
+    fn udp_scoped(&self, target: Endpoint, _: Scope) -> BoxFuture<'_, Result<Datagram>> {
         self.record(target);
         Box::pin(async { bail!("recorded") })
     }
@@ -69,28 +69,28 @@ impl Resolver for Counting {
 
 /// Connection setup runs in the stream's own task, so a setup failure can
 /// instead end the stream before its first byte.
-async fn failed_tcp(client: &Clients, target: Target) {
+async fn failed_tcp(client: &Outbound, target: Endpoint) {
     if let Ok(mut stream) = client.tcp(target).await {
         assert!(!matches!(stream.read(&mut [0]).await, Ok(1)));
     }
 }
 
-fn server() -> Target {
-    Target::Domain {
+fn server() -> Endpoint {
+    Endpoint::Domain {
         name: "proxy.test".into(),
         port: 443,
     }
 }
 
-fn outbounds() -> [OutboundImpl; 5] {
+fn outbounds() -> [OutboundProtocol; 5] {
     [
-        OutboundImpl::Http(HttpOutboundConfig { server: server() }),
-        OutboundImpl::Socks5(Socks5OutboundConfig { server: server() }),
-        OutboundImpl::Shadowsocks2022(Shadowsocks2022OutboundConfig {
+        OutboundProtocol::Http(HttpOutboundConfig { server: server() }),
+        OutboundProtocol::Socks5(Socks5OutboundConfig { server: server() }),
+        OutboundProtocol::Shadowsocks2022(Shadowsocks2022OutboundConfig {
             server: server(),
             password: KEY.into(),
         }),
-        OutboundImpl::AnyTls(AnyTlsOutboundConfig {
+        OutboundProtocol::AnyTls(AnyTlsOutboundConfig {
             server: server(),
             password: KEY.into(),
             tls: TlsClientConfig {
@@ -99,7 +99,7 @@ fn outbounds() -> [OutboundImpl; 5] {
             },
             idle_session_timeout: None,
         }),
-        OutboundImpl::Hysteria2(Hysteria2OutboundConfig {
+        OutboundProtocol::Hysteria2(Hysteria2OutboundConfig {
             server: server(),
             password: KEY.into(),
             server_name: None,
@@ -116,7 +116,7 @@ async fn server_names_are_resolved_only_for_carriers_that_require_ip_targets() {
             let name = format!("{outbound:?}");
             let carrier = Recording::new(domain_targets);
             let resolver = Arc::new(Counting(AtomicUsize::new(0)));
-            let client = Clients::new(outbound, carrier.clone(), resolver.clone()).unwrap();
+            let client = Outbound::new(outbound, carrier.clone(), resolver.clone()).unwrap();
             assert!(client.capabilities().domain_targets, "{name}");
 
             let destination = target("198.51.100.1:80".parse().unwrap());
@@ -139,13 +139,13 @@ async fn server_names_are_resolved_only_for_carriers_that_require_ip_targets() {
 
 #[tokio::test]
 async fn domain_targets_pass_through_direct_only_when_its_carrier_accepts_them() {
-    let destination = Target::Domain {
+    let destination = Endpoint::Domain {
         name: "destination.test".into(),
         port: 80,
     };
-    let direct = || OutboundImpl::Direct(DirectOutboundConfig {});
+    let direct = || OutboundProtocol::Direct(DirectOutboundConfig {});
 
-    let host = Clients::new(
+    let host = Outbound::new(
         direct(),
         Arc::new(System::new(Scope::new(), Default::default()).unwrap()),
         Arc::new(SystemResolver),
@@ -164,15 +164,15 @@ async fn domain_targets_pass_through_direct_only_when_its_carrier_accepts_them()
     }
 
     let carrier = Recording::new(false);
-    let socks = Clients::new(
-        OutboundImpl::Socks5(Socks5OutboundConfig {
+    let socks = Outbound::new(
+        OutboundProtocol::Socks5(Socks5OutboundConfig {
             server: target("192.0.2.1:1080".parse().unwrap()),
         }),
         carrier.clone(),
         Arc::new(SystemResolver),
     )
     .unwrap();
-    let proxied = Clients::new(direct(), Arc::new(socks), Arc::new(SystemResolver)).unwrap();
+    let proxied = Outbound::new(direct(), Arc::new(socks), Arc::new(SystemResolver)).unwrap();
     assert!(proxied.capabilities().domain_targets);
     failed_tcp(&proxied, destination).await;
     assert_eq!(
@@ -218,13 +218,13 @@ async fn host_network_options_apply_to_every_socket_kind() {
     }
 }
 
-// A carrier can be another open dialer, so rejected options must leave no work on it.
+// A carrier can be another open outbound, so rejected options must leave no work on it.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn rejected_options_leave_no_work_on_the_carrier() {
     let scope = Scope::new();
-    let result = Clients::new(
-        OutboundImpl::Naive(NaiveOutboundConfig {
+    let result = Outbound::new(
+        OutboundProtocol::Naive(NaiveOutboundConfig {
             server: target("127.0.0.1:443".parse().unwrap()),
             username: String::new(),
             password: "password".into(),

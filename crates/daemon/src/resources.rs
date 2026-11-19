@@ -8,8 +8,8 @@ use anyhow::{Context, Result, bail, ensure};
 use futures_util::{FutureExt, future::BoxFuture};
 use kotoconn_config::*;
 use kotoconn_inbounds::InboundAddress;
-use kotoconn_outbounds::{Clients, System};
-use kotoconn_protocol::{Carrier, Scope, ServerContext};
+use kotoconn_outbounds::{Outbound, System};
+use kotoconn_protocol::{Connector, Scope, ServerContext};
 use std::{
     any::Any,
     collections::HashMap,
@@ -61,7 +61,7 @@ struct Entry {
     /// find the entry until that finishes.
     live: Option<Live>,
     lifetime: Arc<Lifetime>,
-    /// The resource this one was created on, such as a dialer's carrier.
+    /// The resource this one was created on, such as an outbound's carrier.
     uses: Option<ResourceId>,
     /// Open resources created on this one; it cannot close while any remain.
     users: usize,
@@ -74,7 +74,7 @@ struct Live {
 
 enum Native {
     Inbound(InboundAddress),
-    Dialer(Arc<Clients>),
+    Outbound(Arc<Outbound>),
     DnsService(Arc<DnsService>),
 }
 
@@ -174,26 +174,26 @@ impl Manager {
         self.root.close();
     }
 
-    /// An open dialer for new work.
-    pub fn dialer(&self, id: DialerId) -> Result<Arc<Clients>> {
-        self.open_dialer(id).map(|(clients, _)| clients)
+    /// An open outbound for new work.
+    pub fn outbound(&self, id: OutboundId) -> Result<Arc<Outbound>> {
+        self.open_outbound(id).map(|(outbound, _)| outbound)
     }
 
-    fn open_dialer(&self, id: DialerId) -> Result<(Arc<Clients>, Arc<Lifetime>)> {
+    fn open_outbound(&self, id: OutboundId) -> Result<(Arc<Outbound>, Arc<Lifetime>)> {
         let registry = self.registry();
         let entry = registry.entries.get(&id.into());
         match entry.and_then(|entry| Some((&entry.live.as_ref()?.native, &entry.lifetime))) {
-            Some((Native::Dialer(clients), lifetime)) if lifetime.is_open() => {
-                Ok((clients.clone(), lifetime.clone()))
+            Some((Native::Outbound(outbound), lifetime)) if lifetime.is_open() => {
+                Ok((outbound.clone(), lifetime.clone()))
             }
-            Some((Native::Dialer(_), _)) | None => bail!("dialer is closed"),
-            Some(_) => bail!("resource is not a dialer"),
+            Some((Native::Outbound(_), _)) | None => bail!("outbound is closed"),
+            Some(_) => bail!("resource is not an outbound"),
         }
     }
 
-    pub fn client_control(&self, id: DialerId, protocol: TransportProtocol) -> Option<Scope> {
+    pub fn outbound_control(&self, id: OutboundId, protocol: TransportProtocol) -> Option<Scope> {
         match self.registry().native(id.into())? {
-            (Native::Dialer(clients), _) => Some(clients.control(protocol)),
+            (Native::Outbound(outbound), _) => Some(outbound.control(protocol)),
             _ => None,
         }
     }
@@ -238,7 +238,7 @@ impl Manager {
         };
         let built = match &config {
             ResourceConfig::Inbound(config) => self.inbound(InboundId(id.0), config).await?,
-            ResourceConfig::Dialer(config) => self.build_dialer(config, &mut reservation)?,
+            ResourceConfig::Outbound(config) => self.build_outbound(config, &mut reservation)?,
             ResourceConfig::DnsService(config) => self.dns_service(config, &mut reservation)?,
             ResourceConfig::DnsListener(config) => {
                 self.dns_listener(InboundId(id.0), config).await?
@@ -328,7 +328,7 @@ impl Manager {
             inbound: id,
             policy: self.policy.clone(),
             manager: self.this.clone(),
-            routing: config.routing_handler.clone(),
+            routing: config.route.clone(),
             sessions: self.sessions.clone(),
             idle: config.udp_idle_timeout,
             sniff: config.sniff.clone(),
@@ -362,7 +362,7 @@ impl Manager {
         let lifetime = Lifetime::new(self.root.child());
         let handler = Arc::new(network::dns::Handler {
             policy: self.policy.clone(),
-            handler: config.dns_handler.clone(),
+            handler: config.answer.clone(),
         });
 
         let bound = kotoconn_dns::bind(
@@ -386,22 +386,22 @@ impl Manager {
         })
     }
 
-    fn build_dialer(
+    fn build_outbound(
         &self,
-        config: &DialerConfig,
+        config: &OutboundConfig,
         reservation: &mut Reservation<'_>,
     ) -> Result<Built> {
-        // Each host network dialer has its own carrier for its socket options.
-        let (carrier, scope): (Arc<dyn Carrier>, _) = match &config.carrier {
-            CarrierConfig::Dialer(carrier) => {
-                let clients =
+        // Each host network outbound has its own carrier for its socket options.
+        let (carrier, scope): (Arc<dyn Connector>, _) = match &config.via {
+            OutboundVia::Outbound(carrier) => {
+                let outbound =
                     self.reserve(reservation, (*carrier).into(), |native| match native {
-                        Native::Dialer(clients) => Some(clients.clone()),
+                        Native::Outbound(outbound) => Some(outbound.clone()),
                         _ => None,
                     })?;
-                (clients, None)
+                (outbound, None)
             }
-            CarrierConfig::Host(options) => {
+            OutboundVia::Host(options) => {
                 let scope = self.root.child();
                 (
                     Arc::new(System::new(scope.clone(), options.clone())?),
@@ -412,11 +412,11 @@ impl Manager {
 
         let resolver = Arc::new(PolicyResolver {
             policy: self.policy.clone(),
-            handler: config.outbound.resolve_handler.clone(),
+            handler: config.resolve_server.clone(),
         });
-        let clients = Clients::new(config.outbound.implementation.clone(), carrier, resolver);
-        let clients = match clients {
-            Ok(clients) => Arc::new(clients),
+        let outbound = Outbound::new(config.protocol.clone(), carrier, resolver);
+        let outbound = match outbound {
+            Ok(outbound) => Arc::new(outbound),
             Err(error) => {
                 if let Some(scope) = scope {
                     scope.close();
@@ -425,11 +425,11 @@ impl Manager {
             }
         };
 
-        // A host network dialer also owns its carrier's sockets.
-        let lifetime = Lifetime::new(scope.unwrap_or_else(|| clients.scope().clone()));
-        let (idle, drain) = (clients.clone(), clients.clone());
+        // A host network outbound also owns its carrier's sockets.
+        let lifetime = Lifetime::new(scope.unwrap_or_else(|| outbound.scope().clone()));
+        let (idle, drain) = (outbound.clone(), outbound.clone());
         Ok(Built {
-            native: Native::Dialer(clients),
+            native: Native::Outbound(outbound),
             lifetime,
             uses: reservation.id,
             idle: Box::pin(async move { idle.connections_closed().await }),
@@ -443,13 +443,14 @@ impl Manager {
         config: &DnsServiceConfig,
         reservation: &mut Reservation<'_>,
     ) -> Result<Built> {
-        let clients = self.reserve(reservation, config.dialer.into(), |native| match native {
-            Native::Dialer(clients) => Some(clients.clone()),
-            _ => None,
-        })?;
+        let outbound =
+            self.reserve(reservation, config.outbound.into(), |native| match native {
+                Native::Outbound(outbound) => Some(outbound.clone()),
+                _ => None,
+            })?;
 
         let lifetime = Lifetime::new(self.root.child());
-        let service = kotoconn_dns::Service::new(config.clone(), clients, lifetime.scope.clone());
+        let service = kotoconn_dns::Service::new(config.clone(), outbound, lifetime.scope.clone());
         let service = match service {
             Ok(service) => Arc::new(DnsService {
                 service,
@@ -483,14 +484,14 @@ impl Manager {
         service.queries.run(service.service.query(request)).await
     }
 
-    /// Connects through an open dialer. Closing or draining the dialer ends the probe.
-    async fn probe(&self, id: DialerId, probe: Probe) -> Result<ProbeResult> {
-        let (clients, lifetime) = self.open_dialer(id)?;
+    /// Connects through an open outbound. Closing or draining the outbound ends the probe.
+    async fn probe(&self, id: OutboundId, probe: Probe) -> Result<ProbeResult> {
+        let (outbound, lifetime) = self.open_outbound(id)?;
 
         ensure!(probe.length > 0, "a probe reads at least one response byte");
         let started = Instant::now();
         let exchange = async {
-            let mut stream = clients.tcp_scoped(probe.target, Scope::new()).await?;
+            let mut stream = outbound.tcp_scoped(probe.target, Scope::new()).await?;
             if !probe.request.is_empty() {
                 stream.write_all(&probe.request).await?;
             }
@@ -512,7 +513,7 @@ impl Manager {
 
         tokio::select! {
             biased;
-            _ = lifetime.admission.cancelled() => bail!("dialer is closed"),
+            _ = lifetime.admission.cancelled() => bail!("outbound is closed"),
             result = tokio::time::timeout(probe.timeout, exchange) => {
                 result.context("probe timed out")?
             }
@@ -703,7 +704,7 @@ impl Native {
     fn tier(&self) -> Tier {
         match self {
             Native::Inbound(_) => Tier::EntryPoint,
-            Native::Dialer(_) | Native::DnsService(_) => Tier::Service,
+            Native::Outbound(_) | Native::DnsService(_) => Tier::Service,
         }
     }
 }
@@ -752,13 +753,13 @@ impl kotoconn_script::Resources for Manager {
 
     fn probe(
         &self,
-        dialer: DialerId,
+        outbound: OutboundId,
         probe: Probe,
     ) -> kotoconn_script::NativeFuture<std::result::Result<ProbeResult, String>> {
         // SAFETY: the policy runtime holds this manager through an Arc.
         let this = self.this.upgrade().expect("manager is shared");
         Box::pin(async move {
-            this.probe(dialer, probe)
+            this.probe(outbound, probe)
                 .await
                 .map_err(|error| format!("{error:#}"))
         })
@@ -825,12 +826,10 @@ mod tests {
             release: released,
         }));
         let id = manager
-            .create(ResourceConfig::Dialer(DialerConfig {
-                carrier: CarrierConfig::Host(Default::default()),
-                outbound: OutboundConfig {
-                    implementation: OutboundImpl::Direct(DirectOutboundConfig {}),
-                    resolve_handler: ResolveHandler::new(std::num::NonZeroU64::MIN, registration),
-                },
+            .create(ResourceConfig::Outbound(OutboundConfig {
+                via: OutboundVia::Host(Default::default()),
+                protocol: OutboundProtocol::Direct(DirectOutboundConfig {}),
+                resolve_server: ResolvePolicy::new(std::num::NonZeroU64::MIN, registration),
             }))
             .await
             .unwrap();
@@ -858,7 +857,7 @@ mod tests {
             implementation: InboundImpl::Socks5(Socks5InboundConfig {
                 listen: "127.0.0.1:0".parse().unwrap(),
             }),
-            routing_handler: RoutingHandler::new(std::num::NonZeroU64::MIN, Arc::new(())),
+            route: RoutePolicy::new(std::num::NonZeroU64::MIN, Arc::new(())),
             udp_idle_timeout: Duration::from_secs(1),
             sniff: None,
         });

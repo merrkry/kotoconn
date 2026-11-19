@@ -48,11 +48,11 @@ impl PacketSend for Sender {
 
 struct Echo;
 
-impl p::Handler for Echo {
+impl p::InboundHandler for Echo {
     fn tcp(
         &self,
         _: std::net::SocketAddr,
-        _: p::Target,
+        _: p::Endpoint,
         _: p::BoxStream,
         _: Scope,
     ) -> BoxFuture<'_, Result<()>> {
@@ -80,11 +80,11 @@ pub(super) fn context() -> ServerContext {
 
 struct TcpAcceptor(mpsc::UnboundedSender<(std::net::SocketAddr, p::BoxStream)>);
 
-impl p::Handler for TcpAcceptor {
+impl p::InboundHandler for TcpAcceptor {
     fn tcp(
         &self,
         source: std::net::SocketAddr,
-        _: p::Target,
+        _: p::Endpoint,
         stream: p::BoxStream,
         _: Scope,
     ) -> BoxFuture<'_, Result<()>> {
@@ -366,11 +366,11 @@ async fn aborting_a_dedicated_endpoint_releases_its_queue_after_open() {
 
 struct SelectiveReader(Arc<Notify>);
 
-impl p::Handler for SelectiveReader {
+impl p::InboundHandler for SelectiveReader {
     fn tcp(
         &self,
         _: std::net::SocketAddr,
-        _: p::Target,
+        _: p::Endpoint,
         _: p::BoxStream,
         _: Scope,
     ) -> BoxFuture<'_, Result<()>> {
@@ -495,11 +495,11 @@ async fn forced_shutdown_interrupts_a_writer_after_receive_workers_have_drained(
 
 struct ObservedSessions(mpsc::UnboundedSender<(std::net::SocketAddr, Scope)>);
 
-impl p::Handler for ObservedSessions {
+impl p::InboundHandler for ObservedSessions {
     fn tcp(
         &self,
         _: std::net::SocketAddr,
-        _: p::Target,
+        _: p::Endpoint,
         _: p::BoxStream,
         _: Scope,
     ) -> BoxFuture<'_, Result<()>> {

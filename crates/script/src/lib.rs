@@ -36,8 +36,12 @@ pub trait Resources: Send + Sync + 'static {
     /// Completes once the resource has closed and released its native state.
     fn released(&self, id: ResourceId) -> NativeFuture<()>;
 
-    /// Ends early when the dialer closes or drains.
-    fn probe(&self, dialer: DialerId, probe: Probe) -> NativeFuture<Result<ProbeResult, String>>;
+    /// Ends early when the outbound closes or drains.
+    fn probe(
+        &self,
+        outbound: OutboundId,
+        probe: Probe,
+    ) -> NativeFuture<Result<ProbeResult, String>>;
 
     fn dns_query(
         &self,
@@ -145,41 +149,37 @@ impl Script {
 
     pub async fn route(
         &self,
-        handler: &RoutingHandler,
-        flow: Flow,
+        handler: &RoutePolicy,
+        flow: SessionInfo,
     ) -> Result<RouteDecision, Error> {
         let protocol = flow.protocol;
 
         let decision = self
             .with(async |ctx| {
                 let function = loader::host(&ctx)?.borrow().handler(handler.id())?;
-                Ok(host::RoutingHandler::new(function)
-                    .call(data::Flow::from(flow))
+                Ok(host::RoutePolicy::new(function)
+                    .call(data::SessionInfo::from(flow))
                     .await?
                     .value)
             })
             .await?;
 
         match (&decision, protocol) {
-            (RouteDecision::Route { .. }, TransportProtocol::Udp) => Err(Error(
+            (RouteDecision::ForwardTcp { .. }, TransportProtocol::Udp) => Err(Error(
                 "UDP routing must use route_udp; target override is not supported".into(),
             )),
-            (RouteDecision::Udp { .. }, TransportProtocol::Tcp) => {
+            (RouteDecision::ForwardUdp { .. }, TransportProtocol::Tcp) => {
                 Err(Error("TCP routing must use route".into()))
             }
             _ => Ok(decision),
         }
     }
 
-    pub async fn resolve(
-        &self,
-        handler: &ResolveHandler,
-        name: &str,
-    ) -> Result<Vec<IpAddr>, Error> {
+    pub async fn resolve(&self, handler: &ResolvePolicy, name: &str) -> Result<Vec<IpAddr>, Error> {
         self.with(async |ctx| {
             let function = loader::host(&ctx)?.borrow().handler(handler.id())?;
 
-            Ok(host::ResolveHandler::new(function)
+            Ok(host::ResolvePolicy::new(function)
                 .call(name.to_owned())
                 .await?
                 .into_iter()
@@ -191,14 +191,14 @@ impl Script {
 
     pub async fn dns(
         &self,
-        handler: &DnsHandler,
+        handler: &DnsPolicy,
         request: DnsRequest,
         info: Option<DnsRequestInfo>,
     ) -> Result<DnsHandlerResult, Error> {
         self.with(async |ctx| {
             let function = loader::host(&ctx)?.borrow().handler(handler.id())?;
 
-            Ok(host::DnsHandler::new(function)
+            Ok(host::DnsPolicy::new(function)
                 .call(dns::Request {
                     value: request,
                     info,

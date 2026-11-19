@@ -8,13 +8,17 @@ use shadowsocks_service::net::packet_window::PacketWindowFilter;
 use std::{collections::HashMap, sync::Arc};
 
 pub struct Client {
-    endpoint: Endpoint,
-    carrier: Arc<dyn Carrier>,
+    endpoint: ServerEndpoint,
+    carrier: Arc<dyn Connector>,
     crypto: Arc<Crypto>,
 }
 
 impl Client {
-    pub fn new(endpoint: Endpoint, carrier: Arc<dyn Carrier>, password: &str) -> Result<Self> {
+    pub fn new(
+        endpoint: ServerEndpoint,
+        carrier: Arc<dyn Connector>,
+        password: &str,
+    ) -> Result<Self> {
         Ok(Self {
             endpoint,
             carrier,
@@ -23,7 +27,7 @@ impl Client {
     }
 }
 
-impl p::Client for Client {
+impl p::OutboundAdapter for Client {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             domain_targets: true,
@@ -31,7 +35,7 @@ impl p::Client for Client {
         }
     }
 
-    fn tcp(&self, target: Target, scope: Scope) -> BoxFuture<'_, Result<BoxStream>> {
+    fn tcp(&self, target: Endpoint, scope: Scope) -> BoxFuture<'_, Result<BoxStream>> {
         Box::pin(async move {
             let carrier = self.carrier.capabilities();
             let stream = self
@@ -42,7 +46,7 @@ impl p::Client for Client {
         })
     }
 
-    fn udp(&self, _: Target, scope: Scope) -> BoxFuture<'_, Result<Datagram>> {
+    fn udp(&self, _: Endpoint, scope: Scope) -> BoxFuture<'_, Result<Datagram>> {
         Box::pin(async move {
             let endpoint = self.endpoint.target(self.carrier.capabilities()).await?;
             let mut transport = self

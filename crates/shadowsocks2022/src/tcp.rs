@@ -3,7 +3,7 @@
 use super::{Crypto, METHOD, address, buffered::Buffered};
 use anyhow::Result;
 use bytes::{BufMut, BytesMut};
-use kotoconn_protocol::{BoxStream, Target};
+use kotoconn_protocol::{BoxStream, Endpoint};
 use rand::RngCore;
 use shadowsocks::{
     context::SharedContext,
@@ -18,7 +18,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 pub(super) async fn connect(
     stream: BoxStream,
-    target: Target,
+    target: Endpoint,
     crypto: &Crypto,
 ) -> Result<BoxStream> {
     let mut stream = Encrypted {

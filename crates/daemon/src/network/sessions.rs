@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use kotoconn_protocol::{Scope, Target, TransportProtocol};
+use kotoconn_protocol::{Endpoint, Scope, TransportProtocol};
 use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot};
 
@@ -9,7 +9,7 @@ pub struct SessionId(pub u64);
 #[derive(Clone, Debug)]
 pub struct SessionHandle {
     pub id: SessionId,
-    pub destination: Target,
+    pub destination: Endpoint,
     pub protocol: TransportProtocol,
     control: Scope,
 }
@@ -26,7 +26,7 @@ impl SessionHandle {
 
 enum Command {
     Register(
-        Target,
+        Endpoint,
         TransportProtocol,
         Scope,
         mpsc::UnboundedSender<Command>,
@@ -88,7 +88,7 @@ impl Sessions {
 
     pub(crate) async fn register(
         &self,
-        destination: Target,
+        destination: Endpoint,
         protocol: TransportProtocol,
         scope: Scope,
     ) -> Result<Registration> {

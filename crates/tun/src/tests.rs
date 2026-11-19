@@ -1,5 +1,5 @@
 use super::*;
-use packet::{Decoder, Flow, Packet};
+use packet::{Decoder, FlowKey, Packet};
 use smoltcp::{phy::ChecksumCapabilities, wire::*};
 use std::{io, time::Duration};
 use tokio::{
@@ -8,8 +8,8 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-pub(super) fn flow(ipv6: bool) -> Flow {
-    Flow {
+pub(super) fn flow(ipv6: bool) -> FlowKey {
+    FlowKey {
         source: if ipv6 {
             "[fd00::2]:12345"
         } else {
@@ -28,7 +28,7 @@ pub(super) fn flow(ipv6: bool) -> Flow {
 }
 
 pub(super) fn segment(
-    flow: Flow,
+    flow: FlowKey,
     seq: i32,
     ack: Option<i32>,
     control: TcpControl,

@@ -68,8 +68,8 @@ impl Pool {
 }
 
 pub struct Client {
-    endpoint: Endpoint,
-    carrier: Arc<dyn Carrier>,
+    endpoint: ServerEndpoint,
+    carrier: Arc<dyn Connector>,
     connector: TlsConnector,
     name: ServerName<'static>,
     password: [u8; 32],
@@ -83,7 +83,7 @@ pub struct Client {
 impl Client {
     pub fn new(
         options: &AnyTlsOutboundConfig,
-        carrier: Arc<dyn Carrier>,
+        carrier: Arc<dyn Connector>,
         resolver: Arc<dyn Resolver>,
     ) -> Result<Self> {
         tokio::runtime::Handle::try_current().context("AnyTLS client requires a Tokio runtime")?;
@@ -115,7 +115,7 @@ impl Client {
             }
         })?;
         Ok(Self {
-            endpoint: Endpoint {
+            endpoint: ServerEndpoint {
                 address: options.server.clone(),
                 resolver,
             },
@@ -216,7 +216,7 @@ impl Drop for Client {
     }
 }
 
-impl p::Client for Client {
+impl p::OutboundAdapter for Client {
     fn drain(&self) {
         let mut pool = self.pool.lock();
         pool.draining = true;
@@ -234,11 +234,11 @@ impl p::Client for Client {
         }
     }
 
-    fn tcp(&self, destination: Target, scope: Scope) -> BoxFuture<'_, Result<BoxStream>> {
+    fn tcp(&self, destination: Endpoint, scope: Scope) -> BoxFuture<'_, Result<BoxStream>> {
         Box::pin(async move { self.open(wire::address(&destination)?.into(), scope).await })
     }
 
-    fn udp(&self, destination: Target, scope: Scope) -> BoxFuture<'_, Result<Datagram>> {
+    fn udp(&self, destination: Endpoint, scope: Scope) -> BoxFuture<'_, Result<Datagram>> {
         Box::pin(async move {
             let mut address = wire::address(&udp::sentinel())?;
             address.extend(udp::request(&destination)?);

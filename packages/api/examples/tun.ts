@@ -3,13 +3,14 @@ import { auto_route, dns_service } from "@kotoconn/api";
 
 // The mark lets the daemon's own sockets bypass the TUN routes.
 const mark = 0x2022;
-const direct = await k.dialer({
-  carrier: k.host_network({ mark }),
-  outbound: { resolve_handler: (name) => k.lookup(name), implementation: k.direct_outbound({}) },
+const direct = await k.outbound({
+  via: k.host_network({ mark }),
+  resolve_server: (name) => k.lookup(name),
+  protocol: k.direct_outbound({}),
 });
 const dns = await dns_service({
   upstream: { protocol: "udp", server: { address: k.ip("1.1.1.1"), port: 53 } },
-  dialer: direct,
+  outbound: direct,
 });
 
 const tun = await k.inbound({
@@ -22,9 +23,9 @@ const tun = await k.inbound({
     ],
   }),
   // DNS captured by the TUN reaches DNS policy instead of being forwarded as is.
-  routing_handler: (flow) => {
-    if (flow.dest.port === 53) return k.route_dns(dns.handler);
-    return flow.protocol === "udp" ? k.route_udp(direct) : k.route(direct, flow.dest);
+  route: (flow) => {
+    if (flow.destination.port === 53) return k.route_dns(dns.handler);
+    return flow.protocol === "udp" ? k.route_udp(direct) : k.route(direct, flow.destination);
   },
   udp_idle_timeout: k.timeout(60_000),
 });

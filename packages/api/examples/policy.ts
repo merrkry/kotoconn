@@ -1,22 +1,23 @@
-import { kotoconn as k, type RoutingHandler } from "@kotoconn/bindings";
+import { kotoconn as k, type RoutePolicy } from "@kotoconn/bindings";
 
-const dialer = await k.dialer({
-  carrier: k.host_network({}),
-  outbound: { resolve_handler: (name) => k.lookup(name), implementation: k.direct_outbound({}) },
+const outbound = await k.outbound({
+  via: k.host_network({}),
+  resolve_server: (name) => k.lookup(name),
+  protocol: k.direct_outbound({}),
 });
 
-const routing: RoutingHandler = async (flow) => {
+const routing: RoutePolicy = async (flow) => {
   if (flow.protocol === "udp") {
     // This direct carrier needs an IP. UDP policy cannot rewrite the destination.
-    return flow.dest.ip ? k.route_udp(dialer) : k.reject();
+    return flow.destination.ip ? k.route_udp(outbound) : k.reject();
   }
-  const domain = flow.sniff?.domain ?? flow.dest.domain;
+  const domain = flow.sniff?.domain ?? flow.destination.domain;
   if (domain) {
     const addresses = await k.lookup(domain);
     const address = addresses[0];
-    return address ? k.route(dialer, k.ip_target(address, flow.dest.port)) : k.reject();
+    return address ? k.route(outbound, k.ip_endpoint(address, flow.destination.port)) : k.reject();
   }
-  return k.route(dialer, flow.dest);
+  return k.route(outbound, flow.destination);
 };
 
 for (const implementation of [
@@ -28,7 +29,7 @@ for (const implementation of [
   }),
 ]) {
   await k.inbound({
-    routing_handler: routing,
+    route: routing,
     sniff: { timeout: k.timeout(300) },
     udp_idle_timeout: k.timeout(60_000),
     implementation,

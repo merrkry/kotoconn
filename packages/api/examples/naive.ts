@@ -1,21 +1,19 @@
 import { kotoconn as k } from "@kotoconn/bindings";
 
-const naive = await k.dialer({
-  carrier: k.host_network({}),
-  outbound: {
-    resolve_handler: (name) => k.lookup(name),
-    implementation: k.naive_outbound({
-      server: k.domain("proxy.example.com", 443),
-      username: "user",
-      password: "replace-with-your-password",
-    }),
-  },
+const naive = await k.outbound({
+  via: k.host_network({}),
+  resolve_server: (name) => k.lookup(name),
+  protocol: k.naive_outbound({
+    server: k.domain("proxy.example.com", 443),
+    username: "user",
+    password: "replace-with-your-password",
+  }),
 });
 await k.inbound({
   implementation: k.socks5_inbound({
     listen: { address: k.ip("127.0.0.1"), port: 1080 },
   }),
-  routing_handler: (flow) => (flow.protocol === "tcp" ? k.route(naive, flow.dest) : k.reject()),
+  route: (flow) => (flow.protocol === "tcp" ? k.route(naive, flow.destination) : k.reject()),
   udp_idle_timeout: k.timeout(30_000),
 });
 

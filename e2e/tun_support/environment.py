@@ -252,16 +252,18 @@ def policy(
 ):
     path.write_text(f"""import {{ kotoconn as k }} from '@kotoconn/bindings';
 const resolver = name => k.lookup(name);
-const direct = await k.dialer({{carrier: k.host_network({{}}), outbound: {{
-    resolve_handler: resolver, implementation: k.direct_outbound({{}})
-}}}});
+const direct = await k.outbound({{
+    via: k.host_network({{}}),
+    resolve_server: resolver,
+    protocol: k.direct_outbound({{}})
+}});
 const routing = flow => flow.protocol === 'udp'
-    ? k.route_udp(direct) : k.route(direct, flow.dest);
+    ? k.route_udp(direct) : k.route(direct, flow.destination);
 const tun = await k.inbound({{implementation: k.tun_inbound({{
     name: '{NAME}', mtu: {mtu}, addresses: [
     {{address: k.ip('192.0.2.1'), prefix: 30}},
     {{address: k.ip('fd00::1'), prefix: 126}}
-]}}), routing_handler: routing, udp_idle_timeout: k.timeout({idle_ms})}});
+]}}), route: routing, udp_idle_timeout: k.timeout({idle_ms})}});
 """)
     if outbound == "socks5":
         source = path.read_text()
@@ -270,22 +272,19 @@ const tun = await k.inbound({{implementation: k.tun_inbound({{
     implementation: k.socks5_inbound({listen: {
         address: k.ip('127.0.0.1'), port: 9100
     }}),
-    routing_handler: routing, udp_idle_timeout: k.timeout(30000)
+    route: routing, udp_idle_timeout: k.timeout(30000)
 });
-const proxy = await k.dialer({carrier: k.host_network({}), outbound: {
-    resolve_handler: resolver, implementation: k.socks5_outbound({
-        server: k.ip_target(k.ip('127.0.0.1'), 9100)
-    })
-}});
+const proxy = await k.outbound({
+    via: k.host_network({}), resolve_server: resolver,
+    protocol: k.socks5_outbound({server: k.ip_endpoint(k.ip('127.0.0.1'), 9100)})
+});
 const tunRouting = flow => flow.protocol === 'udp'
-    ? k.route_udp(proxy) : k.route(proxy, flow.dest);
+    ? k.route_udp(proxy) : k.route(proxy, flow.destination);
 """
         path.write_text(
             source[:point]
             + relay
-            + source[point:].replace(
-                "routing_handler: routing", "routing_handler: tunRouting"
-            )
+            + source[point:].replace("route: routing", "route: tunRouting")
         )
     if auto_route:
         path.write_text(

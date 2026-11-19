@@ -1,10 +1,10 @@
 #![cfg(target_os = "linux")]
 
 use anyhow::Result;
-use kotoconn_config::{OutboundImpl, Socks5OutboundConfig};
+use kotoconn_config::{OutboundProtocol, Socks5OutboundConfig};
 use kotoconn_daemon::{Daemon, Shutdown};
-use kotoconn_outbounds::{Clients, System, SystemResolver};
-use kotoconn_protocol::{Carrier, Scope, target};
+use kotoconn_outbounds::{Outbound, System, SystemResolver};
+use kotoconn_protocol::{Connector, Scope, target};
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -20,10 +20,10 @@ async fn daemon(implementation: String, outbound: String) -> Result<Daemon> {
         r#"
         import {{ kotoconn as k }} from '@kotoconn/bindings';
         const resolver = name => k.lookup(name);
-        const dialer = await k.dialer({{ carrier: k.host_network({{}}), outbound: {{ resolve_handler: resolver, implementation: {outbound} }} }});
-        const routing = flow => k.route(dialer, flow.dest);
+        const outbound = await k.outbound({{ via: k.host_network({{}}), resolve_server: resolver, protocol: {outbound} }});
+        const routing = flow => k.route(outbound, flow.destination);
         const listen = {{ address: k.ip('127.0.0.1'), port: 0 }};
-        await k.inbound({{ implementation: {implementation}, routing_handler: routing, udp_idle_timeout: k.timeout(1000) }});
+        await k.inbound({{ implementation: {implementation}, route: routing, udp_idle_timeout: k.timeout(1000) }});
     "#
     );
     Ok(Daemon::start_with_sources(
@@ -62,11 +62,11 @@ async fn shutdown_drains_active_h2_streams_then_closes_idle_pools() -> Result<()
         let server_port = server.listen_addresses().values().next().unwrap().port();
         let client = daemon(
             "k.socks5_inbound({listen})".into(),
-            format!("k.naive_outbound({{server: k.ip_target(k.ip('127.0.0.1'), {server_port}), server_name: 'proxy.test', username: 'user', password: 'secret', certificate: {certificate}}})"),
+            format!("k.naive_outbound({{server: k.ip_endpoint(k.ip('127.0.0.1'), {server_port}), server_name: 'proxy.test', username: 'user', password: 'secret', certificate: {certificate}}})"),
         ).await?;
 
-        let entry = Clients::new(
-            OutboundImpl::Socks5(Socks5OutboundConfig { server: target(*client.listen_addresses().values().next().unwrap()) }),
+        let entry = Outbound::new(
+            OutboundProtocol::Socks5(Socks5OutboundConfig { server: target(*client.listen_addresses().values().next().unwrap()) }),
             Arc::new(System::new(scope.clone(), Default::default()).unwrap()), Arc::new(SystemResolver),
         )?;
         let mut stream = entry.tcp(destination).await?;

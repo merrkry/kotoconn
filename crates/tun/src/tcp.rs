@@ -1,7 +1,7 @@
 //! TCP state belongs to the receive worker. Stream handles exchange immutable
 //! payload blocks and consumption notifications without locking the socket.
 use crate::{
-    packet::{Flow, Packet},
+    packet::{FlowKey, Packet},
     pool::Pool,
     storage::PacketArena,
     tcp_storage::Storage,
@@ -50,7 +50,7 @@ pub(crate) struct Link {
     pub gso: bool,
 }
 
-pub(crate) type Ready = (Flow, u64);
+pub(crate) type Ready = (FlowKey, u64);
 
 struct Shared {
     attachment: SegQueue<direct::Attachment>,
@@ -403,7 +403,7 @@ pub(crate) enum Progress {
 
 impl Connection {
     pub fn new(
-        flow: Flow,
+        flow: FlowKey,
         link: Link,
         ready: mpsc::UnboundedSender<Ready>,
         generation: u64,
@@ -991,7 +991,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn dynamic_receive_window_preserves_advertised_space_when_target_falls() {
-        let flow = Flow {
+        let flow = FlowKey {
             source: "192.0.2.2:12345".parse().unwrap(),
             destination: "198.51.100.1:443".parse().unwrap(),
         };

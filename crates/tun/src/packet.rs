@@ -8,7 +8,7 @@ use tokio::time::Instant;
 pub(crate) const REASSEMBLY_LIFETIME: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct Flow {
+pub(crate) struct FlowKey {
     pub source: SocketAddr,
     pub destination: SocketAddr,
 }
@@ -45,11 +45,11 @@ impl Packet<'_> {
         data
     }
 
-    pub fn tcp(&self) -> Option<(Flow, TcpRepr<'_>)> {
+    pub fn tcp(&self) -> Option<(FlowKey, TcpRepr<'_>)> {
         self.tcp_with_checksum(false)
     }
 
-    pub fn tcp_with_checksum(&self, verified: bool) -> Option<(Flow, TcpRepr<'_>)> {
+    pub fn tcp_with_checksum(&self, verified: bool) -> Option<(FlowKey, TcpRepr<'_>)> {
         let packet = TcpPacket::new_checked(&self.payload[..]).ok()?;
         let repr = TcpRepr::parse(
             &packet,
@@ -62,11 +62,11 @@ impl Packet<'_> {
     }
 
     #[cfg(test)]
-    pub fn udp(&self) -> Option<(Flow, &[u8])> {
+    pub fn udp(&self) -> Option<(FlowKey, &[u8])> {
         self.udp_with_checksum(false)
     }
 
-    pub fn udp_with_checksum(&self, verified: bool) -> Option<(Flow, &[u8])> {
+    pub fn udp_with_checksum(&self, verified: bool) -> Option<(FlowKey, &[u8])> {
         let packet = UdpPacket::new_checked(&self.payload[..]).ok()?;
         // smoltcp 0.14's verify_checksum accepts zero for both address families.
         // RFC 8200 section 8.1 forbids it for ordinary UDP over IPv6.
@@ -87,8 +87,8 @@ impl Packet<'_> {
         ))
     }
 
-    fn flow(&self, source: u16, destination: u16) -> Option<Flow> {
-        (destination != 0).then(|| Flow {
+    fn flow(&self, source: u16, destination: u16) -> Option<FlowKey> {
+        (destination != 0).then(|| FlowKey {
             source: SocketAddr::new(self.ip.src_addr().into(), source),
             destination: SocketAddr::new(self.ip.dst_addr().into(), destination),
         })
@@ -147,7 +147,7 @@ impl Assembly {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum RouteKey {
-    Flow(u8, Flow),
+    Flow(u8, FlowKey),
     Fragment(FragmentKey),
 }
 
@@ -190,7 +190,7 @@ impl<'a> Parsed<'a> {
         (destination != 0).then(|| {
             RouteKey::Flow(
                 u8::from(self.ip.next_header()),
-                Flow {
+                FlowKey {
                     source: SocketAddr::new(self.ip.src_addr().into(), source),
                     destination: SocketAddr::new(self.ip.dst_addr().into(), destination),
                 },

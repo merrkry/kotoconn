@@ -1,4 +1,4 @@
-use crate::{packet::Flow, tcp, transmit::Transmit, udp};
+use crate::{packet::FlowKey, tcp, transmit::Transmit, udp};
 use kotoconn_protocol::{self as p, queue};
 use std::{
     collections::VecDeque,
@@ -80,7 +80,7 @@ impl Wake for Ready {
 }
 
 pub(crate) struct Direct {
-    flow: Flow,
+    flow: FlowKey,
     io: p::BoxPacketIo,
     pending: VecDeque<p::Packet>,
     received: Vec<p::Packet>,
@@ -343,7 +343,7 @@ mod tests {
 
     #[tokio::test]
     async fn output_pressure_retains_empty_replies_and_allows_reverse_traffic() {
-        let flow = Flow {
+        let flow = FlowKey {
             source: "192.0.2.2:1000".parse().unwrap(),
             destination: "198.51.100.1:2000".parse().unwrap(),
         };
@@ -410,7 +410,7 @@ mod tests {
     #[tokio::test]
     async fn new_ingress_follows_prequeued_packets_across_partial_native_sends() {
         for size in [1, 60000] {
-            let flow = Flow {
+            let flow = FlowKey {
                 source: "192.0.2.2:1000".parse().unwrap(),
                 destination: "198.51.100.1:2000".parse().unwrap(),
             };

@@ -1,10 +1,10 @@
 use std::net::SocketAddr;
 
-use crate::Target;
+use crate::Endpoint;
 
 #[derive(Debug, Clone, PartialEq, Eq, ts_rs::TS)]
 pub struct DirectInboundConfig {
     #[ts(type = "SocketAddr")]
     pub listen: SocketAddr,
-    pub target: Target,
+    pub target: Endpoint,
 }

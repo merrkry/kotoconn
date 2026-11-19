@@ -1,11 +1,11 @@
 use std::time::Duration;
 
-use crate::Target;
+use crate::Endpoint;
 
-/// A health check that opens a TCP connection through a dialer.
+/// A health check that opens a TCP connection through an outbound.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Probe {
-    pub target: Target,
+    pub target: Endpoint,
     /// Sent once connected; empty for protocols where the server speaks first.
     pub request: Vec<u8>,
     /// Response bytes to read before the probe completes, unless the server

@@ -1,10 +1,10 @@
-use kotoconn_config::{DirectOutboundConfig, OutboundImpl, TransportProtocol};
-use kotoconn_outbounds::{Clients, System, SystemResolver};
+use kotoconn_config::{DirectOutboundConfig, OutboundProtocol, TransportProtocol};
+use kotoconn_outbounds::{Outbound, System, SystemResolver};
 use kotoconn_protocol::*;
 use std::{future::poll_fn, io, sync::Arc, time::Duration};
 use tokio::net::UdpSocket;
 
-async fn exchange(io: &mut BoxPacketIo, target: Target, payload: Vec<u8>) {
+async fn exchange(io: &mut BoxPacketIo, target: Endpoint, payload: Vec<u8>) {
     let packet = Packet {
         target: target.clone(),
         payload: payload.clone().into(),
@@ -40,15 +40,15 @@ async fn native_datagrams_preserve_boundaries_and_nested_carrier_cancellation() 
             let root = Scope::new();
             let system = Arc::new(System::new(root.clone(), Default::default()).unwrap());
             let middle = Arc::new(
-                Clients::new(
-                    OutboundImpl::Direct(DirectOutboundConfig {}),
+                Outbound::new(
+                    OutboundProtocol::Direct(DirectOutboundConfig {}),
                     system,
                     Arc::new(SystemResolver),
                 )
                 .unwrap(),
             );
-            let leaf = Clients::new(
-                OutboundImpl::Direct(DirectOutboundConfig {}),
+            let leaf = Outbound::new(
+                OutboundProtocol::Direct(DirectOutboundConfig {}),
                 middle.clone(),
                 Arc::new(SystemResolver),
             )

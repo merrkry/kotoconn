@@ -10,7 +10,7 @@ use hickory_net::{
     xfer::{DnsExchange, DnsHandle},
 };
 use kotoconn_config::{DnsServiceConfig, TransportProtocol};
-use kotoconn_protocol::{Carrier, Scope, target};
+use kotoconn_protocol::{Connector, Scope, target};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -33,7 +33,11 @@ pub struct Service {
 }
 
 impl Service {
-    pub fn new(config: DnsServiceConfig, carrier: Arc<dyn Carrier>, scope: Scope) -> Result<Self> {
+    pub fn new(
+        config: DnsServiceConfig,
+        carrier: Arc<dyn Connector>,
+        scope: Scope,
+    ) -> Result<Self> {
         ensure!(!config.timeout.is_zero(), "DNS timeout must be positive");
         ensure!(
             config.upstream.server.port() != 0,

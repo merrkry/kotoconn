@@ -1,8 +1,8 @@
 use std::num::NonZeroU64;
 
 use crate::{
-    DialerConfig, DialerId, DnsListenerConfig, DnsServiceConfig, DnsServiceId, InboundConfig,
-    InboundId,
+    DnsListenerConfig, DnsServiceConfig, DnsServiceId, InboundConfig, InboundId, OutboundConfig,
+    OutboundId,
 };
 
 /// Identifies one resource of any kind. IDs are never reused, so a reference to a
@@ -10,8 +10,8 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResourceId(pub NonZeroU64);
 
-impl From<DialerId> for ResourceId {
-    fn from(id: DialerId) -> Self {
+impl From<OutboundId> for ResourceId {
+    fn from(id: OutboundId) -> Self {
         Self(id.0)
     }
 }
@@ -31,7 +31,7 @@ impl From<DnsServiceId> for ResourceId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceConfig {
     Inbound(InboundConfig),
-    Dialer(DialerConfig),
+    Outbound(OutboundConfig),
     DnsService(DnsServiceConfig),
     DnsListener(DnsListenerConfig),
 }

@@ -1,6 +1,6 @@
 use anyhow::{Result, bail, ensure};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use kotoconn_protocol::{Packet, Target};
+use kotoconn_protocol::{Endpoint, Packet};
 use quinn::VarInt;
 use quinn_proto::coding::Codec;
 use rand::{Rng, distr::Alphanumeric};
@@ -24,10 +24,10 @@ pub fn padding() -> String {
         .collect()
 }
 
-pub fn address(target: &Target) -> Result<String> {
+pub fn address(target: &Endpoint) -> Result<String> {
     let value = match target {
-        Target::Ip { address, port } => SocketAddr::new(*address, *port).to_string(),
-        Target::Domain { name, port } => {
+        Endpoint::Ip { address, port } => SocketAddr::new(*address, *port).to_string(),
+        Endpoint::Domain { name, port } => {
             ensure!(
                 !name.is_empty() && !name.contains([':', '[', ']', '\0']),
                 "invalid Hysteria domain"
@@ -39,7 +39,7 @@ pub fn address(target: &Target) -> Result<String> {
     Ok(value)
 }
 
-pub fn parse_address(value: &str) -> Result<Target> {
+pub fn parse_address(value: &str) -> Result<Endpoint> {
     ensure!(value.len() <= MAX_ADDRESS, "Hysteria address too long");
     if let Ok(address) = value.parse::<SocketAddr>() {
         return Ok(kotoconn_protocol::target(address));
@@ -52,7 +52,7 @@ pub fn parse_address(value: &str) -> Result<Target> {
         !name.is_empty() && !name.contains([':', '[', ']', '\0']),
         "invalid Hysteria domain"
     );
-    Ok(Target::Domain {
+    Ok(Endpoint::Domain {
         name: name.into(),
         port: port.parse()?,
     })
@@ -85,7 +85,7 @@ fn put_field(out: &mut Vec<u8>, value: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub async fn request(output: &mut (impl AsyncWrite + Unpin), target: &Target) -> Result<()> {
+pub async fn request(output: &mut (impl AsyncWrite + Unpin), target: &Endpoint) -> Result<()> {
     let mut bytes = Vec::new();
     put_varint(&mut bytes, TCP_REQUEST)?;
     put_field(&mut bytes, address(target)?.as_bytes())?;
@@ -95,7 +95,7 @@ pub async fn request(output: &mut (impl AsyncWrite + Unpin), target: &Target) ->
 }
 
 /// The stream classifier has already consumed the TCPRequest ID.
-pub async fn read_request(input: &mut (impl AsyncRead + Unpin)) -> Result<Target> {
+pub async fn read_request(input: &mut (impl AsyncRead + Unpin)) -> Result<Endpoint> {
     let bytes = read_field(input, MAX_ADDRESS).await?;
     let target = parse_address(std::str::from_utf8(&bytes)?)?;
     read_field(input, MAX_PADDING).await?;
@@ -128,7 +128,7 @@ pub struct Fragment {
     packet: u16,
     index: u8,
     count: u8,
-    target: Target,
+    target: Endpoint,
     payload: Bytes,
 }
 
@@ -192,7 +192,7 @@ pub fn fragments(session: u32, packet: u16, value: &Packet, mtu: usize) -> Resul
 }
 
 struct Pending {
-    target: Target,
+    target: Endpoint,
     fragments: Vec<Option<Bytes>>,
     bytes: usize,
     received: usize,

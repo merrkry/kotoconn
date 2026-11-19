@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 use futures_util::future::{BoxFuture, try_join_all};
 use kotoconn_config::{NaiveInboundConfig, NaiveOutboundConfig};
 use kotoconn_naive::{Client, Server};
-use kotoconn_protocol::{self as p, Client as _, Server as _, *};
+use kotoconn_protocol::{self as p, OutboundAdapter as _, Server as _, *};
 use std::{
     net::{IpAddr, SocketAddr},
     sync::{
@@ -37,7 +37,7 @@ struct SocketCarrier {
     connections: AtomicUsize,
 }
 
-impl Carrier for SocketCarrier {
+impl Connector for SocketCarrier {
     fn capabilities(&self) -> Capabilities {
         Capabilities::TCP
     }
@@ -45,7 +45,7 @@ impl Carrier for SocketCarrier {
         &self.scope
     }
 
-    fn tcp_scoped(&self, target: Target, caller: Scope) -> BoxFuture<'_, Result<BoxStream>> {
+    fn tcp_scoped(&self, target: Endpoint, caller: Scope) -> BoxFuture<'_, Result<BoxStream>> {
         Box::pin(async move {
             assert_eq!(socket_addr(&target)?, self.destination);
             self.connections.fetch_add(1, Ordering::Relaxed);
@@ -56,7 +56,7 @@ impl Carrier for SocketCarrier {
         })
     }
 
-    fn udp_scoped(&self, _: Target, _: Scope) -> BoxFuture<'_, Result<Datagram>> {
+    fn udp_scoped(&self, _: Endpoint, _: Scope) -> BoxFuture<'_, Result<Datagram>> {
         Box::pin(async { bail!("UDP must not be attempted") })
     }
 }
@@ -72,13 +72,13 @@ impl Resolver for Resolve {
     }
 }
 
-struct Echo(mpsc::UnboundedSender<Target>);
+struct Echo(mpsc::UnboundedSender<Endpoint>);
 
-impl Handler for Echo {
+impl InboundHandler for Echo {
     fn tcp(
         &self,
         _: std::net::SocketAddr,
-        target: Target,
+        target: Endpoint,
         mut io: BoxStream,
         _: Scope,
     ) -> BoxFuture<'_, Result<()>> {
@@ -104,9 +104,9 @@ struct Fixture {
     pool: Scope,
     carrier: Arc<SocketCarrier>,
     options: NaiveOutboundConfig,
-    endpoint: Endpoint,
+    endpoint: ServerEndpoint,
     names: mpsc::UnboundedReceiver<String>,
-    targets: mpsc::UnboundedReceiver<Target>,
+    targets: mpsc::UnboundedReceiver<Endpoint>,
 }
 
 impl Fixture {
@@ -133,7 +133,7 @@ impl Fixture {
                 },
             )
             .await?;
-        let server = Target::Domain {
+        let server = Endpoint::Domain {
             name: "network.test".into(),
             port: bound.local_addr.port(),
         };
@@ -144,7 +144,7 @@ impl Fixture {
         });
         scope.spawn(bound.run)?;
         let (send, names) = mpsc::unbounded_channel();
-        let endpoint = Endpoint {
+        let endpoint = ServerEndpoint {
             address: server.clone(),
             resolver: Arc::new(Resolve(send)),
         };
@@ -188,8 +188,8 @@ impl Drop for Fixture {
     }
 }
 
-fn destination() -> Target {
-    Target::Domain {
+fn destination() -> Endpoint {
+    Endpoint::Domain {
         name: "target.invalid".into(),
         port: 443,
     }
@@ -314,7 +314,7 @@ async fn malformed_authorities_fail_before_network_io() -> Result<()> {
         "host:123",
         "[::1]",
     ] {
-        let destination = Target::Domain {
+        let destination = Endpoint::Domain {
             name: name.into(),
             port: 443,
         };

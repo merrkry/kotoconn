@@ -21,9 +21,9 @@ pub use io::{
     BoxStream, ChunkBuffer, Datagram, DatagramWorker, Packet, Stream, copy_bidirectional,
     packet_pair, prefix, stream_task,
 };
-pub use kotoconn_config::{Target, TransportProtocol};
+pub use kotoconn_config::{Endpoint, TransportProtocol};
 pub use packet_io::{BoxPacketIo, NativeDatagram, PacketIo, packet_io_task};
-pub use server::{BoundServer, Handler, Server, ServerContext, accept, accept_loop};
+pub use server::{BoundServer, InboundHandler, Server, ServerContext, accept, accept_loop};
 pub use session::UdpSession;
 use std::{net::SocketAddr, sync::Arc};
 
@@ -68,39 +68,39 @@ impl Capabilities {
     }
 
     /// Check a connection request before it starts any I/O.
-    pub fn require_for(self, protocol: TransportProtocol, target: &Target) -> Result<()> {
+    pub fn require_for(self, protocol: TransportProtocol, target: &Endpoint) -> Result<()> {
         let transport = match protocol {
             TransportProtocol::Tcp => Self::TCP,
             TransportProtocol::Udp => Self::UDP,
         };
 
         self.require(Self {
-            domain_targets: matches!(target, Target::Domain { .. }),
+            domain_targets: matches!(target, Endpoint::Domain { .. }),
             ..transport
         })
     }
 }
 
 /// One carrier reference provides all lower-layer capabilities a protocol needs.
-pub trait Carrier: Send + Sync {
+pub trait Connector: Send + Sync {
     fn capabilities(&self) -> Capabilities;
     fn scope(&self) -> &Scope;
-    fn tcp(&self, target: Target) -> BoxFuture<'_, Result<BoxStream>> {
+    fn tcp(&self, target: Endpoint) -> BoxFuture<'_, Result<BoxStream>> {
         self.tcp_scoped(target, self.scope().child())
     }
 
-    fn udp(&self, target: Target) -> BoxFuture<'_, Result<Datagram>> {
+    fn udp(&self, target: Endpoint) -> BoxFuture<'_, Result<Datagram>> {
         self.udp_scoped(target, self.scope().child())
     }
     /// Propagate completion tracking through every layer of a connection attempt.
-    fn tcp_scoped(&self, target: Target, caller: Scope) -> BoxFuture<'_, Result<BoxStream>>;
-    fn udp_scoped(&self, target: Target, caller: Scope) -> BoxFuture<'_, Result<Datagram>>;
+    fn tcp_scoped(&self, target: Endpoint, caller: Scope) -> BoxFuture<'_, Result<BoxStream>>;
+    fn udp_scoped(&self, target: Endpoint, caller: Scope) -> BoxFuture<'_, Result<Datagram>>;
 
     /// Open packet I/O for a caller that supplies its own driver. Declining must
     /// perform no network I/O; the caller can then use udp_scoped normally.
     fn udp_native_scoped(
         &self,
-        _target: Target,
+        _target: Endpoint,
         _caller: Scope,
     ) -> BoxFuture<'_, Result<Option<NativeDatagram>>> {
         Box::pin(async { Ok(None) })
@@ -108,20 +108,20 @@ pub trait Carrier: Send + Sync {
 }
 
 /// Adapters own protocol state. The runtime supplies independent TCP/UDP lifetimes.
-pub trait Client: Send + Sync {
+pub trait OutboundAdapter: Send + Sync {
     /// Release idle protocol resources during shutdown. Accepted work may still
     /// open connections; active streams must continue to drain.
     fn drain(&self) {}
 
     fn capabilities(&self) -> Capabilities;
-    fn tcp(&self, target: Target, scope: Scope) -> BoxFuture<'_, Result<BoxStream>>;
-    fn udp(&self, target: Target, scope: Scope) -> BoxFuture<'_, Result<Datagram>>;
+    fn tcp(&self, target: Endpoint, scope: Scope) -> BoxFuture<'_, Result<BoxStream>>;
+    fn udp(&self, target: Endpoint, scope: Scope) -> BoxFuture<'_, Result<Datagram>>;
 
-    /// Same opt-in contract as Carrier::udp_native_scoped. Encoded transports
+    /// Same opt-in contract as Connector::udp_native_scoped. Encoded transports
     /// keep their ordinary datagram driver unless they explicitly implement it.
     fn udp_native(
         &self,
-        _target: Target,
+        _target: Endpoint,
         _scope: Scope,
     ) -> BoxFuture<'_, Result<Option<NativeDatagram>>> {
         Box::pin(async { Ok(None) })
@@ -134,23 +134,23 @@ pub trait Resolver: Send + Sync {
 }
 
 #[derive(Clone)]
-pub struct Endpoint {
-    pub address: Target,
+pub struct ServerEndpoint {
+    pub address: Endpoint,
     pub resolver: Arc<dyn Resolver>,
 }
 
-impl Endpoint {
+impl ServerEndpoint {
     /// The target to request from a carrier with `capabilities`. The server
     /// name is resolved only when that carrier requires IP targets.
-    pub async fn target(&self, capabilities: Capabilities) -> Result<Target> {
+    pub async fn target(&self, capabilities: Capabilities) -> Result<Endpoint> {
         match &self.address {
-            Target::Domain { name, port } if !capabilities.domain_targets => {
+            Endpoint::Domain { name, port } if !capabilities.domain_targets => {
                 let addresses = self.resolver.resolve(name.clone()).await?;
                 let address = addresses
                     .into_iter()
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("resolver returned no addresses"))?;
-                Ok(Target::Ip {
+                Ok(Endpoint::Ip {
                     address,
                     port: *port,
                 })
@@ -163,24 +163,24 @@ impl Endpoint {
 /// Whether a datagram from `source` comes from the server at `server`. A
 /// carrier that accepted a domain target reports whichever address it reached,
 /// so only the port identifies that server.
-pub fn from_server(server: &Target, source: &Target) -> bool {
+pub fn from_server(server: &Endpoint, source: &Endpoint) -> bool {
     match server {
-        Target::Domain { port, .. } => source.port() == *port,
-        Target::Ip { .. } => server == source,
+        Endpoint::Domain { port, .. } => source.port() == *port,
+        Endpoint::Ip { .. } => server == source,
     }
 }
 
-pub fn socket_addr(target: &Target) -> Result<SocketAddr> {
+pub fn socket_addr(target: &Endpoint) -> Result<SocketAddr> {
     match target {
-        Target::Ip { address, port } => Ok(SocketAddr::new(*address, *port)),
-        Target::Domain { .. } => {
+        Endpoint::Ip { address, port } => Ok(SocketAddr::new(*address, *port)),
+        Endpoint::Domain { .. } => {
             bail!("carrier requires IP targets; resolve domains in user policy")
         }
     }
 }
 
-pub fn target(address: SocketAddr) -> Target {
-    Target::Ip {
+pub fn target(address: SocketAddr) -> Endpoint {
+    Endpoint::Ip {
         address: address.ip(),
         port: address.port(),
     }

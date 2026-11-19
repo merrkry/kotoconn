@@ -14,23 +14,23 @@ pub(crate) fn declarations() -> String {
     let _: fn(&Cidr, IpAddr) -> bool = Cidr::contains;
     let _: fn(&Cidr) -> String = Cidr::display;
     let _: fn(&Inbound, Inbound) -> bool = Inbound::equals;
-    let _: fn(&Dialer, Dialer) -> bool = Dialer::equals;
+    let _: fn(&Outbound, Outbound) -> bool = Outbound::equals;
     let _: fn(&DnsServiceRef, DnsServiceRef) -> bool = DnsServiceRef::equals;
-    let _: for<'js> fn(&Dialer, rquickjs::Ctx<'js>) -> rquickjs::Result<()> = Dialer::close;
-    let _: for<'js> fn(&Dialer, rquickjs::Ctx<'js>, DrainOptions) -> rquickjs::Result<()> =
-        Dialer::drain;
-    let _: for<'js> fn(&Dialer, rquickjs::Ctx<'js>) -> rquickjs::Result<rquickjs::Promise<'js>> =
-        Dialer::wait;
+    let _: for<'js> fn(&Outbound, rquickjs::Ctx<'js>) -> rquickjs::Result<()> = Outbound::close;
+    let _: for<'js> fn(&Outbound, rquickjs::Ctx<'js>, DrainOptions) -> rquickjs::Result<()> =
+        Outbound::drain;
+    let _: for<'js> fn(&Outbound, rquickjs::Ctx<'js>) -> rquickjs::Result<rquickjs::Promise<'js>> =
+        Outbound::wait;
 
-    let _: fn(&Target) -> u16 = Target::port;
-    let _: fn(&Target) -> Option<String> = Target::domain;
-    let _: fn(&Target) -> Option<IpAddr> = Target::ip;
+    let _: fn(&Endpoint) -> u16 = Endpoint::port;
+    let _: fn(&Endpoint) -> Option<String> = Endpoint::domain;
+    let _: fn(&Endpoint) -> Option<IpAddr> = Endpoint::ip;
 
     let cfg = ts_rs::Config::default();
     let declarations = [
         IpAddr::decl(&cfg),
         Cidr::decl(&cfg),
-        Target::decl(&cfg),
+        Endpoint::decl(&cfg),
         Timeout::decl(&cfg),
         Port::decl(&cfg),
         Mtu::decl(&cfg),
@@ -38,15 +38,15 @@ pub(crate) fn declarations() -> String {
         Byte::decl(&cfg),
         Bytes::decl(&cfg),
         Milliseconds::decl(&cfg),
-        Dialer::decl(&cfg),
+        Outbound::decl(&cfg),
         Inbound::decl(&cfg),
         "interface Resource { close(): void; drain(options: DrainOptions): void; wait(): Promise<void>; }".into(),
         DrainOptions::decl(&cfg),
         ProbeOptions::decl(&cfg),
         ProbeResult::decl(&cfg),
-        format!("type RoutingHandler = {};", host::RoutingHandler::name(&cfg)),
-        format!("type ResolveHandler = {};", host::ResolveHandler::name(&cfg)),
-        format!("type DnsHandler = {};", host::DnsHandler::name(&cfg)),
+        format!("type RoutePolicy = {};", host::RoutePolicy::name(&cfg)),
+        format!("type ResolvePolicy = {};", host::ResolvePolicy::name(&cfg)),
+        format!("type DnsPolicy = {};", host::DnsPolicy::name(&cfg)),
         DnsServiceRef::decl(&cfg),
         DnsServiceConfig::decl(&cfg),
         DnsUpstreamConfig::decl(&cfg),
@@ -59,7 +59,7 @@ pub(crate) fn declarations() -> String {
         Decision::decl(&cfg),
         DnsResult::decl(&cfg),
         InboundImpl::decl(&cfg),
-        OutboundImpl::decl(&cfg),
+        OutboundProtocol::decl(&cfg),
         Hysteria2InboundConfig::decl(&cfg),
         Hysteria2OutboundConfig::decl(&cfg),
         TlsClientConfig::decl(&cfg),
@@ -73,7 +73,7 @@ pub(crate) fn declarations() -> String {
         NaiveInboundConfig::decl(&cfg),
         NaiveOutboundConfig::decl(&cfg),
         Shadowsocks2022OutboundConfig::decl(&cfg),
-        Flow::decl(&cfg),
+        SessionInfo::decl(&cfg),
         SniffConfig::decl(&cfg),
         SniffProtocol::decl(&cfg),
         SniffResult::decl(&cfg),
@@ -86,8 +86,7 @@ pub(crate) fn declarations() -> String {
         Socks5OutboundConfig::decl(&cfg),
         InboundConfig::decl(&cfg),
         OutboundConfig::decl(&cfg),
-        DialerConfig::decl(&cfg),
-        CarrierConfig::decl(&cfg),
+        OutboundVia::decl(&cfg),
         HostNetwork::decl(&cfg),
         HostNetworkConfig::decl(&cfg),
         crate::handler::Handler::<(), ()>::decl(&cfg),

@@ -2,7 +2,7 @@
 /// exposed transport is still TCP. Certificates are PEM trust anchors.
 #[derive(Debug, Clone, PartialEq, Eq, ts_rs::TS)]
 pub struct NaiveOutboundConfig {
-    pub server: crate::Target,
+    pub server: crate::Endpoint,
     pub username: String,
     pub password: String,
     #[ts(optional)]

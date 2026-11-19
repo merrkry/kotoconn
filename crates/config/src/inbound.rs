@@ -8,7 +8,7 @@ mod tun;
 
 use std::{num::NonZeroU64, time::Duration};
 
-use crate::RoutingHandler;
+use crate::RoutePolicy;
 
 pub use direct::DirectInboundConfig;
 pub use http::HttpInboundConfig;
@@ -26,8 +26,8 @@ pub struct InboundId(pub NonZeroU64);
 
 #[derive(Debug, Clone, PartialEq, Eq, ts_rs::TS)]
 pub struct InboundConfig {
-    #[ts(type = "RoutingHandler")]
-    pub routing_handler: RoutingHandler,
+    #[ts(type = "RoutePolicy")]
+    pub route: RoutePolicy,
     #[ts(optional)]
     pub sniff: Option<crate::SniffConfig>,
     #[ts(type = "Timeout")]

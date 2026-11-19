@@ -51,10 +51,10 @@ pub enum Shutdown {
 type Reply<T> = oneshot::Sender<Result<T, Error>>;
 
 enum Command {
-    Route(RoutingHandler, Flow, Reply<RouteDecision>),
-    Resolve(ResolveHandler, String, Reply<Vec<IpAddr>>),
+    Route(RoutePolicy, SessionInfo, Reply<RouteDecision>),
+    Resolve(ResolvePolicy, String, Reply<Vec<IpAddr>>),
     Dns(
-        DnsHandler,
+        DnsPolicy,
         Box<DnsRequest>,
         Option<DnsRequestInfo>,
         Reply<DnsHandlerResult>,
@@ -73,8 +73,8 @@ impl Policy {
     #[tracing::instrument(skip_all, fields(handler_id = handler.id().get()), err)]
     pub async fn route(
         &self,
-        handler: &RoutingHandler,
-        flow: Flow,
+        handler: &RoutePolicy,
+        flow: SessionInfo,
     ) -> Result<RouteDecision, Error> {
         let (reply, result) = oneshot::channel();
         self.send(Command::Route(handler.clone(), flow, reply))
@@ -85,7 +85,7 @@ impl Policy {
     #[tracing::instrument(skip_all, fields(handler_id = handler.id().get(), %name), err)]
     pub async fn resolve(
         &self,
-        handler: &ResolveHandler,
+        handler: &ResolvePolicy,
         name: String,
     ) -> Result<Vec<IpAddr>, Error> {
         let (reply, result) = oneshot::channel();
@@ -97,7 +97,7 @@ impl Policy {
     #[tracing::instrument(skip_all, fields(handler_id = handler.id().get()), err)]
     pub async fn dns(
         &self,
-        handler: &DnsHandler,
+        handler: &DnsPolicy,
         request: DnsRequest,
         info: Option<DnsRequestInfo>,
     ) -> Result<DnsHandlerResult, Error> {
@@ -325,12 +325,12 @@ impl Daemon {
         self.resources.sessions.list().await
     }
 
-    pub fn client_control(
+    pub fn outbound_control(
         &self,
-        id: DialerId,
+        id: OutboundId,
         protocol: TransportProtocol,
     ) -> Option<kotoconn_protocol::Scope> {
-        self.resources.client_control(id, protocol)
+        self.resources.outbound_control(id, protocol)
     }
 
     pub fn policy(&self) -> &Policy {

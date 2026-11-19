@@ -2,7 +2,7 @@
 //! immediately; policy resolution and carrier I/O run on the Tokio executor.
 use anyhow::{Result, ensure};
 use cronet::{NetworkHooks, UdpDialResult};
-use kotoconn_protocol::{Carrier, Endpoint, Packet, Scope, from_server};
+use kotoconn_protocol::{Connector, Packet, Scope, ServerEndpoint, from_server};
 use std::{
     io,
     net::{TcpListener, TcpStream, UdpSocket},
@@ -18,8 +18,8 @@ pub(crate) fn resolver_rules(host: &str) -> String {
 }
 
 pub(crate) fn hooks(
-    carrier: Arc<dyn Carrier>,
-    endpoint: Endpoint,
+    carrier: Arc<dyn Connector>,
+    endpoint: ServerEndpoint,
     scope: Scope,
     quic: bool,
     host: &str,

@@ -94,7 +94,7 @@ const listenPort: number = await Promise.resolve(1080);
         else:
             # Resolve at startup so the generated policy also exercises top-level await.
             source += f"const address{index} = (await k.lookup('{server}'))[0];\n"
-            config = f"{{server: k.ip_target(address{index}, {port})"
+            config = f"{{server: k.ip_endpoint(address{index}, {port})"
             if kind == "shadowsocks2022":
                 config += f", password: '{KEY}'"
             if kind == "naive":
@@ -106,9 +106,9 @@ const listenPort: number = await Promise.resolve(1080);
             )
             config += "}"
         source += (
-            f"const d{index} = await k.dialer({{carrier: {previous}, "
-            "outbound: {resolve_handler: resolver, "
-            f"implementation: k.{kind}_outbound({config})}}}});\n"
+            f"const d{index} = await k.outbound({{via: {previous}, "
+            "resolve_server: resolver, "
+            f"protocol: k.{kind}_outbound({config})}});\n"
         )
         previous = f"d{index}"
 
@@ -118,8 +118,8 @@ const listenPort: number = await Promise.resolve(1080);
     elif inbound == "naive" and naive is not None:
         extra = f", ...naive, private_key: {json.dumps(naive['private_key'])}"
     source += f"""const routing = async flow => {{
-    {"if (flow.dest.port === 9002) return k.reject();" if rewrite else ""}
-    const target = await destination(flow.dest);
+    {"if (flow.destination.port === 9002) return k.reject();" if rewrite else ""}
+    const target = await destination(flow.destination);
     return flow.protocol === 'udp'
         ? k.route_udp({previous}) : k.route({previous}, target);
 }};
@@ -127,7 +127,7 @@ await k.inbound({{
     implementation: k.{inbound}_inbound({{
         listen: {{address: k.ip('0.0.0.0'), port: listenPort}}{extra}
     }}),
-    routing_handler: routing, udp_idle_timeout: k.timeout(30000)
+    route: routing, udp_idle_timeout: k.timeout(30000)
 }});
 """
     # The TypeScript suite changes the TCP destination. UDP cannot rewrite targets.
@@ -136,7 +136,7 @@ export async function destination(target: {ip: ReturnType<typeof k.ip>, port: nu
     if (target.port === 9003) throw new Error('e2e handler failure');
     const port: number = REWRITE ? 9001 : target.port;
     const address = REWRITE ? (await k.lookup('echo'))[0] : target.ip;
-    return await Promise.resolve(k.ip_target(address, port));
+    return await Promise.resolve(k.ip_endpoint(address, port));
 }
 """.replace("REWRITE", "true" if rewrite else "false")
     return source, routing

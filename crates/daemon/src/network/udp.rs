@@ -17,9 +17,9 @@ impl Drop for Entry {
 }
 
 struct Completion {
-    target: Target,
+    target: Endpoint,
     generation: u64,
-    sender: mpsc::UnboundedSender<(Target, u64)>,
+    sender: mpsc::UnboundedSender<(Endpoint, u64)>,
 }
 
 impl Drop for Completion {
@@ -42,11 +42,11 @@ pub(super) fn association(
             let incoming = packets.take_receiver();
             let worker = packets.worker.take();
             let activity = packets.session_activity.take();
-            let flow = Flow {
+            let flow = SessionInfo {
                 inbound: handler.inbound,
                 source,
                 protocol: TransportProtocol::Udp,
-                dest: target,
+                destination: target,
                 sniff: None,
             };
 
@@ -73,7 +73,7 @@ async fn route_packets(
     source: SocketAddr,
     mut packets: Datagram,
 ) -> Result<()> {
-    let mut sessions = HashMap::<Target, Entry>::new();
+    let mut sessions = HashMap::<Endpoint, Entry>::new();
     let (completed, mut completions) = mpsc::unbounded_channel();
     let mut generation = 0u64;
     let mut session_limit_drops = 0u64;
@@ -136,11 +136,11 @@ async fn route_packets(
                             generation,
                             sender: completed.clone(),
                         };
-                        let flow = Flow {
+                        let flow = SessionInfo {
                             inbound: handler.inbound,
                             source,
                             protocol: TransportProtocol::Udp,
-                            dest: target.clone(),
+                            destination: target.clone(),
                             sniff: None,
                         };
                         let control = scope.clone();
@@ -178,7 +178,7 @@ async fn route_packets(
 
 async fn session(
     handler: SessionHandler,
-    mut flow: Flow,
+    mut flow: SessionInfo,
     mut incoming: kotoconn_protocol::queue::Receiver<Packet>,
     replies: kotoconn_protocol::queue::Sender<Packet>,
     scope: Scope,
@@ -188,7 +188,7 @@ async fn session(
     debug_assert_eq!(flow.protocol, TransportProtocol::Udp);
     debug_assert!(flow.sniff.is_none());
 
-    let destination = flow.dest.clone();
+    let destination = flow.destination.clone();
     let source = flow.source;
     let (lifetime, activity) = match shared_activity {
         Some(activity) => (None, activity),
@@ -217,14 +217,14 @@ async fn session(
 
         let decision = handler.policy.route(&handler.routing, flow).await?;
 
-        let dialer = match decision {
-            RouteDecision::Udp { dialer } => dialer,
+        let outbound = match decision {
+            RouteDecision::ForwardUdp { outbound } => outbound,
             // Rejection is a policy outcome, not a session failure.
             RouteDecision::Reject => {
                 tracing::debug!("UDP session rejected");
                 return Ok(());
             }
-            RouteDecision::Dns { handler: dns } => {
+            RouteDecision::Dns { answer: dns } => {
                 tracing::debug!("UDP session answered by a DNS handler");
                 let responder = Arc::new(handler.responder(dns));
                 let mut batch = Vec::with_capacity(32);
@@ -258,12 +258,12 @@ async fn session(
                 return Ok(());
             }
             // SAFETY: Policy::route rejects TCP decisions for UDP flows.
-            RouteDecision::Route { .. } => unreachable!("TCP decision for a UDP flow"),
+            RouteDecision::ForwardTcp { .. } => unreachable!("TCP decision for a UDP flow"),
         };
 
-        tracing::debug!(dialer_id = dialer.0.get(), "UDP route selected");
+        tracing::debug!(outbound_id = outbound.0.get(), "UDP route selected");
 
-        let client = handler.dialer(dialer)?;
+        let client = handler.outbound(outbound)?;
 
         client
             .control(TransportProtocol::Udp)

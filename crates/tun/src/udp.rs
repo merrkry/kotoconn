@@ -1,4 +1,4 @@
-use crate::{packet::Flow, storage::PacketArena};
+use crate::{packet::FlowKey, storage::PacketArena};
 use bytes::Bytes;
 use smoltcp::{phy::ChecksumCapabilities, wire::*};
 use std::{
@@ -228,7 +228,7 @@ fn copy_fragment(header: &[u8; 8], payload: &[u8], offset: usize, out: &mut [u8]
     }
 }
 
-pub(crate) fn reply_flow(flow: Flow, source: SocketAddr) -> Option<(SocketAddr, SocketAddr)> {
+pub(crate) fn reply_flow(flow: FlowKey, source: SocketAddr) -> Option<(SocketAddr, SocketAddr)> {
     // Outbound reply metadata selects the wire source. It must be usable in the
     // client's address family; a domain cannot be put into an IP header.
     (source.is_ipv4() == flow.source.is_ipv4() && crate::packet::unicast(source.ip().into()))

@@ -1,36 +1,32 @@
 import { kotoconn as k } from "@kotoconn/bindings";
 import { dns_service } from "@kotoconn/api";
 
-const proxy = await k.dialer({
-  carrier: k.host_network({}),
-  outbound: {
-    resolve_handler: (name) => k.lookup(name),
-    implementation: k.socks5_outbound({
-      server: k.ip_target(k.ip("127.0.0.1"), 1080),
-    }),
-  },
+const proxy = await k.outbound({
+  via: k.host_network({}),
+  resolve_server: (name) => k.lookup(name),
+  protocol: k.socks5_outbound({
+    server: k.ip_endpoint(k.ip("127.0.0.1"), 1080),
+  }),
 });
 
 const upstream = await dns_service({
   upstream: { protocol: "tcp", server: { address: k.ip("1.1.1.1"), port: 53 } },
-  dialer: proxy,
+  outbound: proxy,
   cache: { capacity: 4096 },
 });
 
 // The service resolves this server name through `proxy`, so its connections never
 // depend on themselves.
-export const remote = await k.dialer({
-  carrier: k.host_network({}),
-  outbound: {
-    resolve_handler: upstream.resolve,
-    implementation: k.http_outbound({ server: k.domain("proxy.example.com", 8080) }),
-  },
+export const remote = await k.outbound({
+  via: k.host_network({}),
+  resolve_server: upstream.resolve,
+  protocol: k.http_outbound({ server: k.domain("proxy.example.com", 8080) }),
 });
 
 await k.dns_listener({
   listen: { address: k.ip("127.0.0.1"), port: 1053 },
   protocols: ["udp", "tcp"],
-  dns_handler: async (request) => {
+  answer: async (request) => {
     if (k.domain_suffix(request.query.name, "blocked.example")) {
       return k.drop();
     }

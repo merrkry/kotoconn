@@ -17,7 +17,7 @@ use tracing::Instrument;
 
 pub(crate) struct PolicyResolver {
     pub policy: Policy,
-    pub handler: ResolveHandler,
+    pub handler: ResolvePolicy,
 }
 
 impl Resolver for PolicyResolver {
@@ -31,7 +31,7 @@ pub(crate) struct SessionHandler {
     pub inbound: InboundId,
     pub policy: Policy,
     pub manager: Weak<Manager>,
-    pub routing: RoutingHandler,
+    pub routing: RoutePolicy,
     pub sessions: sessions::Sessions,
     pub idle: std::time::Duration,
     pub sniff: Option<SniffConfig>,
@@ -40,7 +40,7 @@ pub(crate) struct SessionHandler {
 }
 
 impl SessionHandler {
-    pub(super) fn responder(&self, handler: DnsHandler) -> kotoconn_dns::Responder {
+    pub(super) fn responder(&self, handler: DnsPolicy) -> kotoconn_dns::Responder {
         let handler = dns::Handler {
             policy: self.policy.clone(),
             handler,
@@ -48,19 +48,19 @@ impl SessionHandler {
         kotoconn_dns::Responder::new(self.inbound, Arc::new(handler))
     }
 
-    fn dialer(&self, id: DialerId) -> Result<Arc<kotoconn_outbounds::Clients>> {
+    fn outbound(&self, id: OutboundId) -> Result<Arc<kotoconn_outbounds::Outbound>> {
         self.manager
             .upgrade()
             .context("the daemon has stopped")?
-            .dialer(id)
+            .outbound(id)
     }
 }
 
-impl p::Handler for SessionHandler {
+impl p::InboundHandler for SessionHandler {
     fn tcp(
         &self,
         source: SocketAddr,
-        destination: Target,
+        destination: Endpoint,
         mut stream: BoxStream,
         scope: Scope,
     ) -> BoxFuture<'_, Result<()>> {
@@ -94,23 +94,23 @@ impl p::Handler for SessionHandler {
                             .policy
                             .route(
                                 &self.routing,
-                                Flow {
+                                SessionInfo {
                                     inbound: self.inbound,
                                     source,
                                     protocol: TransportProtocol::Tcp,
-                                    dest: destination,
+                                    destination,
                                     sniff,
                                 },
                             )
                             .await?;
-                        let (dialer, target) = match decision {
-                            RouteDecision::Route { dialer, target } => (dialer, target),
+                        let (outbound, target) = match decision {
+                            RouteDecision::ForwardTcp { outbound, to } => (outbound, to),
                             // Rejection is a policy outcome, not a session failure.
                             RouteDecision::Reject => {
                                 tracing::debug!("TCP session rejected");
                                 return Ok(());
                             }
-                            RouteDecision::Dns { handler } => {
+                            RouteDecision::Dns { answer: handler } => {
                                 tracing::debug!("TCP session answered by a DNS handler");
                                 let responder = self.responder(handler);
                                 return kotoconn_dns::serve_stream(
@@ -122,13 +122,17 @@ impl p::Handler for SessionHandler {
                                 .await;
                             }
                             // SAFETY: Policy::route rejects UDP decisions for TCP flows.
-                            RouteDecision::Udp { .. } => {
+                            RouteDecision::ForwardUdp { .. } => {
                                 unreachable!("UDP decision for a TCP flow")
                             }
                         };
-                        tracing::debug!(dialer_id = dialer.0.get(), ?target, "TCP route selected");
+                        tracing::debug!(
+                            outbound_id = outbound.0.get(),
+                            ?target,
+                            "TCP route selected"
+                        );
 
-                        let client = self.dialer(dialer)?;
+                        let client = self.outbound(outbound)?;
                         let control = client.control(TransportProtocol::Tcp);
 
                         control

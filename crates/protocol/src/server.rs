@@ -1,16 +1,16 @@
-use crate::{BoxStream, Datagram, Scope, Target};
+use crate::{BoxStream, Datagram, Endpoint, Scope};
 use anyhow::Result;
 use futures_util::future::BoxFuture;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
-pub trait Handler: Send + Sync {
+pub trait InboundHandler: Send + Sync {
     /// Source is the accepted transport peer, or the original packet source for TUN.
     fn tcp(
         &self,
         source: SocketAddr,
-        destination: Target,
+        destination: Endpoint,
         stream: BoxStream,
         scope: Scope,
     ) -> BoxFuture<'_, Result<()>>;
@@ -22,7 +22,7 @@ pub trait Handler: Send + Sync {
 
 #[derive(Clone)]
 pub struct ServerContext {
-    pub handler: Arc<dyn Handler>,
+    pub handler: Arc<dyn InboundHandler>,
     pub scope: Scope,
     pub stopping: CancellationToken,
     pub udp_idle_timeout: Duration,

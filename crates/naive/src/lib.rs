@@ -15,7 +15,7 @@ pub use server::Server;
 
 use anyhow::{Result, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use kotoconn_protocol::{Target, target};
+use kotoconn_protocol::{Endpoint, target};
 use std::net::SocketAddr;
 
 fn authorization(username: &str, password: &str) -> Result<String> {
@@ -31,10 +31,10 @@ fn authorization(username: &str, password: &str) -> Result<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn authority(destination: &Target) -> Result<String> {
+fn authority(destination: &Endpoint) -> Result<String> {
     let value = match destination {
-        Target::Ip { address, port } => SocketAddr::new(*address, *port).to_string(),
-        Target::Domain { name, port } => {
+        Endpoint::Ip { address, port } => SocketAddr::new(*address, *port).to_string(),
+        Endpoint::Domain { name, port } => {
             ensure!(valid_hostname(name), "invalid Naive destination hostname");
             format!("{name}:{port}")
         }
@@ -51,7 +51,7 @@ fn valid_hostname(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || b"-._".contains(&c))
 }
 
-fn parse_authority(value: &str) -> Result<Target> {
+fn parse_authority(value: &str) -> Result<Endpoint> {
     if let Ok(address) = value.parse::<SocketAddr>() {
         ensure!(
             address.port() != 0,
@@ -69,7 +69,7 @@ fn parse_authority(value: &str) -> Result<Target> {
         .port_u16()
         .filter(|port| *port != 0)
         .ok_or_else(|| anyhow::anyhow!("Naive destination requires a nonzero port"))?;
-    Ok(Target::Domain {
+    Ok(Endpoint::Domain {
         name: value.host().into(),
         port,
     })
