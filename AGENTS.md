@@ -22,23 +22,21 @@ Do not make avoiding dependencies the primary consideration. Use well-maintained
 
 ## Documentation
 
-`docs/adr` records design decisions and their reasons, not how the code implements them. An ADR may describe a decided design before it is implemented. Keep the ADRs a current set of decisions rather than a change log: when a decision changes, rewrite, merge or remove the affected ADRs instead of adding ones that supersede them.
+Write documentation sparingly. Every document must meet both conditions.
 
-Docs should hold what the code cannot say, such as intent, contracts and user-facing behavior, without restating implementation details. Update the affected docs in the same change as the code. When docs and code disagree and the intended behavior is unclear, ask the user which one to change.
+- Its content remains valid as the implementation evolves.
+- It explains high-level intent and trade-offs that the code cannot convey.
 
-## Code Style
-
-Leave one blank line between top-level items, including type, trait, implementation, and function definitions. Keep related imports and module declarations grouped.
-
-Use blank lines to show the phases of longer functions. Separate setup, validation, core work, and cleanup into readable blocks, and expand dense one-line branches when the control flow is easier to scan that way. Avoid long uninterrupted runs of executable statements.
-
-When reviewing or editing code, scan for consecutive non-empty lines and add a blank line wherever the next statement starts a distinct logical step.
+Use [RFCs](docs/rfc/README.md) for fundamental design decisions and
+[protocol notes](docs/protocols/README.md) for deliberate interoperability choices.
 
 ## Version control
 
 Use scoped commits by crate name or aspect, e.g. `config: split outbound mod` `ci: allow workflow_dispatch`.
 
-Before editing `external/smoltcp`, follow the [stable fork branch workflow](external/README.md#smoltcp-development-branch). Keep its development checkout attached to the persistent branch.
+Forked dependencies live at `external/<repo>` as Git submodules. Use the
+[maintain-submodule-fork skill](.agents/skills/maintain-submodule-fork/SKILL.md)
+before changing a fork or its pin.
 
 ## Verification
 
