@@ -2,7 +2,7 @@ use anyhow::{Result, bail, ensure};
 use anytls::core::{CHECK_MARK, Command, Frame, HEADER_OVERHEAD_SIZE, PaddingFactory};
 use bytes::{Buf, Bytes, BytesMut};
 use fast_socks5::util::target_addr::{TargetAddr, read_address};
-use kotoconn_protocol::Target;
+use kotoconn_protocol::Endpoint;
 use sha2::{Digest, Sha256};
 use std::{io, net::SocketAddr};
 use subtle::ConstantTimeEq;
@@ -51,10 +51,10 @@ pub(crate) async fn send_authentication(
     Ok(())
 }
 
-pub(crate) fn address(target: &Target) -> Result<Vec<u8>> {
+pub(crate) fn address(target: &Endpoint) -> Result<Vec<u8>> {
     let address = match target {
-        Target::Ip { address, port } => TargetAddr::Ip(SocketAddr::new(*address, *port)),
-        Target::Domain { name, port } => {
+        Endpoint::Ip { address, port } => TargetAddr::Ip(SocketAddr::new(*address, *port)),
+        Endpoint::Domain { name, port } => {
             ensure!(!name.is_empty(), "empty destination domain");
             TargetAddr::Domain(name.clone(), *port)
         }
@@ -62,7 +62,7 @@ pub(crate) fn address(target: &Target) -> Result<Vec<u8>> {
     Ok(address.to_be_bytes()?)
 }
 
-pub(crate) async fn read_target(io: &mut (impl AsyncRead + Unpin)) -> Result<Target> {
+pub(crate) async fn read_target(io: &mut (impl AsyncRead + Unpin)) -> Result<Endpoint> {
     let family = io.read_u8().await?;
     read_target_family(io, family).await
 }
@@ -70,12 +70,12 @@ pub(crate) async fn read_target(io: &mut (impl AsyncRead + Unpin)) -> Result<Tar
 pub(crate) async fn read_target_family(
     io: &mut (impl AsyncRead + Unpin),
     family: u8,
-) -> Result<Target> {
+) -> Result<Endpoint> {
     Ok(match read_address(io, family).await? {
         TargetAddr::Ip(socket) => kotoconn_protocol::target(socket),
         TargetAddr::Domain(name, port) => {
             ensure!(!name.is_empty(), "empty destination domain");
-            Target::Domain { name, port }
+            Endpoint::Domain { name, port }
         }
     })
 }

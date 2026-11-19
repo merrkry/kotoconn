@@ -53,7 +53,7 @@ impl System {
         Ok(())
     }
 
-    async fn udp_socket(&self, target: &Target) -> Result<UdpSocket> {
+    async fn udp_socket(&self, target: &Endpoint) -> Result<UdpSocket> {
         let peer = socket_addr(target)?;
         let socket = UdpSocket::bind(if peer.is_ipv4() {
             "0.0.0.0:0"
@@ -70,7 +70,7 @@ impl System {
     }
 }
 
-impl Carrier for System {
+impl Connector for System {
     fn capabilities(&self) -> Capabilities {
         Capabilities::BOTH
     }
@@ -79,7 +79,7 @@ impl Carrier for System {
         &self.scope
     }
 
-    fn tcp_scoped(&self, target: Target, caller: Scope) -> BoxFuture<'_, Result<BoxStream>> {
+    fn tcp_scoped(&self, target: Endpoint, caller: Scope) -> BoxFuture<'_, Result<BoxStream>> {
         Box::pin(async move {
             let address = socket_addr(&target)?;
             let socket = if address.is_ipv4() {
@@ -99,7 +99,7 @@ impl Carrier for System {
         })
     }
 
-    fn udp_scoped(&self, target: Target, caller: Scope) -> BoxFuture<'_, Result<Datagram>> {
+    fn udp_scoped(&self, target: Endpoint, caller: Scope) -> BoxFuture<'_, Result<Datagram>> {
         Box::pin(async move {
             let socket = self.udp_socket(&target).await?;
             crate::native_udp::start(socket, target, self.scope.child().tracked_by(&caller))
@@ -108,7 +108,7 @@ impl Carrier for System {
 
     fn udp_native_scoped(
         &self,
-        target: Target,
+        target: Endpoint,
         caller: Scope,
     ) -> BoxFuture<'_, Result<Option<NativeDatagram>>> {
         Box::pin(async move {

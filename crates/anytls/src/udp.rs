@@ -1,28 +1,28 @@
 use crate::wire;
 use anyhow::{Result, bail, ensure};
-use kotoconn_protocol::{BoxStream, Datagram, Packet, Scope, Target, packet_pair};
+use kotoconn_protocol::{BoxStream, Datagram, Endpoint, Packet, Scope, packet_pair};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const SENTINEL: &str = "sp.v2.udp-over-tcp.arpa";
 
-pub(crate) fn sentinel() -> Target {
-    Target::Domain {
+pub(crate) fn sentinel() -> Endpoint {
+    Endpoint::Domain {
         name: SENTINEL.into(),
         port: 0,
     }
 }
 
-pub(crate) fn is_sentinel(target: &Target) -> bool {
-    matches!(target, Target::Domain { name, .. } if name == SENTINEL)
+pub(crate) fn is_sentinel(target: &Endpoint) -> bool {
+    matches!(target, Endpoint::Domain { name, .. } if name == SENTINEL)
 }
 
-pub(crate) fn request(destination: &Target) -> Result<Vec<u8>> {
+pub(crate) fn request(destination: &Endpoint) -> Result<Vec<u8>> {
     let mut request = vec![1];
     request.extend(wire::address(destination)?);
     Ok(request)
 }
 
-pub(crate) async fn read_request(stream: &mut BoxStream) -> Result<Option<Target>> {
+pub(crate) async fn read_request(stream: &mut BoxStream) -> Result<Option<Endpoint>> {
     let mode = stream.read_u8().await?;
     ensure!(mode <= 1, "invalid UoT mode");
     let destination = wire::read_target(stream).await?;
@@ -31,7 +31,7 @@ pub(crate) async fn read_request(stream: &mut BoxStream) -> Result<Option<Target
 
 pub(crate) fn start(
     stream: BoxStream,
-    destination: Option<Target>,
+    destination: Option<Endpoint>,
     scope: Scope,
 ) -> Result<Datagram> {
     let (mut user, driver) = packet_pair(scope.clone());
@@ -70,7 +70,7 @@ pub(crate) fn start(
 
 async fn read_packet(
     reader: &mut (impl AsyncRead + Unpin),
-    connected: Option<&Target>,
+    connected: Option<&Endpoint>,
 ) -> Result<Packet> {
     let target = if let Some(destination) = connected {
         destination.clone()

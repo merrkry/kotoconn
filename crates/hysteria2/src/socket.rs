@@ -1,6 +1,6 @@
 use blake2::{Blake2b, Digest, digest::consts::U32};
 use bytes::Bytes;
-use kotoconn_protocol::{Datagram, Packet, Target, from_server, queue};
+use kotoconn_protocol::{Datagram, Endpoint, Packet, from_server, queue};
 use quinn::{
     AsyncUdpSocket, UdpPoller,
     udp::{RecvMeta, Transmit},
@@ -19,18 +19,18 @@ use std::{
 /// Quinn remains responsible for congestion feedback and reliable retransmission.
 pub struct CarrierSocket {
     transport: Mutex<Datagram>,
-    server: Target,
+    server: Endpoint,
     peer: SocketAddr,
 }
 
 impl CarrierSocket {
-    pub fn new(transport: Datagram, server: Target) -> Self {
+    pub fn new(transport: Datagram, server: Endpoint) -> Self {
         let peer = match &server {
-            Target::Ip { address, port } => SocketAddr::new(*address, *port),
+            Endpoint::Ip { address, port } => SocketAddr::new(*address, *port),
             // Quinn identifies its peer by socket address only. A domain server
             // stays a domain for the carrier; Quinn sees a reserved stand-in
             // (RFC 5737) that never leaves this socket.
-            Target::Domain { port, .. } => {
+            Endpoint::Domain { port, .. } => {
                 SocketAddr::new(std::net::Ipv4Addr::new(192, 0, 2, 1).into(), *port)
             }
         };
@@ -129,7 +129,7 @@ impl AsyncUdpSocket for CarrierSocket {
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
-        // Carrier does not expose its native bind address. Quinn uses this virtual
+        // Connector does not expose its native bind address. Quinn uses this virtual
         // address only for address-family selection; packets retain the real peer.
         Ok(SocketAddr::new(
             if self.peer.is_ipv4() {

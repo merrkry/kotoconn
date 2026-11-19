@@ -32,20 +32,20 @@ impl Recorder {
         self.ended.lock().unwrap().get(&id).copied()
     }
 
-    /// The resolve handler of the first dialer.
-    pub fn resolve_handler(&self) -> ResolveHandler {
+    /// The resolve handler of the first outbound.
+    pub fn resolve_server(&self) -> ResolvePolicy {
         self.created()
             .into_iter()
             .find_map(|(_, config)| match config {
-                ResourceConfig::Dialer(dialer) => Some(dialer.outbound.resolve_handler),
+                ResourceConfig::Outbound(outbound) => Some(outbound.resolve_server),
                 _ => None,
             })
-            .expect("a dialer was created")
+            .expect("an outbound was created")
     }
 
-    /// The result of later probes through `dialer`; probes fail without one.
-    pub fn set_probe(&self, dialer: ResourceId, result: Result<ProbeResult, String>) {
-        self.probes.lock().unwrap().insert(dialer, result);
+    /// The result of later probes through `outbound`; probes fail without one.
+    pub fn set_probe(&self, outbound: ResourceId, result: Result<ProbeResult, String>) {
+        self.probes.lock().unwrap().insert(outbound, result);
     }
 
     /// Forget recorded configurations, dropping their handler references.
@@ -58,11 +58,11 @@ impl Resources for Recorder {
     /// Rejects references to resources that were never created or have ended.
     fn create(&self, config: ResourceConfig) -> NativeFuture<Result<ResourceId, String>> {
         let referenced = match &config {
-            ResourceConfig::Dialer(DialerConfig {
-                carrier: CarrierConfig::Dialer(id),
+            ResourceConfig::Outbound(OutboundConfig {
+                via: OutboundVia::Outbound(id),
                 ..
             }) => Some(ResourceId::from(*id)),
-            ResourceConfig::DnsService(service) => Some(service.dialer.into()),
+            ResourceConfig::DnsService(service) => Some(service.outbound.into()),
             _ => None,
         };
         let open = |id| {
@@ -101,12 +101,12 @@ impl Resources for Recorder {
         Box::pin(async {})
     }
 
-    fn probe(&self, dialer: DialerId, _: Probe) -> NativeFuture<Result<ProbeResult, String>> {
+    fn probe(&self, outbound: OutboundId, _: Probe) -> NativeFuture<Result<ProbeResult, String>> {
         let result = self
             .probes
             .lock()
             .unwrap()
-            .get(&dialer.into())
+            .get(&outbound.into())
             .cloned()
             .unwrap_or_else(|| Err("no probe result".to_owned()));
         Box::pin(async move { result })
@@ -142,11 +142,9 @@ pub async fn load(source: &str) -> (Script, Arc<Recorder>) {
         .unwrap()
 }
 
-/// Registers `handler` as the resolve handler of a dialer, so tests can call it.
+/// Registers `handler` as the resolve handler of an outbound, so tests can call it.
 pub fn with_resolver(handler: &str) -> String {
     format!(
-        "await k.dialer({{carrier: k.host_network({{}}), outbound: {{
-            resolve_handler: {handler}, implementation: k.direct_outbound({{}})
-        }}}});"
+        "await k.outbound({{via: k.host_network({{}}), resolve_server: {handler}, protocol: k.direct_outbound({{}})}});"
     )
 }

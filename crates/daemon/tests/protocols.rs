@@ -1,7 +1,7 @@
 use anyhow::Result;
 use kotoconn_config::*;
 use kotoconn_daemon::Daemon;
-use kotoconn_outbounds::{Clients, System, SystemResolver};
+use kotoconn_outbounds::{Outbound, System, SystemResolver};
 use kotoconn_protocol::*;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{
@@ -21,18 +21,18 @@ fn hysteria_certificate() -> &'static rcgen::CertifiedKey<rcgen::KeyPair> {
     &CERTIFICATE
 }
 
-fn outbound(kind: &str, server: Target) -> OutboundImpl {
+fn outbound(kind: &str, server: Endpoint) -> OutboundProtocol {
     match kind {
-        "hysteria2" => OutboundImpl::Hysteria2(Hysteria2OutboundConfig {
+        "hysteria2" => OutboundProtocol::Hysteria2(Hysteria2OutboundConfig {
             server,
             password: KEY.into(),
             server_name: Some("localhost".into()),
             ca_certificate: Some(hysteria_certificate().cert.pem()),
             obfs_password: Some("salamander-test".into()),
         }),
-        "http" => OutboundImpl::Http(HttpOutboundConfig { server }),
-        "socks5" => OutboundImpl::Socks5(Socks5OutboundConfig { server }),
-        "shadowsocks2022" => OutboundImpl::Shadowsocks2022(Shadowsocks2022OutboundConfig {
+        "http" => OutboundProtocol::Http(HttpOutboundConfig { server }),
+        "socks5" => OutboundProtocol::Socks5(Socks5OutboundConfig { server }),
+        "shadowsocks2022" => OutboundProtocol::Shadowsocks2022(Shadowsocks2022OutboundConfig {
             server,
             password: KEY.into(),
         }),
@@ -49,16 +49,16 @@ async fn daemon_with_idle(idle: u32) -> Result<Daemon> {
         r#"
         import {{ kotoconn as k }} from '@kotoconn/bindings';
         const resolver = name => k.lookup(name);
-        const direct = await k.dialer({{ carrier: k.host_network({{}}), outbound: {{ resolve_handler: resolver, implementation: k.direct_outbound({{}}) }} }});
+        const direct = await k.outbound({{ via: k.host_network({{}}), resolve_server: resolver, protocol: k.direct_outbound({{}}) }});
         const inbounds = [];
         const routing = flow => {{
             if (!inbounds.some(inbound => flow.inbound.equals(inbound))) throw Error('unknown inbound');
             if (!flow.source.address.is_loopback() || flow.source.port === 0) throw Error('missing source');
-            return flow.protocol === 'udp' ? k.route_udp(direct) : k.route(direct, flow.dest);
+            return flow.protocol === 'udp' ? k.route_udp(direct) : k.route(direct, flow.destination);
         }};
         const listen = {{ address: k.ip('127.0.0.1'), port: 0 }};
         for (const implementation of [k.http_inbound({{listen}}), k.socks5_inbound({{listen}}), k.shadowsocks2022_inbound({{listen, password: '{KEY}'}}), k.hysteria2_inbound({{listen, password: '{KEY}', certificate: {certificate:?}, private_key: {private_key:?}, obfs_password: 'salamander-test'}})]) {{
-            inbounds.push(await k.inbound({{ implementation, routing_handler: routing, udp_idle_timeout: k.timeout({idle}) }}));
+            inbounds.push(await k.inbound({{ implementation, route: routing, udp_idle_timeout: k.timeout({idle}) }}));
         }}
     "#,
         certificate = hysteria_certificate().cert.pem(),
@@ -72,7 +72,7 @@ async fn daemon_with_idle(idle: u32) -> Result<Daemon> {
     .await?)
 }
 
-fn address(daemon: &Daemon, kind: &str) -> Target {
+fn address(daemon: &Daemon, kind: &str) -> Endpoint {
     let id = daemon
         .resources()
         .into_iter()
@@ -94,7 +94,7 @@ fn address(daemon: &Daemon, kind: &str) -> Target {
     target(daemon.listen_addresses()[&id])
 }
 
-async fn echoes(scope: &Scope) -> Result<(Target, Target)> {
+async fn echoes(scope: &Scope) -> Result<(Endpoint, Endpoint)> {
     let tcp = TcpListener::bind("127.0.0.1:0").await?;
     let udp = UdpSocket::bind("127.0.0.1:0").await?;
     let addresses = (target(tcp.local_addr()?), target(udp.local_addr()?));
@@ -121,7 +121,7 @@ async fn echoes(scope: &Scope) -> Result<(Target, Target)> {
     Ok(addresses)
 }
 
-async fn tcp_roundtrip(client: &dyn Carrier, target: Target) -> Result<()> {
+async fn tcp_roundtrip(client: &dyn Connector, target: Endpoint) -> Result<()> {
     let mut stream = client.tcp(target).await?;
     let mut greeting = [0; 5];
     stream.read_exact(&mut greeting).await?;
@@ -142,7 +142,7 @@ async fn tcp_roundtrip(client: &dyn Carrier, target: Target) -> Result<()> {
     Ok(())
 }
 
-async fn udp_roundtrip(client: &dyn Carrier, target: Target) -> Result<()> {
+async fn udp_roundtrip(client: &dyn Connector, target: Endpoint) -> Result<()> {
     let mut connection = client.udp(target.clone()).await?;
     for payload in [vec![], vec![42], (0..8192).map(|n| n as u8).collect()] {
         connection
@@ -165,11 +165,11 @@ async fn protocols_and_nested_carriers_preserve_tcp_and_udp() -> Result<()> {
         let daemon = daemon().await?;
         let scope = Scope::new();
         let (tcp, udp) = echoes(&scope).await?;
-        let system: Arc<dyn Carrier> =
+        let system: Arc<dyn Connector> =
             Arc::new(System::new(scope.clone(), Default::default()).unwrap());
 
         for kind in ["http", "socks5", "shadowsocks2022", "hysteria2"] {
-            let client = Clients::new(
+            let client = Outbound::new(
                 outbound(kind, address(&daemon, kind)),
                 system.clone(),
                 Arc::new(SystemResolver),
@@ -183,19 +183,19 @@ async fn protocols_and_nested_carriers_preserve_tcp_and_udp() -> Result<()> {
         }
 
         // SOCKS over Shadowsocks uses one carrier for both control and data.
-        let ss: Arc<dyn Carrier> = Arc::new(Clients::new(
+        let ss: Arc<dyn Connector> = Arc::new(Outbound::new(
             outbound("shadowsocks2022", address(&daemon, "shadowsocks2022")),
             system.clone(),
             Arc::new(SystemResolver),
         )?);
-        let socks: Arc<dyn Carrier> = Arc::new(Clients::new(
+        let socks: Arc<dyn Connector> = Arc::new(Outbound::new(
             outbound("socks5", address(&daemon, "socks5")),
             ss,
             Arc::new(SystemResolver),
         )?);
         tcp_roundtrip(socks.as_ref(), tcp.clone()).await?;
         udp_roundtrip(socks.as_ref(), udp.clone()).await?;
-        let http = Clients::new(
+        let http = Outbound::new(
             outbound("http", address(&daemon, "http")),
             socks,
             Arc::new(SystemResolver),
@@ -203,17 +203,17 @@ async fn protocols_and_nested_carriers_preserve_tcp_and_udp() -> Result<()> {
         tcp_roundtrip(&http, tcp.clone()).await?;
 
         // QUIC travels through SOCKS UDP carried by Shadowsocks.
-        let lower = Arc::new(Clients::new(
+        let lower = Arc::new(Outbound::new(
             outbound("shadowsocks2022", address(&daemon, "shadowsocks2022")),
             system.clone(),
             Arc::new(SystemResolver),
         )?);
-        let lower = Arc::new(Clients::new(
+        let lower = Arc::new(Outbound::new(
             outbound("socks5", address(&daemon, "socks5")),
             lower,
             Arc::new(SystemResolver),
         )?);
-        let hysteria = Clients::new(
+        let hysteria = Outbound::new(
             outbound("hysteria2", address(&daemon, "hysteria2")),
             lower,
             Arc::new(SystemResolver),
@@ -278,13 +278,13 @@ async fn inbound_handshake_deadlines_leave_admitted_sessions_open() -> Result<()
         let daemon = daemon().await?;
         let scope = Scope::new();
         let (tcp, udp) = echoes(&scope).await?;
-        let system: Arc<dyn Carrier> = Arc::new(System::new(scope.clone(), Default::default())?);
+        let system: Arc<dyn Connector> = Arc::new(System::new(scope.clone(), Default::default())?);
 
         let kinds = ["http", "socks5", "shadowsocks2022"];
         let mut admitted = Vec::new();
         let mut association = None;
         for kind in kinds {
-            let client = Clients::new(
+            let client = Outbound::new(
                 outbound(kind, address(&daemon, kind)),
                 system.clone(),
                 Arc::new(SystemResolver),
@@ -355,7 +355,7 @@ async fn sessions_split_by_destination_and_close_without_killing_association() -
             let scope = Scope::new();
             let (_, a) = echoes(&scope).await?;
             let (_, b) = echoes(&scope).await?;
-            let client = Clients::new(
+            let client = Outbound::new(
                 outbound(kind, address(&daemon, kind)),
                 Arc::new(System::new(scope.clone(), Default::default()).unwrap()),
                 Arc::new(SystemResolver),
@@ -428,12 +428,12 @@ async fn lower_tcp_close_ends_socks_udp_control_but_not_sibling_udp() -> Result<
         let daemon = daemon().await?;
         let scope = Scope::new();
         let (_, target) = echoes(&scope).await?;
-        let lower = Arc::new(Clients::new(
+        let lower = Arc::new(Outbound::new(
             outbound("shadowsocks2022", address(&daemon, "shadowsocks2022")),
             Arc::new(System::new(scope.clone(), Default::default()).unwrap()),
             Arc::new(SystemResolver),
         )?);
-        let socks = Clients::new(
+        let socks = Outbound::new(
             outbound("socks5", address(&daemon, "socks5")),
             lower.clone(),
             Arc::new(SystemResolver),
@@ -535,12 +535,12 @@ async fn shadowsocks_udp_rejects_tampering_and_replay_before_routing() -> Result
 async fn capability_checks_and_udp_policy_contract_reject_invalid_requests() -> Result<()> {
     tokio::time::timeout(LIMIT, async {
         let scope = Scope::new();
-        let http: Arc<dyn Carrier> = Arc::new(Clients::new(
+        let http: Arc<dyn Connector> = Arc::new(Outbound::new(
             outbound("http", target("127.0.0.1:1".parse()?)),
             Arc::new(System::new(scope.clone(), Default::default()).unwrap()),
             Arc::new(SystemResolver),
         )?);
-        let socks = Clients::new(
+        let socks = Outbound::new(
             outbound("socks5", target("127.0.0.1:1".parse()?)),
             http,
             Arc::new(SystemResolver),
@@ -558,10 +558,10 @@ async fn capability_checks_and_udp_policy_contract_reject_invalid_requests() -> 
         let source = r#"
             import { kotoconn as k } from '@kotoconn/bindings';
             const resolver = name => k.lookup(name);
-            const d = await k.dialer({carrier: k.host_network({}), outbound: {resolve_handler: resolver, implementation: k.direct_outbound({})}});
+            const d = await k.outbound({via: k.host_network({}), resolve_server: resolver, protocol: k.direct_outbound({})});
             await k.inbound({
                 implementation: k.http_inbound({listen: {address: k.ip('127.0.0.1'), port: 0}}),
-                routing_handler: flow => k.route(d, flow.dest), udp_idle_timeout: k.timeout(1000),
+                route: flow => k.route(d, flow.destination), udp_idle_timeout: k.timeout(1000),
             });
         "#;
         let daemon = Daemon::start_with_sources(
@@ -574,7 +574,7 @@ async fn capability_checks_and_udp_policy_contract_reject_invalid_requests() -> 
             .resources()
             .into_iter()
             .find_map(|(id, config)| match config {
-                ResourceConfig::Inbound(inbound) => Some((InboundId(id.0), inbound.routing_handler)),
+                ResourceConfig::Inbound(inbound) => Some((InboundId(id.0), inbound.route)),
                 _ => None,
             })
             .unwrap();
@@ -582,12 +582,12 @@ async fn capability_checks_and_udp_policy_contract_reject_invalid_requests() -> 
             .policy()
             .route(
                 &handler,
-                Flow {
+                SessionInfo {
                     inbound,
                     source: "127.0.0.1:12345".parse()?,
                     protocol: TransportProtocol::Udp,
                     sniff: None,
-                    dest: target("127.0.0.1:2".parse()?),
+                    destination: target("127.0.0.1:2".parse()?),
                 },
             )
             .await
@@ -622,11 +622,11 @@ async fn configured_resolver_only_receives_outbound_server_names() -> Result<()>
         }
 
         let (tx, mut names) = tokio::sync::mpsc::unbounded_channel();
-        let endpoint = Target::Domain {
+        let endpoint = Endpoint::Domain {
             name: "proxy.test".into(),
             port: address(&daemon, "socks5").port(),
         };
-        let client = Clients::new(
+        let client = Outbound::new(
             outbound("socks5", endpoint),
             Arc::new(System::new(scope.clone(), Default::default()).unwrap()),
             Arc::new(Recording(tx)),
@@ -657,24 +657,22 @@ async fn routing_metadata_identifies_inbound_and_tcp_udp_sources() -> Result<()>
         let source = format!(r#"
             import {{ kotoconn as k }} from '@kotoconn/bindings';
             const resolve = () => [];
-            const direct = await k.dialer({{ carrier: k.host_network({{}}), outbound: {{
-                resolve_handler: resolve, implementation: k.direct_outbound({{}})
-            }} }});
+            const direct = await k.outbound({{ via: k.host_network({{}}), resolve_server: resolve, protocol: k.direct_outbound({{}}) }});
             const routing = flow => {{
                 if (!flow.inbound.equals(inbound) || flow.inbound.equals(other)) throw Error('wrong inbound');
                 const port = flow.protocol === 'tcp' ? {tcp_port} : {udp_port};
                 if (!flow.source.address.equals(k.ip('127.0.0.1')) || flow.source.port !== port) {{
                     throw Error('wrong source endpoint');
                 }}
-                return flow.protocol === 'udp' ? k.route_udp(direct) : k.route(direct, flow.dest);
+                return flow.protocol === 'udp' ? k.route_udp(direct) : k.route(direct, flow.destination);
             }};
             const listen = {{ address: k.ip('127.0.0.1'), port: 0 }};
             const inbound = await k.inbound({{
-                implementation: k.socks5_inbound({{ listen }}), routing_handler: routing,
+                implementation: k.socks5_inbound({{ listen }}), route: routing,
                 udp_idle_timeout: k.timeout(10000)
             }});
             const other = await k.inbound({{
-                implementation: k.http_inbound({{ listen }}), routing_handler: routing,
+                implementation: k.http_inbound({{ listen }}), route: routing,
                 udp_idle_timeout: k.timeout(10000)
             }});
         "#);
@@ -774,7 +772,7 @@ async fn shutdown_deadline_reports_forced_network_cleanup() -> Result<()> {
         let daemon = daemon().await?;
         let scope = Scope::new();
         let (echo, _) = echoes(&scope).await?;
-        let client = Clients::new(
+        let client = Outbound::new(
             outbound("http", address(&daemon, "http")),
             Arc::new(System::new(scope.clone(), Default::default()).unwrap()),
             Arc::new(SystemResolver),
@@ -803,7 +801,7 @@ async fn hysteria_shared_connection_keeps_siblings_alive_and_retires_when_unused
         lower: System,
         calls: Arc<AtomicUsize>,
     }
-    impl Carrier for CountUdp {
+    impl Connector for CountUdp {
         fn capabilities(&self) -> Capabilities {
             Capabilities::BOTH
         }
@@ -812,14 +810,14 @@ async fn hysteria_shared_connection_keeps_siblings_alive_and_retires_when_unused
         }
         fn tcp_scoped(
             &self,
-            target: Target,
+            target: Endpoint,
             scope: Scope,
         ) -> futures_util::future::BoxFuture<'_, Result<BoxStream>> {
             self.lower.tcp_scoped(target, scope)
         }
         fn udp_scoped(
             &self,
-            target: Target,
+            target: Endpoint,
             scope: Scope,
         ) -> futures_util::future::BoxFuture<'_, Result<Datagram>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -832,7 +830,7 @@ async fn hysteria_shared_connection_keeps_siblings_alive_and_retires_when_unused
         let (tcp, udp) = echoes(&scope).await?;
         let client_scope = Scope::new();
         let calls = Arc::new(AtomicUsize::new(0));
-        let client = Clients::new(
+        let client = Outbound::new(
             outbound("hysteria2", address(&daemon, "hysteria2")),
             Arc::new(CountUdp {
                 lower: System::new(client_scope.clone(), Default::default()).unwrap(),
@@ -885,14 +883,14 @@ async fn hysteria_rejects_bad_credentials_certificates_and_tcp_only_carriers() -
         let daemon = daemon().await?;
         let scope = Scope::new();
         let server = address(&daemon, "hysteria2");
-        let OutboundImpl::Hysteria2(options) = outbound("hysteria2", server.clone()) else {
+        let OutboundProtocol::Hysteria2(options) = outbound("hysteria2", server.clone()) else {
             unreachable!()
         };
-        let endpoint = Endpoint {
+        let endpoint = ServerEndpoint {
             address: server.clone(),
             resolver: Arc::new(SystemResolver),
         };
-        let system: Arc<dyn Carrier> =
+        let system: Arc<dyn Connector> =
             Arc::new(System::new(scope.clone(), Default::default()).unwrap());
         for failure in ["password", "name", "ca"] {
             let mut options = options.clone();
@@ -908,14 +906,14 @@ async fn hysteria_rejects_bad_credentials_certificates_and_tcp_only_carriers() -
                 &options,
             )?;
             assert!(
-                Client::tcp(&client, target("127.0.0.1:9".parse()?), scope.child())
+                OutboundAdapter::tcp(&client, target("127.0.0.1:9".parse()?), scope.child())
                     .await
                     .is_err(),
                 "{failure}"
             );
             drop(client);
         }
-        let http: Arc<dyn Carrier> = Arc::new(Clients::new(
+        let http: Arc<dyn Connector> = Arc::new(Outbound::new(
             outbound("http", server),
             system,
             Arc::new(SystemResolver),
@@ -936,7 +934,7 @@ async fn hysteria_cancelled_setup_releases_the_carrier_without_an_idle_deadline(
         scope: Scope,
         started: tokio::sync::mpsc::Sender<()>,
     }
-    impl Carrier for PendingCarrier {
+    impl Connector for PendingCarrier {
         fn capabilities(&self) -> Capabilities {
             Capabilities::BOTH
         }
@@ -945,14 +943,14 @@ async fn hysteria_cancelled_setup_releases_the_carrier_without_an_idle_deadline(
         }
         fn tcp_scoped(
             &self,
-            _: Target,
+            _: Endpoint,
             _: Scope,
         ) -> futures_util::future::BoxFuture<'_, Result<BoxStream>> {
             Box::pin(async { anyhow::bail!("unexpected TCP carrier request") })
         }
         fn udp_scoped(
             &self,
-            _: Target,
+            _: Endpoint,
             _: Scope,
         ) -> futures_util::future::BoxFuture<'_, Result<Datagram>> {
             Box::pin(async move {
@@ -965,11 +963,11 @@ async fn hysteria_cancelled_setup_releases_the_carrier_without_an_idle_deadline(
         let root = Scope::new();
         let (started, mut ready) = tokio::sync::mpsc::channel(1);
         let server = target("127.0.0.1:1".parse()?);
-        let OutboundImpl::Hysteria2(options) = outbound("hysteria2", server.clone()) else {
+        let OutboundProtocol::Hysteria2(options) = outbound("hysteria2", server.clone()) else {
             unreachable!()
         };
         let client = Arc::new(kotoconn_outbounds::hysteria2::Client::new(
-            Endpoint {
+            ServerEndpoint {
                 address: server.clone(),
                 resolver: Arc::new(SystemResolver),
             },
@@ -982,10 +980,9 @@ async fn hysteria_cancelled_setup_releases_the_carrier_without_an_idle_deadline(
         let caller = Scope::new();
         let task_client = client.clone();
         let task_scope = caller.clone();
-        let task =
-            tokio::spawn(
-                async move { Client::tcp(task_client.as_ref(), server, task_scope).await },
-            );
+        let task = tokio::spawn(async move {
+            OutboundAdapter::tcp(task_client.as_ref(), server, task_scope).await
+        });
         ready.recv().await.unwrap();
         caller.close();
         assert!(task.await?.is_err());

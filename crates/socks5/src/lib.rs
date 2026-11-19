@@ -5,21 +5,21 @@ mod server;
 use anyhow::{Result, ensure};
 pub use client::Client;
 use fast_socks5::util::target_addr::TargetAddr;
-use kotoconn_protocol::{Packet, Target, target};
+use kotoconn_protocol::{Endpoint, Packet, target};
 pub use server::Server;
 use std::net::SocketAddr;
 
-fn address(value: Target) -> TargetAddr {
+fn address(value: Endpoint) -> TargetAddr {
     match value {
-        Target::Ip { address, port } => TargetAddr::Ip(SocketAddr::new(address, port)),
-        Target::Domain { name, port } => TargetAddr::Domain(name, port),
+        Endpoint::Ip { address, port } => TargetAddr::Ip(SocketAddr::new(address, port)),
+        Endpoint::Domain { name, port } => TargetAddr::Domain(name, port),
     }
 }
 
-fn from_address(value: TargetAddr) -> Target {
+fn from_address(value: TargetAddr) -> Endpoint {
     match value {
         TargetAddr::Ip(value) => target(value),
-        TargetAddr::Domain(name, port) => Target::Domain { name, port },
+        TargetAddr::Domain(name, port) => Endpoint::Domain { name, port },
     }
 }
 

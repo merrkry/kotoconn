@@ -19,11 +19,11 @@ use std::{
 use tokio_util::sync::CancellationToken;
 use ts_rs::TS;
 
-pub(crate) type RoutingHandler<'js> = Handler<'js, Flow, Decision>;
+pub(crate) type RoutePolicy<'js> = Handler<'js, SessionInfo, Decision>;
 
-pub(crate) type ResolveHandler<'js> = Handler<'js, String, Vec<IpAddr>>;
+pub(crate) type ResolvePolicy<'js> = Handler<'js, String, Vec<IpAddr>>;
 
-pub(crate) type DnsHandler<'js> = Handler<'js, Request, DnsResult>;
+pub(crate) type DnsPolicy<'js> = Handler<'js, Request, DnsResult>;
 
 #[derive(rquickjs::JsLifetime)]
 #[rquickjs::class]
@@ -258,33 +258,33 @@ api! {
             Ok(Duration::from_millis(milliseconds.0.into()).into())
         }
 
-        fn domain(self, name: String, port: Port) -> Target {
-            Ok(config::Target::Domain { name, port: port.0 }.into())
+        fn domain(self, name: String, port: Port) -> Endpoint {
+            Ok(config::Endpoint::Domain { name, port: port.0 }.into())
         }
 
-        fn ip_target(self, address: IpAddr, port: Port) -> Target {
-            Ok(config::Target::Ip {
+        fn ip_endpoint(self, address: IpAddr, port: Port) -> Endpoint {
+            Ok(config::Endpoint::Ip {
                 address: address.value,
                 port: port.0,
             }
             .into())
         }
 
-        fn route(self, dialer: Dialer, target: Target) -> Decision {
-            Ok(config::RouteDecision::Route {
-                dialer: dialer.value,
-                target: target.value,
+        fn route(self, outbound: Outbound, to: Endpoint) -> Decision {
+            Ok(config::RouteDecision::ForwardTcp {
+                outbound: outbound.value,
+                to: to.value,
             }
             .into())
         }
 
-        fn route_udp(self, dialer: Dialer) -> Decision {
-            Ok(config::RouteDecision::Udp { dialer: dialer.value }.into())
+        fn route_udp(self, outbound: Outbound) -> Decision {
+            Ok(config::RouteDecision::ForwardUdp { outbound: outbound.value }.into())
         }
 
-        fn route_dns(self, handler: DnsHandler<'js>) -> Decision {
+        fn route_dns(self, answer: DnsPolicy<'js>) -> Decision {
             Ok(config::RouteDecision::Dns {
-                handler: self.register(handler.function)?,
+                answer: self.register(answer.function)?,
             }
             .into())
         }
@@ -305,8 +305,8 @@ api! {
             Ok(config::InboundImpl::Hysteria2(options.into()).into())
         }
 
-        fn hysteria2_outbound(self, options: Hysteria2OutboundConfig) -> OutboundImpl {
-            Ok(config::OutboundImpl::Hysteria2(options.into()).into())
+        fn hysteria2_outbound(self, options: Hysteria2OutboundConfig) -> OutboundProtocol {
+            Ok(config::OutboundProtocol::Hysteria2(options.into()).into())
         }
 
         fn http_inbound(self, options: HttpInboundConfig) -> InboundImpl {
@@ -317,8 +317,8 @@ api! {
             Ok(config::InboundImpl::AnyTls(options.into()).into())
         }
 
-        fn anytls_outbound(self, options: AnyTlsOutboundConfig) -> OutboundImpl {
-            Ok(config::OutboundImpl::AnyTls(options.into()).into())
+        fn anytls_outbound(self, options: AnyTlsOutboundConfig) -> OutboundProtocol {
+            Ok(config::OutboundProtocol::AnyTls(options.into()).into())
         }
 
         fn socks5_inbound(self, options: Socks5InboundConfig) -> InboundImpl {
@@ -329,20 +329,20 @@ api! {
             Ok(config::InboundImpl::Shadowsocks2022(options.into()).into())
         }
 
-        fn http_outbound(self, options: HttpOutboundConfig) -> OutboundImpl {
-            Ok(config::OutboundImpl::Http(options.into()).into())
+        fn http_outbound(self, options: HttpOutboundConfig) -> OutboundProtocol {
+            Ok(config::OutboundProtocol::Http(options.into()).into())
         }
 
         fn naive_inbound(self, options: NaiveInboundConfig) -> InboundImpl {
             Ok(config::InboundImpl::Naive(options.into()).into())
         }
 
-        fn naive_outbound(self, options: NaiveOutboundConfig) -> OutboundImpl {
-            Ok(config::OutboundImpl::Naive(options.into()).into())
+        fn naive_outbound(self, options: NaiveOutboundConfig) -> OutboundProtocol {
+            Ok(config::OutboundProtocol::Naive(options.into()).into())
         }
 
-        fn shadowsocks2022_outbound(self, options: Shadowsocks2022OutboundConfig) -> OutboundImpl {
-            Ok(config::OutboundImpl::Shadowsocks2022(options.into()).into())
+        fn shadowsocks2022_outbound(self, options: Shadowsocks2022OutboundConfig) -> OutboundProtocol {
+            Ok(config::OutboundProtocol::Shadowsocks2022(options.into()).into())
         }
 
         fn direct_inbound(self, options: DirectInboundConfig) -> InboundImpl {
@@ -353,12 +353,12 @@ api! {
             Ok(config::InboundImpl::Tun(options.into()).into())
         }
 
-        fn direct_outbound(self, options: DirectOutboundConfig) -> OutboundImpl {
-            Ok(config::OutboundImpl::Direct(options.into()).into())
+        fn direct_outbound(self, options: DirectOutboundConfig) -> OutboundProtocol {
+            Ok(config::OutboundProtocol::Direct(options.into()).into())
         }
 
-        fn socks5_outbound(self, options: Socks5OutboundConfig) -> OutboundImpl {
-            Ok(config::OutboundImpl::Socks5(options.into()).into())
+        fn socks5_outbound(self, options: Socks5OutboundConfig) -> OutboundProtocol {
+            Ok(config::OutboundProtocol::Socks5(options.into()).into())
         }
 
         fn host_network(self, options: HostNetworkConfig) -> HostNetwork {
@@ -383,9 +383,9 @@ api! {
             response.value.to_vec().map(Bytes).map_err(|e| invalid(e.to_string()))
         }
 
-        fn dialer(self, options: DialerConfig<'js>) -> Started<'js, Dialer> {
-            let config = config::ResourceConfig::Dialer(options.register(self)?);
-            Ok(self.create(config, |id| config::DialerId(id.0).into()))
+        fn outbound(self, options: OutboundConfig<'js>) -> Started<'js, Outbound> {
+            let config = config::ResourceConfig::Outbound(options.register(self)?);
+            Ok(self.create(config, |id| config::OutboundId(id.0).into()))
         }
 
         fn inbound(self, options: InboundConfig<'js>) -> Started<'js, Inbound> {
@@ -427,14 +427,14 @@ api! {
             Ok(response.into())
         }
 
-        fn probe(self, dialer: Dialer, options: ProbeOptions) -> ProbeResult {
+        fn probe(self, outbound: Outbound, options: ProbeOptions) -> ProbeResult {
             let probe = config::Probe {
                 target: options.target.value,
                 request: options.request.map(|request| request.0).unwrap_or_default(),
                 length: options.length.map_or(1, |length| usize::from(length.0)),
                 timeout: options.timeout.value,
             };
-            let result = crate::task::run(self.resources.probe(dialer.value, probe))
+            let result = crate::task::run(self.resources.probe(outbound.value, probe))
                 .await?
                 .map_err(invalid)?;
 

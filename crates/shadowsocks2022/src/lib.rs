@@ -6,7 +6,7 @@ mod tcp;
 
 use anyhow::Result;
 pub use client::Client;
-use kotoconn_protocol::{Target, target};
+use kotoconn_protocol::{Endpoint, target};
 pub use server::Server;
 use shadowsocks::{
     ServerConfig,
@@ -37,17 +37,17 @@ impl Crypto {
     }
 }
 
-fn address(value: Target) -> Address {
+fn address(value: Endpoint) -> Address {
     match value {
-        Target::Ip { address, port } => Address::SocketAddress(SocketAddr::new(address, port)),
-        Target::Domain { name, port } => Address::DomainNameAddress(name, port),
+        Endpoint::Ip { address, port } => Address::SocketAddress(SocketAddr::new(address, port)),
+        Endpoint::Domain { name, port } => Address::DomainNameAddress(name, port),
     }
 }
 
-fn from_address(value: Address) -> Target {
+fn from_address(value: Address) -> Endpoint {
     match value {
         Address::SocketAddress(value) => target(value),
-        Address::DomainNameAddress(name, port) => Target::Domain { name, port },
+        Address::DomainNameAddress(name, port) => Endpoint::Domain { name, port },
     }
 }
 

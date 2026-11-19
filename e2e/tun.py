@@ -140,7 +140,7 @@ def lifecycle(args: argparse.Namespace):
     path.write_text(
         path.read_text() + "\nawait k.inbound({implementation: k.tun_inbound({"
         "name: 'ktest0', mtu: 1500, addresses: []}), "
-        "routing_handler: routing, udp_idle_timeout: k.timeout(30000)});\n"
+        "route: routing, udp_idle_timeout: k.timeout(30000)});\n"
     )
     result = subprocess.run(
         [str(args.binary), "run", "--config", str(path)],

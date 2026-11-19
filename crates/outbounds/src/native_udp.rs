@@ -20,7 +20,7 @@ thread_local! {
 
 struct Native {
     socket: UdpSocket,
-    target: Target,
+    target: Endpoint,
     pool: Pool,
     batch: usize,
     #[cfg(target_os = "linux")]
@@ -29,7 +29,7 @@ struct Native {
 
 pub(super) fn open(
     socket: UdpSocket,
-    target: Target,
+    target: Endpoint,
     scope: Scope,
 ) -> anyhow::Result<NativeDatagram> {
     #[cfg(target_os = "linux")]
@@ -50,7 +50,7 @@ pub(super) fn open(
     Ok(NativeDatagram { io, scope })
 }
 
-pub(super) fn start(socket: UdpSocket, target: Target, scope: Scope) -> anyhow::Result<Datagram> {
+pub(super) fn start(socket: UdpSocket, target: Endpoint, scope: Scope) -> anyhow::Result<Datagram> {
     let native = open(socket, target, scope.clone())?;
     let (mut user, driver) = packet_pair(scope.clone());
     let requests = user.offer_handoff();

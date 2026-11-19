@@ -29,7 +29,7 @@ impl Resources for Unavailable {
 
     fn probe(
         &self,
-        _: config::DialerId,
+        _: config::OutboundId,
         _: config::Probe,
     ) -> NativeFuture<Result<config::ProbeResult, String>> {
         Box::pin(async { Err("unavailable".to_owned()) })
@@ -203,7 +203,7 @@ async fn handlers_are_released_once_their_last_reference_drops() {
                     Vec::<String>::new()
                 })
                 .unwrap();
-                let handler: config::ResolveHandler = loader::host(&ctx)
+                let handler: config::ResolvePolicy = loader::host(&ctx)
                     .unwrap()
                     .borrow()
                     .register(function)

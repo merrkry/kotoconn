@@ -1,19 +1,19 @@
-use crate::{DialerId, DnsHandler, Target};
+use crate::{DnsPolicy, Endpoint, OutboundId};
 
 #[derive(Debug, Clone, PartialEq, Eq, ts_rs::TS)]
 #[ts(rename = "Decision")]
 #[ts(type = "{ readonly __brand: unique symbol }")]
 pub enum RouteDecision {
-    Route {
-        dialer: DialerId,
-        target: Target,
+    ForwardTcp {
+        outbound: OutboundId,
+        to: Endpoint,
     },
-    Udp {
-        dialer: DialerId,
+    ForwardUdp {
+        outbound: OutboundId,
     },
-    /// Answer the flow's DNS messages with a handler instead of forwarding them.
+    /// Answer DNS messages with policy.
     Dns {
-        handler: DnsHandler,
+        answer: DnsPolicy,
     },
     Reject,
 }

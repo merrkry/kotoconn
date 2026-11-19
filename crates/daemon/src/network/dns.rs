@@ -2,7 +2,7 @@ use super::*;
 
 pub(crate) struct Handler {
     pub policy: Policy,
-    pub handler: DnsHandler,
+    pub handler: DnsPolicy,
 }
 
 impl kotoconn_dns::Handler for Handler {

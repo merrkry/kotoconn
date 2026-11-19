@@ -4,7 +4,7 @@ use cronet::{Engine, EngineParams, Header};
 use futures_util::future::BoxFuture;
 use kotoconn_config::NaiveOutboundConfig;
 use kotoconn_protocol::{
-    self as p, BoxStream, Capabilities, Carrier, Datagram, Endpoint, Scope, Target,
+    self as p, BoxStream, Capabilities, Connector, Datagram, Endpoint, Scope, ServerEndpoint,
 };
 use std::{
     net::IpAddr,
@@ -13,8 +13,8 @@ use std::{
 use tokio::sync::OnceCell;
 
 pub struct Client {
-    carrier: Arc<dyn Carrier>,
-    endpoint: Endpoint,
+    carrier: Arc<dyn Connector>,
+    endpoint: ServerEndpoint,
     pool: Scope,
     engine: OnceCell<Weak<Engine>>,
     host: String,
@@ -27,8 +27,8 @@ pub struct Client {
 impl Client {
     pub fn new(
         options: NaiveOutboundConfig,
-        endpoint: Endpoint,
-        carrier: Arc<dyn Carrier>,
+        endpoint: ServerEndpoint,
+        carrier: Arc<dyn Connector>,
         pool: Scope,
     ) -> Result<Self> {
         ensure!(
@@ -38,8 +38,8 @@ impl Client {
         let host = options
             .server_name
             .unwrap_or_else(|| match &options.server {
-                Target::Ip { address, .. } => address.to_string(),
-                Target::Domain { name, .. } => name.clone(),
+                Endpoint::Ip { address, .. } => address.to_string(),
+                Endpoint::Domain { name, .. } => name.clone(),
             });
         ensure!(
             valid_hostname(&host) || host.parse::<IpAddr>().is_ok(),
@@ -134,7 +134,7 @@ impl Client {
     }
 }
 
-impl p::Client for Client {
+impl p::OutboundAdapter for Client {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             tcp: self.carrier.capabilities().require(self.required()).is_ok(),
@@ -143,7 +143,7 @@ impl p::Client for Client {
         }
     }
 
-    fn tcp(&self, target: Target, scope: Scope) -> BoxFuture<'_, Result<BoxStream>> {
+    fn tcp(&self, target: Endpoint, scope: Scope) -> BoxFuture<'_, Result<BoxStream>> {
         Box::pin(async move {
             self.carrier.capabilities().require(self.required())?;
             ensure!(!self.pool.is_closed(), "Naive client closed");
@@ -177,7 +177,7 @@ impl p::Client for Client {
         })
     }
 
-    fn udp(&self, _: Target, _: Scope) -> BoxFuture<'_, Result<Datagram>> {
+    fn udp(&self, _: Endpoint, _: Scope) -> BoxFuture<'_, Result<Datagram>> {
         Box::pin(async { bail!("Naive CONNECT does not support UDP payloads") })
     }
 }

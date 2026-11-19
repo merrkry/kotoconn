@@ -1,6 +1,10 @@
-import { kotoconn as k, type Flow, type Inbound } from "../src/index.js";
+import { kotoconn as k, type SessionInfo, type Inbound } from "../src/index.js";
 
-export async function matches(flow: Flow, inbound: Inbound, domain: string): Promise<boolean> {
+export async function matches(
+  flow: SessionInfo,
+  inbound: Inbound,
+  domain: string,
+): Promise<boolean> {
   const address = flow.source.address;
   const network = k.cidr("192.168.0.0/16");
   const flags: boolean[] = [
@@ -15,25 +19,24 @@ export async function matches(flow: Flow, inbound: Inbound, domain: string): Pro
   // @ts-expect-error CIDRs accept native IP values rather than strings.
   network.contains("192.168.0.1");
 
-  const dialer = await k.dialer({
-    carrier: k.host_network({}),
-    outbound: {
-      resolve_handler: () => [],
-      implementation: k.direct_outbound({}),
-    },
+  const outbound = await k.outbound({
+    via: k.host_network({}),
+    resolve_server: () => [],
+    protocol: k.direct_outbound({}),
   });
 
-  const pending = k.dialer({
-    carrier: dialer,
-    outbound: { resolve_handler: () => [], implementation: k.direct_outbound({}) },
+  const pending = k.outbound({
+    via: outbound,
+    resolve_server: () => [],
+    protocol: k.direct_outbound({}),
   });
   // @ts-expect-error Creation resolves to a reference instead of returning one.
-  k.route(pending, flow.dest);
-  dialer.drain({ timeout: k.timeout(1000) });
-  await dialer.wait();
+  k.route(pending, flow.destination);
+  outbound.drain({ timeout: k.timeout(1000) });
+  await outbound.wait();
 
-  // @ts-expect-error Inbound references are distinct from dialer references.
-  flow.inbound.equals(dialer);
+  // @ts-expect-error Inbound references are distinct from outbound references.
+  flow.inbound.equals(outbound);
 
   // @ts-expect-error Native references cannot be manufactured from an ID.
   const fake: Inbound = 1;

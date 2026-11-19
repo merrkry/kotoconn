@@ -6,12 +6,12 @@ use ts_rs::TS;
 
 #[duplicate::duplicate_item(
     Wrapper Native TypeScript;
-    [Dialer] [config::DialerId] [ts(as = "config::DialerId")];
+    [Outbound] [config::OutboundId] [ts(as = "config::OutboundId")];
     [Inbound] [config::InboundId] [ts(as = "config::InboundId")];
     [DnsServiceRef] [config::DnsServiceId] [ts(as = "config::DnsServiceId")];
     [Timeout] [std::time::Duration] [ts(type = "{ readonly __brand: unique symbol }")];
     [InboundImpl] [config::InboundImpl] [ts(as = "config::InboundImpl")];
-    [OutboundImpl] [config::OutboundImpl] [ts(as = "config::OutboundImpl")];
+    [OutboundProtocol] [config::OutboundProtocol] [ts(as = "config::OutboundProtocol")];
     [HostNetwork] [config::HostNetworkConfig] [ts(type = "{ readonly __brand: unique symbol }")];
     [Decision] [config::RouteDecision] [ts(as = "config::RouteDecision")];
     [DnsResult] [config::DnsHandlerResult] [ts(as = "config::DnsHandlerResult")];
@@ -116,14 +116,14 @@ impl Cidr {
     Clone, rquickjs::class::Trace, rquickjs::JsLifetime, derive_more::From, derive_more::Into, TS,
 )]
 #[rquickjs::class]
-#[ts(as = "config::Target")]
-pub(crate) struct Target {
+#[ts(as = "config::Endpoint")]
+pub(crate) struct Endpoint {
     #[qjs(skip_trace)]
-    pub value: config::Target,
+    pub value: config::Endpoint,
 }
 
 #[rquickjs::methods]
-impl Target {
+impl Endpoint {
     #[qjs(get)]
     pub fn port(&self) -> u16 {
         self.value.port()
@@ -132,16 +132,16 @@ impl Target {
     #[qjs(get)]
     pub fn domain(&self) -> Option<String> {
         match &self.value {
-            config::Target::Domain { name, .. } => Some(name.clone()),
-            config::Target::Ip { .. } => None,
+            config::Endpoint::Domain { name, .. } => Some(name.clone()),
+            config::Endpoint::Ip { .. } => None,
         }
     }
 
     #[qjs(get)]
     pub fn ip(&self) -> Option<IpAddr> {
         match self.value {
-            config::Target::Ip { address, .. } => Some(address.into()),
-            config::Target::Domain { .. } => None,
+            config::Endpoint::Ip { address, .. } => Some(address.into()),
+            config::Endpoint::Domain { .. } => None,
         }
     }
 }
@@ -213,11 +213,11 @@ pub(crate) struct DrainOptions {
     pub timeout: Timeout,
 }
 
-/// A health check through a dialer: connect to `target`, send `request` and read
+/// A health check through an outbound: connect to `target`, send `request` and read
 /// `length` response bytes, 1 unless given. Latency is measured at the first byte.
 #[derive(rquickjs::FromJs, TS)]
 pub(crate) struct ProbeOptions {
-    pub target: Target,
+    pub target: Endpoint,
     #[ts(optional)]
     pub request: Option<Bytes>,
     #[ts(optional)]
@@ -232,7 +232,7 @@ pub(crate) struct ProbeResult {
     pub response: Bytes,
 }
 
-#[duplicate::duplicate_item(Kind; [Dialer]; [Inbound]; [DnsServiceRef];)]
+#[duplicate::duplicate_item(Kind; [Outbound]; [Inbound]; [DnsServiceRef];)]
 #[rquickjs::methods]
 impl Kind {
     pub fn equals(&self, other: Self) -> bool {
@@ -303,10 +303,10 @@ mod tests {
             ctx.globals().set("same", IpAddr::from(ipv4)).unwrap();
             ctx.globals().set("ipv6", IpAddr::from(ipv6)).unwrap();
 
-            ctx.globals().set("domain", Target::from(config::Target::Domain {
+            ctx.globals().set("domain", Endpoint::from(config::Endpoint::Domain {
                 name: "test.invalid".into(), port: 443,
             })).unwrap();
-            ctx.globals().set("target", Target::from(config::Target::Ip {
+            ctx.globals().set("target", Endpoint::from(config::Endpoint::Ip {
                 address: ipv6, port: 53,
             })).unwrap();
 

@@ -3,7 +3,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use kotoconn_config::{Hysteria2InboundConfig, Hysteria2OutboundConfig};
-use kotoconn_protocol::{self as p, BoundServer, Scope, Server as _, ServerContext, Target};
+use kotoconn_protocol::{self as p, BoundServer, Endpoint, Scope, Server as _, ServerContext};
 use std::{
     sync::{
         Arc,
@@ -15,11 +15,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct Handler(Arc<AtomicUsize>);
 
-impl p::Handler for Handler {
+impl p::InboundHandler for Handler {
     fn tcp(
         &self,
         _: std::net::SocketAddr,
-        _: Target,
+        _: Endpoint,
         mut stream: p::BoxStream,
         _: Scope,
     ) -> BoxFuture<'_, Result<()>> {

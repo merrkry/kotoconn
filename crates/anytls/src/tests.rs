@@ -33,14 +33,14 @@ struct Network {
     connections: AtomicUsize,
 }
 
-impl Carrier for Network {
+impl Connector for Network {
     fn capabilities(&self) -> Capabilities {
         Capabilities::TCP
     }
     fn scope(&self) -> &Scope {
         &self.scope
     }
-    fn tcp_scoped(&self, target: Target, scope: Scope) -> BoxFuture<'_, Result<BoxStream>> {
+    fn tcp_scoped(&self, target: Endpoint, scope: Scope) -> BoxFuture<'_, Result<BoxStream>> {
         self.connections.fetch_add(1, Ordering::Relaxed);
         Box::pin(async move {
             stream_task(scope, async move {
@@ -50,7 +50,7 @@ impl Carrier for Network {
             })
         })
     }
-    fn udp_scoped(&self, _: Target, _: Scope) -> BoxFuture<'_, Result<Datagram>> {
+    fn udp_scoped(&self, _: Endpoint, _: Scope) -> BoxFuture<'_, Result<Datagram>> {
         Box::pin(async { bail!("test carrier has no UDP") })
     }
 }
@@ -64,13 +64,13 @@ impl Resolver for Network {
     }
 }
 
-struct Echo(mpsc::UnboundedSender<Target>);
+struct Echo(mpsc::UnboundedSender<Endpoint>);
 
-impl Handler for Echo {
+impl InboundHandler for Echo {
     fn tcp(
         &self,
         _: std::net::SocketAddr,
-        target: Target,
+        target: Endpoint,
         mut stream: BoxStream,
         _: Scope,
     ) -> BoxFuture<'_, Result<()>> {
@@ -103,7 +103,7 @@ struct Fixture {
     scope: Scope,
     network: Arc<Network>,
     options: AnyTlsOutboundConfig,
-    targets: mpsc::UnboundedReceiver<Target>,
+    targets: mpsc::UnboundedReceiver<Endpoint>,
     #[cfg(feature = "interop-tests")]
     private_key: String,
 }
@@ -136,7 +136,7 @@ impl Fixture {
         )
         .await?;
         let options = AnyTlsOutboundConfig {
-            server: Target::Domain {
+            server: Endpoint::Domain {
                 name: "localhost".into(),
                 port: bound.local_addr.port(),
             },
@@ -194,13 +194,14 @@ async fn server_first_tcp_reuses_sessions_and_preserves_domains() -> Result<()> 
         for destination in [
             target("127.0.0.1:1234".parse()?),
             target("[::1]:4567".parse()?),
-            Target::Domain {
+            Endpoint::Domain {
                 name: "unresolved.invalid".into(),
                 port: 80,
             },
         ] {
             let mut stream =
-                p::Client::tcp(&client, destination.clone(), fixture.scope.child()).await?;
+                p::OutboundAdapter::tcp(&client, destination.clone(), fixture.scope.child())
+                    .await?;
             let mut ready = [0; 5];
             stream.read_exact(&mut ready).await?;
             assert_eq!(&ready, b"ready");
@@ -233,7 +234,7 @@ async fn udp_over_tcp_supports_empty_and_large_datagrams() -> Result<()> {
         let mut fixture = Fixture::new(None).await?;
         let client = fixture.client()?;
         assert_eq!(
-            p::Client::capabilities(&client),
+            p::OutboundAdapter::capabilities(&client),
             Capabilities {
                 domain_targets: true,
                 ..Capabilities::BOTH
@@ -242,13 +243,14 @@ async fn udp_over_tcp_supports_empty_and_large_datagrams() -> Result<()> {
         for destination in [
             target("127.0.0.1:53".parse()?),
             target("[::1]:53".parse()?),
-            Target::Domain {
+            Endpoint::Domain {
                 name: "dns.invalid".into(),
                 port: 53,
             },
         ] {
             let mut connection =
-                p::Client::udp(&client, destination.clone(), fixture.scope.child()).await?;
+                p::OutboundAdapter::udp(&client, destination.clone(), fixture.scope.child())
+                    .await?;
             for payload in [vec![], vec![42], vec![7; 65507]] {
                 connection
                     .tx
@@ -283,7 +285,7 @@ async fn rejects_wrong_password_untrusted_certificate_and_wrong_name() -> Result
             }
             let client = Client::new(&options, fixture.network.clone(), fixture.network.clone())?;
             assert!(
-                p::Client::tcp(
+                p::OutboundAdapter::tcp(
                     &client,
                     target("127.0.0.1:80".parse()?),
                     fixture.scope.child(),
@@ -329,7 +331,8 @@ async fn uot_datagram_mode_uses_distinct_address_families() -> Result<()> {
     tokio::time::timeout(LIMIT, async {
         let mut fixture = Fixture::new(None).await?;
         let client = fixture.client()?;
-        let mut stream = p::Client::tcp(&client, udp::sentinel(), fixture.scope.child()).await?;
+        let mut stream =
+            p::OutboundAdapter::tcp(&client, udp::sentinel(), fixture.scope.child()).await?;
         let mut request = vec![0];
         request.extend(wire::address(&target("0.0.0.0:0".parse()?))?);
         stream.write_all(&request).await?;
@@ -345,7 +348,7 @@ async fn uot_datagram_mode_uses_distinct_address_families() -> Result<()> {
             ),
             (
                 vec![2, 3, b'd', b'n', b's', 0, 53],
-                Target::Domain {
+                Endpoint::Domain {
                     name: "dns".into(),
                     port: 53,
                 },
@@ -379,7 +382,7 @@ async fn cancellation_releases_a_stalled_tls_handshake() -> Result<()> {
         let client = Client::new(&options, fixture.network.clone(), fixture.network.clone())?;
         let scope = fixture.scope.child();
         {
-        let opening = p::Client::tcp(&client, target("127.0.0.1:80".parse()?), scope.clone());
+        let opening = p::OutboundAdapter::tcp(&client, target("127.0.0.1:80".parse()?), scope.clone());
         tokio::pin!(opening);
         let (accepted, _) = tokio::select! {
             result = &mut opening => panic!("handshake completed before server replied: {}", result.is_ok()),
@@ -421,7 +424,7 @@ async fn peer_fin_preserves_queued_bytes_and_closes_both_directions() -> Result<
         let fixture = Fixture::new(None).await?;
         let client = fixture.client()?;
         for _ in 0..16 {
-            let mut stream = p::Client::tcp(
+            let mut stream = p::OutboundAdapter::tcp(
                 &client,
                 target("127.0.0.1:2".parse()?),
                 fixture.scope.child(),
@@ -447,8 +450,9 @@ async fn cancellation_waits_for_release_and_leaves_other_streams_usable() -> Res
         let client = fixture.client()?;
         let cancelled = fixture.scope.child();
         let mut first =
-            p::Client::tcp(&client, target("127.0.0.1:80".parse()?), cancelled.clone()).await?;
-        let mut second = p::Client::tcp(
+            p::OutboundAdapter::tcp(&client, target("127.0.0.1:80".parse()?), cancelled.clone())
+                .await?;
+        let mut second = p::OutboundAdapter::tcp(
             &client,
             target("127.0.0.1:80".parse()?),
             fixture.scope.child(),
@@ -464,7 +468,7 @@ async fn cancellation_waits_for_release_and_leaves_other_streams_usable() -> Res
         let mut reply = [0; 11];
         second.read_exact(&mut reply).await?;
         assert_eq!(&reply, b"still alive");
-        let mut reused = p::Client::tcp(
+        let mut reused = p::OutboundAdapter::tcp(
             &client,
             target("127.0.0.1:80".parse()?),
             fixture.scope.child(),

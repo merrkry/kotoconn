@@ -1,6 +1,6 @@
 //! JS option structs. StructuralConvert checks correspondence with the config crate.
 
-use crate::host::{DnsHandler, Host, ResolveHandler, RoutingHandler};
+use crate::host::{DnsPolicy, Host, ResolvePolicy, RoutePolicy};
 use crate::native::*;
 use kotoconn_config as config;
 use rquickjs::{Ctx, FromJs, IntoJs, Result, Value};
@@ -8,13 +8,13 @@ use structural_convert::StructuralConvert;
 use ts_rs::TS;
 
 #[derive(FromJs, IntoJs, TS, StructuralConvert)]
-#[convert(from(config::Flow), into(config::Flow))]
-#[ts(as = "config::Flow")]
-pub(crate) struct Flow {
+#[convert(from(config::SessionInfo), into(config::SessionInfo))]
+#[ts(as = "config::SessionInfo")]
+pub(crate) struct SessionInfo {
     pub inbound: Inbound,
     pub source: SocketAddr,
     pub protocol: TransportProtocol,
-    pub dest: Target,
+    pub destination: Endpoint,
     pub sniff: Option<SniffResult>,
 }
 
@@ -93,40 +93,39 @@ impl<'js> IntoJs<'js> for TransportProtocol {
 }
 
 #[derive(FromJs, TS)]
-#[ts(as = "config::DialerConfig")]
-pub(crate) struct DialerConfig<'js> {
-    pub carrier: CarrierConfig,
-    pub outbound: OutboundConfig<'js>,
+#[ts(as = "config::OutboundConfig")]
+pub(crate) struct OutboundConfig<'js> {
+    pub via: OutboundVia,
+    pub resolve_server: ResolvePolicy<'js>,
+    pub protocol: OutboundProtocol,
 }
 
-impl<'js> DialerConfig<'js> {
-    pub fn register(self, host: &Host<'js>) -> Result<config::DialerConfig> {
-        Ok(config::DialerConfig {
-            carrier: self.carrier.into(),
-            outbound: config::OutboundConfig {
-                resolve_handler: host.register(self.outbound.resolve_handler.function)?,
-                implementation: self.outbound.implementation.into(),
-            },
+impl<'js> OutboundConfig<'js> {
+    pub fn register(self, host: &Host<'js>) -> Result<config::OutboundConfig> {
+        Ok(config::OutboundConfig {
+            via: self.via.into(),
+            resolve_server: host.register(self.resolve_server.function)?,
+            protocol: self.protocol.into(),
         })
     }
 }
 
 #[derive(TS, StructuralConvert)]
-#[convert(from(config::CarrierConfig), into(config::CarrierConfig))]
-#[ts(as = "config::CarrierConfig")]
-pub(crate) enum CarrierConfig {
-    Dialer(Dialer),
+#[convert(from(config::OutboundVia), into(config::OutboundVia))]
+#[ts(as = "config::OutboundVia")]
+pub(crate) enum OutboundVia {
+    Outbound(Outbound),
     Host(HostNetwork),
 }
 
-impl<'js> FromJs<'js> for CarrierConfig {
+impl<'js> FromJs<'js> for OutboundVia {
     fn from_js(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Self> {
-        if let Ok(dialer) = Dialer::from_js(ctx, value.clone()) {
-            return Ok(Self::Dialer(dialer));
+        if let Ok(outbound) = Outbound::from_js(ctx, value.clone()) {
+            return Ok(Self::Outbound(outbound));
         }
         HostNetwork::from_js(ctx, value)
             .map(Self::Host)
-            .map_err(|_| invalid("expected a dialer or host network carrier"))
+            .map_err(|_| invalid("expected an outbound or host network"))
     }
 }
 
@@ -139,16 +138,9 @@ pub(crate) struct HostNetworkConfig {
 }
 
 #[derive(FromJs, TS)]
-#[ts(as = "config::OutboundConfig")]
-pub(crate) struct OutboundConfig<'js> {
-    pub resolve_handler: ResolveHandler<'js>,
-    pub implementation: OutboundImpl,
-}
-
-#[derive(FromJs, TS)]
 #[ts(as = "config::InboundConfig")]
 pub(crate) struct InboundConfig<'js> {
-    pub routing_handler: RoutingHandler<'js>,
+    pub route: RoutePolicy<'js>,
     pub sniff: Option<SniffConfig>,
     pub udp_idle_timeout: Timeout,
     pub implementation: InboundImpl,
@@ -157,7 +149,7 @@ pub(crate) struct InboundConfig<'js> {
 impl<'js> InboundConfig<'js> {
     pub fn register(self, host: &Host<'js>) -> Result<config::InboundConfig> {
         Ok(config::InboundConfig {
-            routing_handler: host.register(self.routing_handler.function)?,
+            route: host.register(self.route.function)?,
             sniff: self.sniff.map(Into::into),
             udp_idle_timeout: self.udp_idle_timeout.into(),
             implementation: self.implementation.into(),
@@ -177,7 +169,7 @@ pub(crate) struct DnsUpstreamConfig {
 #[ts(as = "config::DnsServiceConfig")]
 pub(crate) struct DnsServiceConfig {
     pub upstream: DnsUpstreamConfig,
-    pub dialer: Dialer,
+    pub outbound: Outbound,
     pub cache_capacity: Capacity,
     pub timeout: Timeout,
 }
@@ -186,7 +178,7 @@ impl From<DnsServiceConfig> for config::DnsServiceConfig {
     fn from(value: DnsServiceConfig) -> Self {
         Self {
             upstream: value.upstream.into(),
-            dialer: value.dialer.value,
+            outbound: value.outbound.value,
             cache_capacity: value.cache_capacity.0,
             timeout: value.timeout.value,
         }
@@ -198,7 +190,7 @@ impl From<DnsServiceConfig> for config::DnsServiceConfig {
 pub(crate) struct DnsListenerConfig<'js> {
     pub listen: SocketAddr,
     pub protocols: Vec<TransportProtocol>,
-    pub dns_handler: DnsHandler<'js>,
+    pub answer: DnsPolicy<'js>,
 }
 
 impl<'js> DnsListenerConfig<'js> {
@@ -206,7 +198,7 @@ impl<'js> DnsListenerConfig<'js> {
         Ok(config::DnsListenerConfig {
             listen: self.listen.into(),
             protocols: self.protocols.into_iter().map(Into::into).collect(),
-            dns_handler: host.register(self.dns_handler.function)?,
+            answer: host.register(self.answer.function)?,
         })
     }
 }
@@ -216,7 +208,7 @@ impl<'js> DnsListenerConfig<'js> {
 #[ts(as = "config::DirectInboundConfig")]
 pub(crate) struct DirectInboundConfig {
     pub listen: SocketAddr,
-    pub target: Target,
+    pub target: Endpoint,
 }
 
 #[derive(FromJs, TS, StructuralConvert)]
@@ -245,7 +237,7 @@ pub(crate) struct DirectOutboundConfig {}
 #[convert(from(config::Socks5OutboundConfig), into(config::Socks5OutboundConfig))]
 #[ts(as = "config::Socks5OutboundConfig")]
 pub(crate) struct Socks5OutboundConfig {
-    pub server: Target,
+    pub server: Endpoint,
 }
 
 #[derive(FromJs, IntoJs, TS)]
@@ -298,7 +290,7 @@ pub(crate) struct Shadowsocks2022InboundConfig {
 #[convert(from(config::HttpOutboundConfig), into(config::HttpOutboundConfig))]
 #[ts(as = "config::HttpOutboundConfig")]
 pub(crate) struct HttpOutboundConfig {
-    pub server: Target,
+    pub server: Endpoint,
 }
 
 #[derive(FromJs, TS, StructuralConvert)]
@@ -308,7 +300,7 @@ pub(crate) struct HttpOutboundConfig {
 )]
 #[ts(as = "config::Shadowsocks2022OutboundConfig")]
 pub(crate) struct Shadowsocks2022OutboundConfig {
-    pub server: Target,
+    pub server: Endpoint,
     pub password: String,
 }
 
@@ -335,7 +327,7 @@ pub(crate) struct Hysteria2InboundConfig {
 )]
 #[ts(as = "config::Hysteria2OutboundConfig")]
 pub(crate) struct Hysteria2OutboundConfig {
-    pub server: Target,
+    pub server: Endpoint,
     pub password: String,
     /// TLS server name; defaults to the configured server's domain or IP.
     pub server_name: Option<String>,
@@ -374,7 +366,7 @@ pub(crate) struct AnyTlsInboundConfig {
 #[convert(from(config::AnyTlsOutboundConfig), into(config::AnyTlsOutboundConfig))]
 #[ts(as = "config::AnyTlsOutboundConfig")]
 pub(crate) struct AnyTlsOutboundConfig {
-    pub server: Target,
+    pub server: Endpoint,
     pub password: String,
     pub tls: TlsClientConfig,
     pub idle_session_timeout: Option<Timeout>,
@@ -384,7 +376,7 @@ pub(crate) struct AnyTlsOutboundConfig {
 #[convert(from(config::NaiveOutboundConfig), into(config::NaiveOutboundConfig))]
 #[ts(as = "config::NaiveOutboundConfig")]
 pub(crate) struct NaiveOutboundConfig {
-    pub server: Target,
+    pub server: Endpoint,
     pub username: String,
     pub password: String,
     pub server_name: Option<String>,

@@ -3,7 +3,7 @@ use bytes::Bytes;
 use futures_util::io::{AsyncRead, AsyncWrite};
 use hickory_net::runtime::iocompat::AsyncIoTokioAsStd;
 use hickory_net::runtime::{DnsTcpStream, DnsUdpSocket, RuntimeProvider, Spawn, TokioTime};
-use kotoconn_protocol::{BoxStream, Carrier, Datagram, Packet, Scope, Target};
+use kotoconn_protocol::{BoxStream, Connector, Datagram, Endpoint, Packet, Scope};
 use parking_lot::Mutex;
 use std::{
     future::Future,
@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 pub(crate) struct Runtime {
-    pub carrier: Arc<dyn Carrier>,
+    pub carrier: Arc<dyn Connector>,
     pub scope: Scope,
     pub finished: CancellationToken,
 }
@@ -74,7 +74,7 @@ impl RuntimeProvider for Runtime {
             if bind.is_some() {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "DNS dialers do not support local bind addresses",
+                    "DNS outbounds do not support local bind addresses",
                 ));
             }
 
@@ -100,7 +100,7 @@ impl RuntimeProvider for Runtime {
     ) -> Pin<Box<dyn Future<Output = io::Result<Udp>> + Send>> {
         let runtime = self.clone();
         Box::pin(async move {
-            // Source-port selection belongs to the selected dialer. Hickory's
+            // Source-port selection belongs to the selected outbound. Hickory's
             // proposed local address has no meaning for a remote proxy association.
             let datagram = runtime
                 .carrier
@@ -115,8 +115,8 @@ impl RuntimeProvider for Runtime {
     }
 }
 
-fn target(address: SocketAddr) -> Target {
-    Target::Ip {
+fn target(address: SocketAddr) -> Endpoint {
+    Endpoint::Ip {
         address: address.ip(),
         port: address.port(),
     }
@@ -206,7 +206,7 @@ impl DnsUdpSocket for Udp {
         let mut state = self.0.lock();
         let packet = ready!(state.datagram.rx.poll_recv(cx))
             .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))?;
-        let Target::Ip { address, port } = packet.target else {
+        let Endpoint::Ip { address, port } = packet.target else {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "DNS reply source must be an IP address",

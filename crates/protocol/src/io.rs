@@ -1,4 +1,4 @@
-use crate::{Activity, BoxPacketIo, PacketIo, Scope, Target, queue};
+use crate::{Activity, BoxPacketIo, Endpoint, PacketIo, Scope, queue};
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use std::pin::Pin;
@@ -16,7 +16,7 @@ pub type BoxStream = Pin<Box<dyn Stream>>;
 
 #[derive(Debug, Clone)]
 pub struct Packet {
-    pub target: Target,
+    pub target: Endpoint,
     /// Shared ownership lets ingress retain resource accounting through routing queues.
     pub payload: Bytes,
 }
@@ -28,7 +28,7 @@ pub struct Datagram {
     pub rx: queue::Receiver<Packet>,
     pub scope: Scope,
     /// A connected association has one destination, so routing can own its ingress directly.
-    pub single_target: Option<Target>,
+    pub single_target: Option<Endpoint>,
     /// Set only when the inbound owns this single-target session's idle deadline.
     /// Routing and forwarding share this record instead of creating another timer.
     pub session_activity: Option<Activity>,

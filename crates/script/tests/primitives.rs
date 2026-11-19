@@ -1,15 +1,15 @@
 #[path = "support/resources.rs"]
 mod resources;
 
-use kotoconn_config::ResolveHandler;
+use kotoconn_config::ResolvePolicy;
 use kotoconn_script::Script;
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
 
-async fn load(source: &str) -> (Script, ResolveHandler) {
+async fn load(source: &str) -> (Script, ResolvePolicy) {
     let (script, recorder) = resources::load(source).await;
-    (script, recorder.resolve_handler())
+    (script, recorder.resolve_server())
 }
 
 // Policies record events in `log`; their resolve handler fails unless `log` matches `name`.
@@ -23,14 +23,14 @@ async fn sleep_waits_for_its_timeout_and_rejects_once_shutdown_starts() {
         const log = [];
         k.sleep(k.timeout(60000)).then(() => log.push('slept'));
         k.sleep(k.timeout(3600000)).then(() => log.push('woke'), () => log.push('pending rejected'));
-        await k.dialer({{carrier: k.host_network({{}}), outbound: {{implementation: k.direct_outbound({{}}), resolve_handler: async name => {{
+        await k.outbound({{via: k.host_network({{}}), protocol: k.direct_outbound({{}}), resolve_server: async name => {{
             if (name === 'late') {{
                 await k.sleep(k.timeout(60000)).then(() => log.push('late slept'), () => log.push('late rejected'));
                 return [];
             }}
             {CHECK_LOG}
             return [];
-        }}}}}});
+        }}}});
     "#
     ))
     .await;
@@ -65,12 +65,12 @@ async fn shutdown_hooks_run_newest_first_one_at_a_time_despite_failures() {
             await k.sleep(k.timeout(0)).catch(() => log.push('sleep rejected'));
             log.push(`${{result.status}} ${{result.signal}} ${{result.stdout}} ${{result.stderr.trim()}}`);
         }});
-        await k.dialer({{carrier: k.host_network({{}}), outbound: {{implementation: k.direct_outbound({{}}), resolve_handler: name => {{
+        await k.outbound({{via: k.host_network({{}}), protocol: k.direct_outbound({{}}), resolve_server: name => {{
             if (name === 'register') k.on_shutdown(() => {{ log.push('registered later'); }});
             else if (name === 'register again') k.on_shutdown(() => {{}});
             else {CHECK_LOG}
             return [];
-        }}}}}});
+        }}}});
     "#
     ))
     .await;
@@ -112,7 +112,7 @@ async fn exec_reports_results_and_rejects_failures() {
             }}
             throw Error(`expected rejection: ${{message}}`);
         }};
-        await k.dialer({{carrier: k.host_network({{}}), outbound: {{implementation: k.direct_outbound({{}}), resolve_handler: async name => {{
+        await k.outbound({{via: k.host_network({{}}), protocol: k.direct_outbound({{}}), resolve_server: async name => {{
             if (name !== 'run') {{ {CHECK_LOG} return []; }}
 
             const empty = await k.exec(['cat']);
@@ -129,7 +129,7 @@ async fn exec_reports_results_and_rejects_failures() {
                 {{ timeout: k.timeout(200) }},
             ), 'timed out');
             return [];
-        }}}}}});
+        }}}});
     "#,
         pid_file = pid_file.to_str().unwrap(),
     ))

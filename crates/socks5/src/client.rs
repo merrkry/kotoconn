@@ -7,11 +7,11 @@ use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 
 pub struct Client {
-    pub endpoint: Endpoint,
-    pub carrier: Arc<dyn Carrier>,
+    pub endpoint: ServerEndpoint,
+    pub carrier: Arc<dyn Connector>,
 }
 
-impl p::Client for Client {
+impl p::OutboundAdapter for Client {
     fn capabilities(&self) -> Capabilities {
         let lower = self.carrier.capabilities();
         Capabilities {
@@ -21,7 +21,7 @@ impl p::Client for Client {
         }
     }
 
-    fn tcp(&self, destination: Target, scope: Scope) -> BoxFuture<'_, Result<BoxStream>> {
+    fn tcp(&self, destination: Endpoint, scope: Scope) -> BoxFuture<'_, Result<BoxStream>> {
         Box::pin(async move {
             let carrier = self.carrier.capabilities();
             carrier.require(Capabilities::TCP)?;
@@ -37,7 +37,7 @@ impl p::Client for Client {
         })
     }
 
-    fn udp(&self, _: Target, scope: Scope) -> BoxFuture<'_, Result<Datagram>> {
+    fn udp(&self, _: Endpoint, scope: Scope) -> BoxFuture<'_, Result<Datagram>> {
         Box::pin(async move {
             let carrier = self.carrier.capabilities();
             carrier.require(Capabilities::BOTH)?;
@@ -55,9 +55,9 @@ impl p::Client for Client {
                 .await?;
             // An unspecified relay address means the server's own address.
             let relay = match from_address(relay) {
-                Target::Ip { address, port } if address.is_unspecified() => match endpoint {
-                    Target::Ip { address, .. } => Target::Ip { address, port },
-                    Target::Domain { ref name, .. } => Target::Domain {
+                Endpoint::Ip { address, port } if address.is_unspecified() => match endpoint {
+                    Endpoint::Ip { address, .. } => Endpoint::Ip { address, port },
+                    Endpoint::Domain { ref name, .. } => Endpoint::Domain {
                         name: name.clone(),
                         port,
                     },

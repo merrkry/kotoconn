@@ -185,7 +185,7 @@ impl Drop for Session<'_> {
             return;
         }
         self.stream.cancel();
-        // Native callbacks run on Cronet's thread. Dialer hooks never wait for
+        // Native callbacks run on Cronet's thread. Outbound hooks never wait for
         // Tokio, so this fallback also works after the runtime has stopped.
         let mut state = self.shared.lock();
         while !state.terminal {

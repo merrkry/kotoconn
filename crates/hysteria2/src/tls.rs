@@ -27,7 +27,7 @@ pub fn transport() -> Arc<TransportConfig> {
             .try_into()
             .expect("QUIC idle timeout"),
     ));
-    // Carrier chains need not expose an IP path MTU. Use QUIC's baseline size.
+    // Connector chains need not expose an IP path MTU. Use QUIC's baseline size.
     config.mtu_discovery_config(None);
     Arc::new(config)
 }

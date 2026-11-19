@@ -6,7 +6,7 @@ use hickory_proto::{
         rdata::{A, AAAA, CNAME, SOA, TXT, opt::EdnsOption},
     },
 };
-use kotoconn_config::{ResolveHandler, ResourceConfig};
+use kotoconn_config::{ResolvePolicy, ResourceConfig};
 use kotoconn_daemon::{Daemon, Shutdown};
 use std::{
     collections::HashMap,
@@ -181,16 +181,16 @@ async fn gateway(upstream: SocketAddr) -> Result<Daemon> {
         import {{kotoconn as k}} from '@kotoconn/bindings';
         let calls = 0;
         const resolve = () => [k.ip(`192.0.2.${{calls}}`)];
-        const direct = await k.dialer({{carrier: k.host_network({{}}), outbound: {{resolve_handler: resolve, implementation: k.direct_outbound({{}})}}}});
-        await k.inbound({{implementation: k.socks5_inbound({{listen: {{address: k.ip('127.0.0.1'), port: 0}}}}), udp_idle_timeout: k.timeout(10000), routing_handler: flow => {{
+        const direct = await k.outbound({{via: k.host_network({{}}), resolve_server: resolve, protocol: k.direct_outbound({{}})}});
+        await k.inbound({{implementation: k.socks5_inbound({{listen: {{address: k.ip('127.0.0.1'), port: 0}}}}), udp_idle_timeout: k.timeout(10000), route: flow => {{
             calls++;
-            return flow.protocol === 'udp' ? k.route_udp(direct) : k.route(direct, k.ip_target(k.ip('{}'), {}));
+            return flow.protocol === 'udp' ? k.route_udp(direct) : k.route(direct, k.ip_endpoint(k.ip('{}'), {}));
         }}}});
     "#, upstream.ip(), upstream.port())).await
 }
 
 async fn gateway_calls(gateway: &Daemon) -> usize {
-    let resolver = resolve_handler(gateway);
+    let resolver = resolve_server(gateway);
     let address = gateway
         .policy()
         .resolve(&resolver, "count".into())
@@ -218,8 +218,8 @@ fn source(
             if (name === 'stats') return [k.ip(`192.0.2.${{calls}}`)];
             return k.lookup(name);
         }};
-        const proxy = await k.dialer({{carrier: k.host_network({{}}), outbound: {{resolve_handler: resolve, implementation: k.socks5_outbound({{server: k.ip_target(k.ip('{}'), {})}})}}}});
-        const service = await dns_service({{dialer: proxy, upstream: {{protocol: '{protocol}', server: {server}}}, {cache} timeout: k.timeout({timeout})}});
+        const proxy = await k.outbound({{via: k.host_network({{}}), resolve_server: resolve, protocol: k.socks5_outbound({{server: k.ip_endpoint(k.ip('{}'), {})}})}});
+        const service = await dns_service({{outbound: proxy, upstream: {{protocol: '{protocol}', server: {server}}}, {cache} timeout: k.timeout({timeout})}});
         const policy = async request => {{
             calls++;
             if (!request.inbound.equals(listener) || !request.source.address.is_loopback() || request.source.port === 0) throw Error('missing DNS context');
@@ -229,7 +229,7 @@ fn source(
             if (request.query.name === 'wrapped.example') return k.respond(await service.query(request));
             return service.handler(request);
         }};
-        const listener = await k.dns_listener({{listen: {{address: k.ip('127.0.0.1'), port: 0}}, protocols: ['udp', 'tcp'], dns_handler: policy}});
+        const listener = await k.dns_listener({{listen: {{address: k.ip('127.0.0.1'), port: 0}}, protocols: ['udp', 'tcp'], answer: policy}});
     "#,
         proxy.ip(),
         proxy.port(),
@@ -344,7 +344,7 @@ async fn policy_runs_on_cache_hits_and_tcp_upstream_uses_the_selected_proxy() ->
         "TCP connection should be reused"
     );
 
-    let resolver = resolve_handler(&daemon);
+    let resolver = resolve_server(&daemon);
     assert_eq!(
         daemon.policy().resolve(&resolver, "stats".into()).await?[0].to_string(),
         "192.0.2.6"
@@ -538,12 +538,12 @@ fn resolving_source(gateway: SocketAddr) -> String {
         import {{kotoconn as k}} from '@kotoconn/bindings';
         import {{dns_service}} from '@kotoconn/api';
         const unused = () => {{ throw Error('IP servers need no resolution'); }};
-        const proxy = await k.dialer({{carrier: k.host_network({{}}), outbound: {{resolve_handler: unused, implementation: k.socks5_outbound({{server: k.ip_target(k.ip('{}'), {})}})}}}});
-        const service = await dns_service({{dialer: proxy, upstream: {{protocol: 'tcp', server: {upstream}}}}});
+        const proxy = await k.outbound({{via: k.host_network({{}}), resolve_server: unused, protocol: k.socks5_outbound({{server: k.ip_endpoint(k.ip('{}'), {})}})}});
+        const service = await dns_service({{outbound: proxy, upstream: {{protocol: 'tcp', server: {upstream}}}}});
         const resolve = service.resolve;
-        const named = await k.dialer({{carrier: k.host_network({{}}), outbound: {{resolve_handler: resolve, implementation: k.socks5_outbound({{server: k.domain('gateway.test', {})}})}}}});
-        const by_name = await dns_service({{dialer: named, upstream: {{protocol: 'tcp', server: {upstream}}}, cache: false}});
-        await k.dns_listener({{listen: {{address: k.ip('127.0.0.1'), port: 0}}, protocols: ['udp'], dns_handler: by_name.handler}});
+        const named = await k.outbound({{via: k.host_network({{}}), resolve_server: resolve, protocol: k.socks5_outbound({{server: k.domain('gateway.test', {})}})}});
+        const by_name = await dns_service({{outbound: named, upstream: {{protocol: 'tcp', server: {upstream}}}, cache: false}});
+        await k.dns_listener({{listen: {{address: k.ip('127.0.0.1'), port: 0}}, protocols: ['udp'], answer: by_name.handler}});
     "#,
         gateway.ip(),
         gateway.port(),
@@ -571,7 +571,7 @@ async fn service_resolve_answers_resolve_handlers_and_dialer_server_names() -> R
     let mut upstream = upstream(false).await?;
     let gateway = gateway(upstream.address).await?;
     let daemon = start(resolving_source(listen(&gateway))).await?;
-    // `named` is the second dialer.
+    // `named` is the second outbound.
     let resolver = dialer_resolver(&daemon, 1);
     let resolve = |name: &str| daemon.policy().resolve(&resolver, name.into());
     let both: Vec<IpAddr> = vec!["192.0.2.1".parse()?, "2001:db8::1".parse()?];
@@ -616,7 +616,7 @@ async fn service_resolve_answers_resolve_handlers_and_dialer_server_names() -> R
     assert_eq!(
         gateway_calls(&gateway).await,
         2,
-        "one connection per dialer"
+        "one connection per outbound"
     );
 
     assert_eq!(daemon.shutdown().await?, Shutdown::Drained);
@@ -632,9 +632,9 @@ async fn shutdown_keeps_outbound_connections_for_pending_policy_calls() -> Resul
         import {{kotoconn as k}} from '@kotoconn/bindings';
         import {{dns_service}} from '@kotoconn/api';
         const unused = () => [];
-        const direct = await k.dialer({{carrier: k.host_network({{}}), outbound: {{resolve_handler: unused, implementation: k.direct_outbound({{}})}}}});
-        const service = await dns_service({{dialer: direct, upstream: {{protocol: 'tcp', server: {server}}}, timeout: k.timeout(30000)}});
-        await k.dialer({{carrier: k.host_network({{}}), outbound: {{implementation: k.direct_outbound({{}}), resolve_handler: service.resolve}}}});
+        const direct = await k.outbound({{via: k.host_network({{}}), resolve_server: unused, protocol: k.direct_outbound({{}})}});
+        const service = await dns_service({{outbound: direct, upstream: {{protocol: 'tcp', server: {server}}}, timeout: k.timeout(30000)}});
+        await k.outbound({{via: k.host_network({{}}), protocol: k.direct_outbound({{}}), resolve_server: service.resolve}});
     "#, server = ip_endpoint(address))).await?;
     let policy = daemon.policy().clone();
     let resolver = dialer_resolver(&daemon, 1);
@@ -655,17 +655,17 @@ async fn shutdown_keeps_outbound_connections_for_pending_policy_calls() -> Resul
     Ok(())
 }
 
-fn resolve_handler(daemon: &Daemon) -> ResolveHandler {
+fn resolve_server(daemon: &Daemon) -> ResolvePolicy {
     dialer_resolver(daemon, 0)
 }
 
-/// The resolve handler of the dialer at `index` in creation order.
-fn dialer_resolver(daemon: &Daemon, index: usize) -> ResolveHandler {
+/// The resolve handler of the outbound at `index` in creation order.
+fn dialer_resolver(daemon: &Daemon, index: usize) -> ResolvePolicy {
     daemon
         .resources()
         .into_iter()
         .filter_map(|(_, config)| match config {
-            ResourceConfig::Dialer(dialer) => Some(dialer.outbound.resolve_handler),
+            ResourceConfig::Outbound(outbound) => Some(outbound.resolve_server),
             _ => None,
         })
         .nth(index)
@@ -674,9 +674,9 @@ fn dialer_resolver(daemon: &Daemon, index: usize) -> ResolveHandler {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn routing_passes_dns_flows_to_a_handler_over_udp_and_tcp() -> Result<()> {
-    use kotoconn_config::{OutboundImpl, Socks5OutboundConfig};
-    use kotoconn_outbounds::{Clients, System, SystemResolver};
-    use kotoconn_protocol::{Carrier, Packet, Scope, target};
+    use kotoconn_config::{OutboundProtocol, Socks5OutboundConfig};
+    use kotoconn_outbounds::{Outbound, System, SystemResolver};
+    use kotoconn_protocol::{Connector, Packet, Scope, target};
     use std::sync::Arc;
 
     tokio::time::timeout(LIMIT, async {
@@ -687,7 +687,7 @@ async fn routing_passes_dns_flows_to_a_handler_over_udp_and_tcp() -> Result<()> 
             const inbound = await k.inbound({
                 implementation: k.socks5_inbound({listen: {address: k.ip('127.0.0.1'), port: 0}}),
                 udp_idle_timeout: k.timeout(10000),
-                routing_handler: flow => flow.dest.port === 53 ? k.route_dns(request => {
+                route: flow => flow.destination.port === 53 ? k.route_dns(request => {
                     if (!request.inbound.equals(inbound) || !request.source.address.is_loopback()) {
                         throw Error('missing request context');
                     }
@@ -701,8 +701,8 @@ async fn routing_passes_dns_flows_to_a_handler_over_udp_and_tcp() -> Result<()> 
             .into(),
         )
         .await?;
-        let client = Clients::new(
-            OutboundImpl::Socks5(Socks5OutboundConfig {
+        let client = Outbound::new(
+            OutboundProtocol::Socks5(Socks5OutboundConfig {
                 server: target(listen(&daemon)),
             }),
             Arc::new(System::new(Scope::new(), Default::default())?),

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use kotoconn_config::{Target, TlsClientConfig, TlsServerConfig};
+use kotoconn_config::{Endpoint, TlsClientConfig, TlsServerConfig};
 use kotoconn_protocol::pem;
 use rustls::{ClientConfig, RootCertStore, ServerConfig, pki_types::ServerName};
 use std::sync::Arc;
@@ -7,11 +7,11 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 pub(crate) fn client(
     options: &TlsClientConfig,
-    server: &Target,
+    server: &Endpoint,
 ) -> Result<(TlsConnector, ServerName<'static>)> {
     let name = options.server_name.clone().unwrap_or_else(|| match server {
-        Target::Ip { address, .. } => address.to_string(),
-        Target::Domain { name, .. } => name.clone(),
+        Endpoint::Ip { address, .. } => address.to_string(),
+        Endpoint::Domain { name, .. } => name.clone(),
     });
     let name = ServerName::try_from(name).context("invalid TLS server name")?;
     let mut roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());

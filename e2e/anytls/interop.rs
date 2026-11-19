@@ -43,9 +43,9 @@ async fn rust_client_interoperates_with_official_go_server() -> Result<()> {
         let client = fixture.client()?;
 
         for _ in 0..3 {
-            let mut stream = p::Client::tcp(
+            let mut stream = p::OutboundAdapter::tcp(
                 &client,
-                Target::Domain {
+                Endpoint::Domain {
                     name: "unresolved.invalid".into(),
                     port: 80,
                 },
@@ -72,7 +72,7 @@ async fn rust_client_interoperates_with_official_go_server() -> Result<()> {
 
         // Keep one stream active to force a fresh authenticated TLS session using
         // the padding scheme the Go server supplied on the previous session.
-        let mut active = p::Client::tcp(
+        let mut active = p::OutboundAdapter::tcp(
             &client,
             target("127.0.0.1:80".parse()?),
             fixture.scope.child(),
@@ -82,13 +82,14 @@ async fn rust_client_interoperates_with_official_go_server() -> Result<()> {
         for destination in [
             target("127.0.0.1:53".parse()?),
             target("[::1]:53".parse()?),
-            Target::Domain {
+            Endpoint::Domain {
                 name: "dns.invalid".into(),
                 port: 53,
             },
         ] {
             let mut packets =
-                p::Client::udp(&client, destination.clone(), fixture.scope.child()).await?;
+                p::OutboundAdapter::udp(&client, destination.clone(), fixture.scope.child())
+                    .await?;
             for payload in [vec![], vec![42], vec![7; 65507]] {
                 packets
                     .tx
@@ -103,7 +104,7 @@ async fn rust_client_interoperates_with_official_go_server() -> Result<()> {
             }
         }
         assert!(
-            p::Client::tcp(
+            p::OutboundAdapter::tcp(
                 &client,
                 target("127.0.0.1:1".parse()?),
                 fixture.scope.child()

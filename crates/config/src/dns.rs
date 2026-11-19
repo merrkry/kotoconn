@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, num::NonZeroU64, time::Duration};
 
-use crate::{DialerId, DnsHandler, InboundId, TransportProtocol};
+use crate::{DnsPolicy, InboundId, OutboundId, TransportProtocol};
 
 pub use hickory_proto::op::{DnsRequest, DnsResponse};
 
@@ -22,7 +22,7 @@ pub struct DnsUpstreamConfig {
 #[derive(Debug, Clone, PartialEq, Eq, ts_rs::TS)]
 pub struct DnsServiceConfig {
     pub upstream: DnsUpstreamConfig,
-    pub dialer: DialerId,
+    pub outbound: OutboundId,
     /// Zero disables the service's TTL cache.
     pub cache_capacity: u32,
     #[ts(type = "Timeout")]
@@ -34,8 +34,8 @@ pub struct DnsListenerConfig {
     #[ts(type = "SocketAddr")]
     pub listen: SocketAddr,
     pub protocols: Vec<TransportProtocol>,
-    #[ts(type = "DnsHandler")]
-    pub dns_handler: DnsHandler,
+    #[ts(type = "DnsPolicy")]
+    pub answer: DnsPolicy,
 }
 
 #[derive(Debug, Clone, Copy)]

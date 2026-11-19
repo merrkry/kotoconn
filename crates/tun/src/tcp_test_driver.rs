@@ -12,7 +12,7 @@ pub(crate) struct TestConnection {
 }
 
 pub(crate) fn connection(
-    flow: Flow,
+    flow: FlowKey,
     mtu: usize,
     output: queue::Sender<Transmit>,
     stopping: tokio_util::sync::CancellationToken,

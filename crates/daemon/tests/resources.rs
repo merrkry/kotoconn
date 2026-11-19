@@ -1,7 +1,7 @@
 use anyhow::Result;
 use kotoconn_config::*;
 use kotoconn_daemon::{Daemon, Shutdown};
-use kotoconn_outbounds::{Clients, System, SystemResolver};
+use kotoconn_outbounds::{Outbound, System, SystemResolver};
 use kotoconn_protocol::*;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
@@ -20,13 +20,13 @@ async fn start(source: String) -> Result<Daemon> {
     .await?)
 }
 
-/// The resolve handler of the first dialer, which the policies use as a command hook.
-fn hook(daemon: &Daemon) -> ResolveHandler {
+/// The resolve handler of the first outbound, which the policies use as a command hook.
+fn hook(daemon: &Daemon) -> ResolvePolicy {
     daemon
         .resources()
         .into_iter()
         .find_map(|(_, config)| match config {
-            ResourceConfig::Dialer(dialer) => Some(dialer.outbound.resolve_handler),
+            ResourceConfig::Outbound(outbound) => Some(outbound.resolve_server),
             _ => None,
         })
         .unwrap()
@@ -41,7 +41,7 @@ async fn command(daemon: &Daemon, name: &str) -> Result<(), kotoconn_daemon::Err
 }
 
 /// A TCP server that greets each client and closes.
-async fn greeter(scope: &Scope) -> Result<Target> {
+async fn greeter(scope: &Scope) -> Result<Endpoint> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = target(listener.local_addr()?);
     scope.spawn(async move {
@@ -55,9 +55,9 @@ async fn greeter(scope: &Scope) -> Result<Target> {
 }
 
 /// Whether a SOCKS5 inbound at `proxy` relays a connection to `destination`.
-async fn relays(proxy: SocketAddr, destination: &Target) -> Result<bool> {
-    let client = Clients::new(
-        OutboundImpl::Socks5(Socks5OutboundConfig {
+async fn relays(proxy: SocketAddr, destination: &Endpoint) -> Result<bool> {
+    let client = Outbound::new(
+        OutboundProtocol::Socks5(Socks5OutboundConfig {
             server: target(proxy),
         }),
         Arc::new(System::new(Scope::new(), Default::default())?),
@@ -92,33 +92,33 @@ async fn policy_creates_and_closes_resources_while_running() -> Result<()> {
             const hook = async name => {
                 switch (name) {
                     case 'create':
-                        carrier = await k.dialer({carrier: k.host_network({}), outbound: {resolve_handler: hook, implementation: direct}});
-                        upper = await k.dialer({carrier, outbound: {resolve_handler: hook, implementation: direct}});
+                        carrier = await k.outbound({via: k.host_network({}), resolve_server: hook, protocol: direct});
+                        upper = await k.outbound({via: carrier, resolve_server: hook, protocol: direct});
                         service = await k.dns_service({
-                            dialer: carrier, cache_capacity: 0, timeout: k.timeout(1000),
+                            outbound: carrier, cache_capacity: 0, timeout: k.timeout(1000),
                             upstream: {protocol: 'udp', server: {address: k.ip('127.0.0.1'), port: 53}},
                         });
                         inbound = await k.inbound({
                             implementation: k.socks5_inbound({listen: {address: k.ip('127.0.0.1'), port: 0}}),
-                            routing_handler: flow => k.route(upper, flow.dest),
+                            route: flow => k.route(upper, flow.destination),
                             udp_idle_timeout: k.timeout(1000),
                         });
                         break;
                     case 'close carrier': carrier.close(); break;
                     case 'close upper': upper.close(); await upper.wait(); break;
                     case 'close service': service.drain({timeout: k.timeout(60000)}); await service.wait(); break;
-                    // References to the closed dialer never reach a later one.
+                    // References to the closed outbound never reach a later one.
                     case 'replace upper':
-                        await k.dialer({carrier: k.host_network({}), outbound: {resolve_handler: hook, implementation: direct}});
+                        await k.outbound({via: k.host_network({}), resolve_server: hook, protocol: direct});
                         break;
                     case 'reuse carrier':
-                        await k.dialer({carrier, outbound: {resolve_handler: hook, implementation: direct}});
+                        await k.outbound({via: carrier, resolve_server: hook, protocol: direct});
                         break;
                     case 'drain inbound': inbound.drain({timeout: k.timeout(60000)}); await inbound.wait(); break;
                 }
                 return [];
             };
-            await k.dialer({carrier: k.host_network({}), outbound: {resolve_handler: hook, implementation: direct}});
+            await k.outbound({via: k.host_network({}), resolve_server: hook, protocol: direct});
         "#
             .into(),
         )
@@ -164,14 +164,14 @@ async fn a_dialer_drain_keeps_accepted_sessions_until_they_finish() -> Result<()
             import { kotoconn as k } from '@kotoconn/bindings';
             const direct = k.direct_outbound({});
             const hook = async name => {
-                if (name === 'drain') dialer.drain({timeout: k.timeout(60000)});
-                if (name === 'wait') await dialer.wait();
+                if (name === 'drain') outbound.drain({timeout: k.timeout(60000)});
+                if (name === 'wait') await outbound.wait();
                 return [];
             };
-            const dialer = await k.dialer({carrier: k.host_network({}), outbound: {resolve_handler: hook, implementation: direct}});
+            const outbound = await k.outbound({via: k.host_network({}), resolve_server: hook, protocol: direct});
             await k.inbound({
                 implementation: k.socks5_inbound({listen: {address: k.ip('127.0.0.1'), port: 0}}),
-                routing_handler: flow => k.route(dialer, flow.dest),
+                route: flow => k.route(outbound, flow.destination),
                 udp_idle_timeout: k.timeout(1000),
             });
         "#
@@ -180,8 +180,8 @@ async fn a_dialer_drain_keeps_accepted_sessions_until_they_finish() -> Result<()
         .await?;
         let proxy = listen_address(&daemon);
 
-        let client = Clients::new(
-            OutboundImpl::Socks5(Socks5OutboundConfig {
+        let client = Outbound::new(
+            OutboundProtocol::Socks5(Socks5OutboundConfig {
                 server: target(proxy),
             }),
             Arc::new(System::new(Scope::new(), Default::default())?),
@@ -225,12 +225,10 @@ async fn startup_failure_releases_the_resources_that_evaluation_created() -> Res
     let source = format!(
         r#"
         import {{ kotoconn as k }} from '@kotoconn/bindings';
-        const dialer = await k.dialer({{carrier: k.host_network({{}}), outbound: {{
-            resolve_handler: () => [], implementation: k.direct_outbound({{}}),
-        }}}});
+        const outbound = await k.outbound({{via: k.host_network({{}}), resolve_server: () => [], protocol: k.direct_outbound({{}}),}});
         await k.inbound({{
             implementation: k.socks5_inbound({{listen: {{address: k.ip('127.0.0.1'), port: {port}}}}}),
-            routing_handler: flow => k.route(dialer, flow.dest),
+            route: flow => k.route(outbound, flow.destination),
             udp_idle_timeout: k.timeout(1000),
         }});
         throw Error('later failure');
@@ -264,12 +262,10 @@ async fn a_dns_listener_drain_answers_accepted_queries_and_admits_no_new_ones() 
                 if (name === 'calls' && calls !== 1) throw Error(`${calls} DNS handler calls`);
                 return [];
             };
-            await k.dialer({carrier: k.host_network({}), outbound: {
-                resolve_handler: hook, implementation: k.direct_outbound({}),
-            }});
+            await k.outbound({via: k.host_network({}), resolve_server: hook, protocol: k.direct_outbound({}),});
             listener = await k.dns_listener({
                 listen: {address: k.ip('127.0.0.1'), port: 0}, protocols: ['udp'],
-                dns_handler: async request => {
+                answer: async request => {
                     calls++;
                     markEntered();
                     await gate;
@@ -329,9 +325,9 @@ async fn probes_measure_a_response_through_an_open_dialer() -> Result<()> {
         let daemon = start(format!(
             r#"
             import {{ kotoconn as k }} from '@kotoconn/bindings';
-            let dialer;
-            const target = k.ip_target(k.ip('127.0.0.1'), {port});
-            const probe = () => k.probe(dialer, {{
+            let outbound;
+            const target = k.ip_endpoint(k.ip('127.0.0.1'), {port});
+            const probe = () => k.probe(outbound, {{
                 // The server closes after four bytes, which ends the read early.
                 target, request: new Uint8Array([112, 105, 110, 103]), length: 8, timeout: k.timeout(10000),
             }});
@@ -343,14 +339,12 @@ async fn probes_measure_a_response_through_an_open_dialer() -> Result<()> {
                     }}
                 }}
                 if (name === 'closed') {{
-                    dialer.close();
+                    outbound.close();
                     await probe();
                 }}
                 return [];
             }};
-            dialer = await k.dialer({{carrier: k.host_network({{}}), outbound: {{
-                resolve_handler: hook, implementation: k.direct_outbound({{}}),
-            }}}});
+            outbound = await k.outbound({{via: k.host_network({{}}), resolve_server: hook, protocol: k.direct_outbound({{}}),}});
         "#,
             port = address.port(),
         ))
@@ -359,7 +353,7 @@ async fn probes_measure_a_response_through_an_open_dialer() -> Result<()> {
         command(&daemon, "probe").await?;
         serving.await??;
         let error = command(&daemon, "closed").await.unwrap_err();
-        assert!(error.to_string().contains("dialer is closed"), "{error}");
+        assert!(error.to_string().contains("outbound is closed"), "{error}");
         assert_eq!(daemon.shutdown().await?, Shutdown::Drained);
         Ok(())
     })

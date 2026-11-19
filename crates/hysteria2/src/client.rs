@@ -8,7 +8,8 @@ use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use kotoconn_config::Hysteria2OutboundConfig;
 use kotoconn_protocol::{
-    self as p, BoxStream, Capabilities, Carrier, CloseScope, Datagram, Endpoint, Scope, Target,
+    self as p, BoxStream, Capabilities, CloseScope, Connector, Datagram, Endpoint, Scope,
+    ServerEndpoint,
 };
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
@@ -36,8 +37,8 @@ impl Drop for Released {
 }
 
 struct Settings {
-    endpoint: Endpoint,
-    carrier: Arc<dyn Carrier>,
+    endpoint: ServerEndpoint,
+    carrier: Arc<dyn Connector>,
     tls: quinn::ClientConfig,
     server_name: String,
     password: String,
@@ -54,8 +55,8 @@ struct Session {
 
 impl Client {
     pub fn new(
-        endpoint: Endpoint,
-        carrier: Arc<dyn Carrier>,
+        endpoint: ServerEndpoint,
+        carrier: Arc<dyn Connector>,
         options: &Hysteria2OutboundConfig,
     ) -> Result<Self> {
         carrier.capabilities().require(Capabilities::UDP)?;
@@ -64,8 +65,8 @@ impl Client {
             .server_name
             .clone()
             .unwrap_or_else(|| match &endpoint.address {
-                Target::Domain { name, .. } => name.clone(),
-                Target::Ip { address, .. } => address.to_string(),
+                Endpoint::Domain { name, .. } => name.clone(),
+                Endpoint::Ip { address, .. } => address.to_string(),
             });
         rustls::pki_types::ServerName::try_from(server_name.as_str())?;
         let scope = carrier.scope().child();
@@ -126,7 +127,7 @@ impl Drop for Client {
     }
 }
 
-impl p::Client for Client {
+impl p::OutboundAdapter for Client {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             domain_targets: true,
@@ -134,7 +135,7 @@ impl p::Client for Client {
         }
     }
 
-    fn tcp(&self, target: Target, scope: Scope) -> BoxFuture<'_, Result<BoxStream>> {
+    fn tcp(&self, target: Endpoint, scope: Scope) -> BoxFuture<'_, Result<BoxStream>> {
         Box::pin(async move {
             let lease = self.session(&scope).await?;
             let session = &lease.session;
@@ -152,7 +153,7 @@ impl p::Client for Client {
         })
     }
 
-    fn udp(&self, _: Target, scope: Scope) -> BoxFuture<'_, Result<Datagram>> {
+    fn udp(&self, _: Endpoint, scope: Scope) -> BoxFuture<'_, Result<Datagram>> {
         Box::pin(async move {
             let lease = self.session(&scope).await?;
             let session = &lease.session;

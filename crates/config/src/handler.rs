@@ -9,20 +9,20 @@ pub struct Handler<K> {
     kind: PhantomData<fn() -> K>,
 }
 
-/// Selects a dialer for a flow, or rejects it.
+/// Selects an outbound for a flow, or rejects it.
 pub enum Route {}
 
-/// Resolves a dialer's server name.
+/// Resolves an outbound's server name.
 pub enum Resolve {}
 
 /// Answers a DNS request.
 pub enum Dns {}
 
-pub type RoutingHandler = Handler<Route>;
+pub type RoutePolicy = Handler<Route>;
 
-pub type ResolveHandler = Handler<Resolve>;
+pub type ResolvePolicy = Handler<Resolve>;
 
-pub type DnsHandler = Handler<Dns>;
+pub type DnsPolicy = Handler<Dns>;
 
 impl<K> Handler<K> {
     /// `registration` keeps the function registered until it drops.

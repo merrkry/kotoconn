@@ -1,4 +1,4 @@
-use kotoconn_config::{ResolveHandler, ResourceConfig};
+use kotoconn_config::{ResolvePolicy, ResourceConfig};
 use kotoconn_daemon::{Daemon, Error, Policy, Shutdown};
 use kotoconn_script::ModuleSource;
 use std::{collections::HashMap, time::Duration};
@@ -14,7 +14,7 @@ async fn pending_policy_calls_do_not_block_the_policy_that_releases_them() {
         let ready, release;
         const allEntered = new Promise(resolve => ready = resolve);
         const gate = new Promise(resolve => release = resolve);
-        await k.dialer({carrier: k.host_network({}), outbound: {implementation: k.direct_outbound({}), resolve_handler: async name => {
+        await k.outbound({via: k.host_network({}), protocol: k.direct_outbound({}), resolve_server: async name => {
             if (name === 'release') {
                 await allEntered;
                 release();
@@ -23,7 +23,7 @@ async fn pending_policy_calls_do_not_block_the_policy_that_releases_them() {
             if (++entered === 80) ready();
             await gate;
             return [k.ip('192.0.2.1')];
-        }}});
+        }});
     "#,
         TIMEOUT,
     )
@@ -60,12 +60,12 @@ async fn start(source: &str, grace: Duration) -> Daemon {
     .unwrap()
 }
 
-fn handler(daemon: &Daemon) -> ResolveHandler {
+fn handler(daemon: &Daemon) -> ResolvePolicy {
     daemon
         .resources()
         .into_iter()
         .find_map(|(_, config)| match config {
-            ResourceConfig::Dialer(dialer) => Some(dialer.outbound.resolve_handler),
+            ResourceConfig::Outbound(outbound) => Some(outbound.resolve_server),
             _ => None,
         })
         .unwrap()
@@ -86,10 +86,10 @@ async fn shutdown_drains_accepted_calls_and_closes_existing_handles() {
                 "main.ts".into(),
                 r#"
                 import { kotoconn as k } from '@kotoconn/bindings';
-                await k.dialer({carrier: k.host_network({}), outbound: {implementation: k.direct_outbound({}), resolve_handler: async () => {
+                await k.outbound({via: k.host_network({}), protocol: k.direct_outbound({}), resolve_server: async () => {
                     await import('./gate.ts');
                     return [k.ip('127.0.0.1')];
-                }}});
+                }});
             "#
                 .into(),
             ),
@@ -147,7 +147,7 @@ async fn shutdown_hooks_run_before_admission_closes_and_release_pending_sleeps()
         (async () => {{ while (true) await k.sleep(k.timeout(3_600_000)); }})().catch(() => {{}});
         let served;
         const handled = new Promise(resolve => served = resolve);
-        await k.dialer({{carrier: k.host_network({{}}), outbound: {{implementation: k.direct_outbound({{}}), resolve_handler: () => {{ served(); return [k.ip('192.0.2.1')]; }}}}}});
+        await k.outbound({{via: k.host_network({{}}), protocol: k.direct_outbound({{}}), resolve_server: () => {{ served(); return [k.ip('192.0.2.1')]; }}}});
         k.on_shutdown(async () => {{
             await handled;
             await k.exec(['sh', '-c', 'cat > "$1"', 'sh', {path:?}], {{ input: 'cleaned' }});
@@ -194,7 +194,7 @@ async fn shutdown_hooks_run_when_an_inbound_fails_to_bind() {
         k.on_shutdown(() => k.exec(['sh', '-c', 'cat > "$1"', 'sh', {path:?}], {{ input: 'cleaned' }}));
         await k.inbound({{
             implementation: k.socks5_inbound({{ listen: {{ address: k.ip('127.0.0.1'), port: {port} }} }}),
-            routing_handler: () => null,
+            route: () => null,
             udp_idle_timeout: k.timeout(1000),
         }});
     "#,
@@ -222,7 +222,7 @@ async fn deadline_cancels_unsettled_promises_and_interrupts_running_js() {
         let source = format!(
             r#"
             import {{ kotoconn as k }} from '@kotoconn/bindings';
-            await k.dialer({{carrier: k.host_network({{}}), outbound: {{implementation: k.direct_outbound({{}}), resolve_handler: async () => {{ {body} return []; }}}}}});
+            await k.outbound({{via: k.host_network({{}}), protocol: k.direct_outbound({{}}), resolve_server: async () => {{ {body} return []; }}}});
         "#
         );
         let daemon = start(&source, Duration::from_millis(30)).await;

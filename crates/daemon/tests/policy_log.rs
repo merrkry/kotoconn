@@ -45,7 +45,7 @@ async fn policy_logs_and_reports_rejections_left_unhandled_after_queued_jobs() {
                 "main.ts".into(),
                 r#"
                 import { kotoconn as k } from '@kotoconn/bindings';
-                await k.dialer({carrier: k.host_network({}), outbound: {implementation: k.direct_outbound({}), resolve_handler: async () => {
+                await k.outbound({via: k.host_network({}), protocol: k.direct_outbound({}), resolve_server: async () => {
                     k.log('info', 'resolving');
                     Promise.reject(Error('lost'));
                     // A handler attached by a later job still observes the rejection.
@@ -53,7 +53,7 @@ async fn policy_logs_and_reports_rejections_left_unhandled_after_queued_jobs() {
                     await null;
                     late.catch(() => {});
                     return [];
-                }}});
+                }});
             "#
                 .into(),
             )]),
@@ -63,7 +63,7 @@ async fn policy_logs_and_reports_rejections_left_unhandled_after_queued_jobs() {
     .await
     .unwrap()
     .unwrap();
-    let id = resolve_handler(&daemon);
+    let id = resolve_server(&daemon);
 
     daemon
         .policy()
@@ -95,7 +95,7 @@ async fn describing_a_reason_can_reject_or_handle_promises() {
             "main.ts".into(),
             r#"
             import { kotoconn as k } from '@kotoconn/bindings';
-            await k.dialer({carrier: k.host_network({}), outbound: {implementation: k.direct_outbound({}), resolve_handler: () => {
+            await k.outbound({via: k.host_network({}), protocol: k.direct_outbound({}), resolve_server: () => {
                 Promise.reject({
                     toString() {
                         Promise.reject('nested rejection');
@@ -112,7 +112,7 @@ async fn describing_a_reason_can_reject_or_handle_promises() {
                     },
                 });
                 return [];
-            }}});
+            }});
             "#
             .into(),
         )]),
@@ -120,7 +120,7 @@ async fn describing_a_reason_can_reject_or_handle_promises() {
     )
     .await
     .unwrap();
-    let id = resolve_handler(&daemon);
+    let id = resolve_server(&daemon);
     daemon
         .policy()
         .resolve(&id, "example".into())
@@ -135,14 +135,12 @@ async fn describing_a_reason_can_reject_or_handle_promises() {
     assert!(!reported("handled rejection"), "{events:?}");
 }
 
-fn resolve_handler(daemon: &Daemon) -> kotoconn_config::ResolveHandler {
+fn resolve_server(daemon: &Daemon) -> kotoconn_config::ResolvePolicy {
     daemon
         .resources()
         .into_iter()
         .find_map(|(_, config)| match config {
-            kotoconn_config::ResourceConfig::Dialer(dialer) => {
-                Some(dialer.outbound.resolve_handler)
-            }
+            kotoconn_config::ResourceConfig::Outbound(outbound) => Some(outbound.resolve_server),
             _ => None,
         })
         .unwrap()

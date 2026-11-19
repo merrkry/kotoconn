@@ -1,6 +1,6 @@
 #[derive(Debug, Clone, PartialEq, Eq, ts_rs::TS)]
 pub struct Hysteria2OutboundConfig {
-    pub server: crate::Target,
+    pub server: crate::Endpoint,
     pub password: String,
     /// TLS server name; defaults to the configured server's domain or IP.
     #[ts(optional)]

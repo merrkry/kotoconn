@@ -41,16 +41,14 @@ async fn concurrent_calls_and_spawned_work_keep_their_parent_spans() {
         HashMap::from([(
             "main.ts".into(),
             "import { kotoconn as k } from '@kotoconn/bindings';
-            await k.dialer({carrier: k.host_network({}), outbound: {
-                resolve_handler: async () => [], implementation: k.direct_outbound({}),
-            }});"
+            await k.outbound({via: k.host_network({}), resolve_server: async () => [], protocol: k.direct_outbound({}),});"
                 .into(),
         )]),
         Duration::from_secs(3),
     )
     .await
     .unwrap();
-    let id = resolve_handler(&daemon);
+    let id = resolve_server(&daemon);
 
     let first = tracing::info_span!("first_request");
     let second = tracing::info_span!("second_request");
@@ -97,14 +95,12 @@ async fn concurrent_calls_and_spawned_work_keep_their_parent_spans() {
     }
 }
 
-fn resolve_handler(daemon: &Daemon) -> kotoconn_config::ResolveHandler {
+fn resolve_server(daemon: &Daemon) -> kotoconn_config::ResolvePolicy {
     daemon
         .resources()
         .into_iter()
         .find_map(|(_, config)| match config {
-            kotoconn_config::ResourceConfig::Dialer(dialer) => {
-                Some(dialer.outbound.resolve_handler)
-            }
+            kotoconn_config::ResourceConfig::Outbound(outbound) => Some(outbound.resolve_server),
             _ => None,
         })
         .unwrap()

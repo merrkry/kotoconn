@@ -7,7 +7,7 @@ use tokio::{
     sync::mpsc,
 };
 
-pub struct Server(pub Target);
+pub struct Server(pub Endpoint);
 
 impl p::Server for Server {
     fn bind(
@@ -69,7 +69,7 @@ impl Drop for Completion {
     }
 }
 
-async fn udp(socket: UdpSocket, target: Target, context: ServerContext) -> Result<()> {
+async fn udp(socket: UdpSocket, target: Endpoint, context: ServerContext) -> Result<()> {
     let mut peers = HashMap::<SocketAddr, SessionEntry>::new();
     let (responses, mut replies) = mpsc::channel::<(SocketAddr, u64, Packet)>(64);
     let (completed, mut completions) = mpsc::unbounded_channel();

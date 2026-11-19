@@ -10,11 +10,11 @@ use tokio::{
 };
 
 pub struct Client {
-    pub endpoint: Endpoint,
-    pub carrier: Arc<dyn Carrier>,
+    pub endpoint: ServerEndpoint,
+    pub carrier: Arc<dyn Connector>,
 }
 
-impl p::Client for Client {
+impl p::OutboundAdapter for Client {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             tcp: self.carrier.capabilities().tcp,
@@ -23,7 +23,7 @@ impl p::Client for Client {
         }
     }
 
-    fn tcp(&self, target: Target, scope: Scope) -> BoxFuture<'_, Result<BoxStream>> {
+    fn tcp(&self, target: Endpoint, scope: Scope) -> BoxFuture<'_, Result<BoxStream>> {
         Box::pin(async move {
             let carrier = self.carrier.capabilities();
             carrier.require(Capabilities::TCP)?;
@@ -60,7 +60,7 @@ impl p::Client for Client {
         })
     }
 
-    fn udp(&self, _: Target, _: Scope) -> BoxFuture<'_, Result<Datagram>> {
+    fn udp(&self, _: Endpoint, _: Scope) -> BoxFuture<'_, Result<Datagram>> {
         Box::pin(async { bail!("HTTP CONNECT does not support UDP") })
     }
 }
@@ -101,7 +101,7 @@ impl p::Server for Server {
     }
 }
 
-async fn handshake(stream: BoxStream) -> Result<(Target, BoxStream)> {
+async fn handshake(stream: BoxStream) -> Result<(Endpoint, BoxStream)> {
     let mut stream = BufReader::new(stream);
     let request = header(&mut stream).await?;
 
@@ -127,16 +127,16 @@ async fn handshake(stream: BoxStream) -> Result<(Target, BoxStream)> {
     Ok((destination, stream))
 }
 
-fn authority(target: &Target) -> Result<String> {
+fn authority(target: &Endpoint) -> Result<String> {
     let text = match target {
-        Target::Ip { address, port } => SocketAddr::new(*address, *port).to_string(),
-        Target::Domain { name, port } => format!("{name}:{port}"),
+        Endpoint::Ip { address, port } => SocketAddr::new(*address, *port).to_string(),
+        Endpoint::Domain { name, port } => format!("{name}:{port}"),
     };
     parse_authority(&text)?;
     Ok(text)
 }
 
-fn parse_authority(value: &str) -> Result<Target> {
+fn parse_authority(value: &str) -> Result<Endpoint> {
     if let Ok(address) = value.parse::<SocketAddr>() {
         return Ok(p::target(address));
     }
@@ -145,7 +145,7 @@ fn parse_authority(value: &str) -> Result<Target> {
         !value.host().is_empty() && !value.host().contains('@'),
         "invalid authority"
     );
-    Ok(Target::Domain {
+    Ok(Endpoint::Domain {
         name: value.host().into(),
         port: value
             .port_u16()
@@ -153,7 +153,7 @@ fn parse_authority(value: &str) -> Result<Target> {
     })
 }
 
-fn destination(header: &[u8]) -> Result<Target> {
+fn destination(header: &[u8]) -> Result<Endpoint> {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut request = httparse::Request::new(&mut headers);
     ensure!(

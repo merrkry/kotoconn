@@ -1,19 +1,19 @@
 use anyhow::Result;
 use futures_util::future::BoxFuture;
 use kotoconn_config::HttpInboundConfig;
-use kotoconn_outbounds::{Clients, System, SystemResolver};
+use kotoconn_outbounds::{Outbound, System, SystemResolver};
 use kotoconn_protocol::*;
 use std::{sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
-struct Inspect(tokio::sync::mpsc::UnboundedSender<Target>);
+struct Inspect(tokio::sync::mpsc::UnboundedSender<Endpoint>);
 
-impl Handler for Inspect {
+impl InboundHandler for Inspect {
     fn tcp(
         &self,
         _: std::net::SocketAddr,
-        destination: Target,
+        destination: Endpoint,
         mut stream: BoxStream,
         _: Scope,
     ) -> BoxFuture<'_, Result<()>> {
@@ -58,14 +58,14 @@ async fn inbound_admission_allows_inspection_and_preserves_domain_target() -> Re
         let address = target(address);
         scope.spawn(bound.run)?;
 
-        let client = Clients::new(
-            kotoconn_config::OutboundImpl::Http(kotoconn_config::HttpOutboundConfig {
+        let client = Outbound::new(
+            kotoconn_config::OutboundProtocol::Http(kotoconn_config::HttpOutboundConfig {
                 server: address,
             }),
             Arc::new(System::new(scope.clone(), Default::default()).unwrap()),
             Arc::new(SystemResolver),
         )?;
-        let destination = Target::Domain {
+        let destination = Endpoint::Domain {
             name: "unresolved.invalid".into(),
             port: 443,
         };
@@ -107,20 +107,18 @@ async fn sniff_metadata_reaches_policy_and_tcp_routing_preserves_payload() -> Re
         let source = format!(r#"
             import {{ kotoconn as k }} from '@kotoconn/bindings';
             const resolve = () => [];
-            const direct = await k.dialer({{ carrier: k.host_network({{}}), outbound: {{
-                resolve_handler: resolve, implementation: k.direct_outbound({{}})
-            }} }});
+            const direct = await k.outbound({{ via: k.host_network({{}}), resolve_server: resolve, protocol: k.direct_outbound({{}}) }});
             const routing = flow => {{
-                if (flow.dest.domain !== 'original.invalid' || flow.dest.port !== 443) {{
+                if (flow.destination.domain !== 'original.invalid' || flow.destination.port !== 443) {{
                     throw Error('sniff changed the original destination');
                 }}
                 if (flow.sniff?.protocol !== 'http' || flow.sniff.domain !== 'sniff.example') {{
                     throw Error('missing sniff metadata');
                 }}
-                return k.route(direct, k.ip_target(k.ip('127.0.0.1'), {port}));
+                return k.route(direct, k.ip_endpoint(k.ip('127.0.0.1'), {port}));
             }};
             await k.inbound({{
-                routing_handler: routing, udp_idle_timeout: k.timeout(10000),
+                route: routing, udp_idle_timeout: k.timeout(10000),
                 sniff: {{ timeout: k.timeout(300) }},
                 implementation: k.http_inbound({{ listen: {{ address: k.ip('127.0.0.1'), port: 0 }} }})
             }});
@@ -130,11 +128,11 @@ async fn sniff_metadata_reaches_policy_and_tcp_routing_preserves_payload() -> Re
         ).await?;
         let scope = Scope::new();
         let address = *daemon.listen_addresses().values().next().unwrap();
-        let client = Clients::new(
-            kotoconn_config::OutboundImpl::Http(kotoconn_config::HttpOutboundConfig { server: target(address) }),
+        let client = Outbound::new(
+            kotoconn_config::OutboundProtocol::Http(kotoconn_config::HttpOutboundConfig { server: target(address) }),
             Arc::new(System::new(scope.clone(), Default::default()).unwrap()), Arc::new(SystemResolver),
         )?;
-        let mut stream = client.tcp(Target::Domain { name: "original.invalid".into(), port: 443 }).await?;
+        let mut stream = client.tcp(Endpoint::Domain { name: "original.invalid".into(), port: 443 }).await?;
         stream.write_all(payload).await?;
         stream.shutdown().await?;
         let mut echoed = Vec::new();

@@ -1,4 +1,4 @@
-use crate::{InboundId, Target};
+use crate::{Endpoint, InboundId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ts_rs::TS)]
 #[ts(rename_all = "lowercase")]
@@ -8,13 +8,13 @@ pub enum TransportProtocol {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ts_rs::TS)]
-pub struct Flow {
+pub struct SessionInfo {
     pub inbound: InboundId,
     #[ts(type = "SocketAddr")]
     pub source: std::net::SocketAddr,
     pub protocol: TransportProtocol,
     // The client's requested destination, unchanged by routing or resolution.
-    pub dest: Target,
+    pub destination: Endpoint,
     #[ts(type = "SniffResult | undefined")]
     pub sniff: Option<crate::SniffResult>,
 }

@@ -1,6 +1,6 @@
 use crate::{
     PacketReceive,
-    packet::{self, Decoder, Flow, Packet, ReassemblyLimits, RouteKey},
+    packet::{self, Decoder, FlowKey, Packet, ReassemblyLimits, RouteKey},
     tcp,
     transmit::Transmit,
     udp,
@@ -104,8 +104,8 @@ impl Drop for UdpEntry {
 }
 
 struct Completion {
-    tx: mpsc::UnboundedSender<(Flow, u64)>,
-    flow: Flow,
+    tx: mpsc::UnboundedSender<(FlowKey, u64)>,
+    flow: FlowKey,
     generation: u64,
 }
 
@@ -120,13 +120,13 @@ struct Worker {
     link: tcp::Link,
     context: ServerContext,
     shared: Arc<Shared>,
-    tcp: HashMap<Flow, TcpEntry>,
-    udp: HashMap<Flow, UdpEntry>,
-    done: mpsc::UnboundedSender<(Flow, u64)>,
+    tcp: HashMap<FlowKey, TcpEntry>,
+    udp: HashMap<FlowKey, UdpEntry>,
+    done: mpsc::UnboundedSender<(FlowKey, u64)>,
     output: queue::Sender<Transmit>,
     ready: mpsc::UnboundedSender<tcp::Ready>,
     transfers: mpsc::UnboundedSender<crate::udp_direct::Transfer>,
-    timers: BTreeMap<(Instant, u64), Flow>,
+    timers: BTreeMap<(Instant, u64), FlowKey>,
     blocked: VecDeque<(tcp::Ready, usize)>,
     pool: crate::pool::Pool,
     arena: crate::storage::PacketArena,
@@ -761,7 +761,7 @@ pub(crate) async fn dispatch<R: PacketReceive>(
 }
 
 async fn udp_replies(
-    flow: Flow,
+    flow: FlowKey,
     mut replies: queue::Receiver<p::Packet>,
     output: queue::Sender<Transmit>,
     activity: p::Activity,
@@ -811,7 +811,7 @@ mod tests {
         let scope = Scope::new();
         let lifetime = p::UdpSession::new(scope.clone(), std::time::Duration::from_secs(10));
         let activity = lifetime.activity();
-        let flow = Flow {
+        let flow = FlowKey {
             source: "192.0.2.2:12345".parse().unwrap(),
             destination: "198.51.100.1:443".parse().unwrap(),
         };
@@ -865,7 +865,7 @@ mod tests {
             mtu: 1280,
             gso: false,
         };
-        let flow = Flow {
+        let flow = FlowKey {
             source: "192.0.2.2:12345".parse().unwrap(),
             destination: "198.51.100.1:443".parse().unwrap(),
         };

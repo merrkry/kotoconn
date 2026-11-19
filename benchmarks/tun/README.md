@@ -8,12 +8,8 @@ mise exec -- moon run benchmark:run -- --profile full
 mise exec -- moon run benchmark:test-udp-churn
 ```
 
-Use `--help` for workload filters and measurement options. To compare against a
-caller-supplied sing-box 1.15 binary with the go TUN stack, pass
-`--sing-box /path/to/sing-box`. The reference enables multi-queue TUN, using
-the same CPU allowance as Kotoconn. Both implementations use the same generator
-binary and alternate execution order. Omit this option for routine candidate
-measurements.
+Use `--help` for workload filters and measurement options. Pass
+`--sing-box /path/to/sing-box` to compare with a local sing-box binary.
 
 ## Comparing results
 
@@ -27,10 +23,6 @@ Read completion rate together with loss and latency. Offered-load duration diffe
 from completion time under overload because receive drain remains in the measured
 window. Paced UDP allows reported loss; strict request/reply cases require every
 reply. UDP churn counts client sockets, which may reuse existing proxy associations.
-
-The full profile includes `udp-large-1` and `udp-large`, with 8192-byte datagrams
-on one and four flows. They exercise IP fragmentation at MTU 1500 and large
-unfragmented packets at MTU 9000. `--udp-rate` sets the offered rate per flow.
 
 Important metric interpretations:
 
@@ -52,8 +44,5 @@ Start with `results.json` and `samples.csv` in the printed artifact directory, t
 inspect the per-sample logs, histograms and resource records. Preserve the binary
 hashes, source revision and settings with any reported result.
 
-[run.py](../run.py) owns benchmark execution and result aggregation.
-[measurement.py](../../e2e/tun_support/measurement.py) defines metrics, and
-[scenarios.py](../../e2e/tun_support/scenarios.py) defines shared workloads.
 Keep network experiments inside the [TUN launcher](../../e2e/tun_support/README.md#isolation-and-artifacts).
 Changes to UDP warmup or port allocation should also pass `benchmark:test-udp-churn`.

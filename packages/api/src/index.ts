@@ -1,21 +1,21 @@
 import { kotoconn as k } from "@kotoconn/bindings";
 import type {
-  Dialer,
-  DialerConfig,
-  DnsHandler,
+  Outbound,
+  OutboundConfig,
+  DnsPolicy,
   DnsUpstreamConfig,
   Inbound,
   IpAddr,
   Request,
   Resource,
   Response,
-  Target,
+  Endpoint,
   Timeout,
 } from "@kotoconn/bindings";
 
 export interface DnsServiceOptions {
   upstream: DnsUpstreamConfig;
-  dialer: Dialer;
+  outbound: Outbound;
   /** TTL cache capacity in responses. Defaults to 4096; false disables caching. */
   cache?: false | { capacity: number };
   /** Total upstream query deadline. Defaults to 5000 milliseconds. */
@@ -25,7 +25,7 @@ export interface DnsServiceOptions {
 /** A native DNS service; closing it ends its queries and cached state. */
 export interface DnsService extends Resource {
   readonly query: (request: Request) => Promise<Response>;
-  readonly handler: DnsHandler;
+  readonly handler: DnsPolicy;
   /**
    * A and AAAA addresses of a name and the aliases its CNAME chain reaches; records for
    * other owners are ignored. NXDOMAIN and NODATA give no addresses; other response
@@ -47,13 +47,13 @@ export async function dns_service(options: DnsServiceOptions): Promise<DnsServic
 
   const service = await k.dns_service({
     upstream: options.upstream,
-    dialer: options.dialer,
+    outbound: options.outbound,
     cache_capacity: options.cache === false ? 0 : (options.cache?.capacity ?? 4096),
     timeout: options.timeout ?? k.timeout(5000),
   });
 
   const query = (request: Request) => k.dns_query(service, request);
-  const handler: DnsHandler = async (request) => k.respond(await query(request));
+  const handler: DnsPolicy = async (request) => k.respond(await query(request));
 
   const lookup = async (name: string, type: "A" | "AAAA") => {
     const request = k.dns_request(name, type);
@@ -117,19 +117,19 @@ export async function dns_service(options: DnsServiceOptions): Promise<DnsServic
   });
 }
 
-/** Measures one dialer, resolving to a latency in milliseconds or rejecting when unhealthy. */
-export type HealthCheck = (dialer: Dialer) => Promise<number>;
+/** Measures one outbound, resolving to a latency in milliseconds or rejecting when unhealthy. */
+export type HealthCheck = (outbound: Outbound) => Promise<number>;
 
 export interface HttpCheckOptions {
-  /** The HTTP server, reached through the probed dialer. */
-  target: Target;
+  /** The HTTP server, reached through the probed outbound. */
+  target: Endpoint;
   /** Defaults to `/generate_204`. */
   path?: string;
   timeout: Timeout;
 }
 
 /**
- * A plain HTTP health check: a HEAD request through the dialer, healthy when the
+ * A plain HTTP health check: a HEAD request through the outbound, healthy when the
  * status is 2xx or 3xx. The latency includes connecting through the carrier chain.
  */
 export function http_check(options: HttpCheckOptions): HealthCheck {
@@ -140,8 +140,8 @@ export function http_check(options: HttpCheckOptions): HealthCheck {
     `HEAD ${options.path ?? "/generate_204"} HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`,
   );
 
-  return async (dialer) => {
-    const result = await k.probe(dialer, {
+  return async (outbound) => {
+    const result = await k.probe(outbound, {
       target: options.target,
       request,
       // "HTTP/1.1 204", which can arrive in several reads.
@@ -163,46 +163,46 @@ function ascii(text: string): Uint8Array {
   return Uint8Array.from(text, (character) => character.charCodeAt(0));
 }
 
-/** Chooses the dialer that routing uses for a set of members. */
+/** Chooses the outbound that routing uses for a set of members. */
 export interface Group {
-  /** The dialer routing should use now. */
-  readonly current: Dialer;
+  /** The outbound routing should use now. */
+  readonly current: Outbound;
   /** Replace the members, for example after a subscription update. */
-  update(dialers: readonly Dialer[]): void;
+  update(outbounds: readonly Outbound[]): void;
   /** Stop health checks. Members stay open; closing them is up to their owner. */
   close(): void;
 }
 
 export interface Selector extends Group {
   /** Make a member current until the next selection or update. */
-  select(dialer: Dialer): void;
+  select(outbound: Outbound): void;
 }
 
 /** A group whose current member policy picks explicitly; it starts with the first one. */
-export function selector(dialers: readonly Dialer[]): Selector {
-  let members = nonEmpty(dialers);
+export function selector(outbounds: readonly Outbound[]): Selector {
+  let members = nonEmpty(outbounds);
   let current = members[0];
 
   return {
     get current() {
       return current;
     },
-    update(dialers) {
-      members = nonEmpty(dialers);
+    update(outbounds) {
+      members = nonEmpty(outbounds);
       if (!members.some((member) => member.equals(current))) current = members[0];
     },
-    select(dialer) {
-      if (!members.some((member) => member.equals(dialer))) {
-        throw new Error("dialer is not a member of this group");
+    select(outbound) {
+      if (!members.some((member) => member.equals(outbound))) {
+        throw new Error("outbound is not a member of this group");
       }
-      current = dialer;
+      current = outbound;
     },
     close() {},
   };
 }
 
 export interface CheckedGroupOptions {
-  dialers: readonly Dialer[];
+  outbounds: readonly Outbound[];
   check: HealthCheck;
   /** Time between check rounds. Rounds start when the group is created and end at shutdown. */
   interval: Timeout;
@@ -223,7 +223,7 @@ export interface FastestOptions extends CheckedGroupOptions {
 export function fastest(options: FastestOptions): CheckedGroup {
   const tolerance = options.tolerance ?? 0;
   return checked(options, (members, latencies, current) => {
-    let best: { member: Dialer; latency: number } | undefined;
+    let best: { member: Outbound; latency: number } | undefined;
     for (const member of members) {
       const latency = latencies.get(member);
       if (latency !== undefined && (best === undefined || latency < best.latency)) {
@@ -248,9 +248,9 @@ export function fallback(options: CheckedGroupOptions): CheckedGroup {
 /** Runs check rounds and picks the current member from the latencies of healthy members. */
 function checked(
   options: CheckedGroupOptions,
-  pick: (members: Members, latencies: Map<Dialer, number>, current: Dialer) => Dialer,
+  pick: (members: Members, latencies: Map<Outbound, number>, current: Outbound) => Outbound,
 ): CheckedGroup {
-  let members = nonEmpty(options.dialers);
+  let members = nonEmpty(options.outbounds);
   let current = members[0];
   let closed = false;
   let rounds = 0;
@@ -263,7 +263,7 @@ function checked(
     // A later round or an update makes these measurements stale.
     if (round !== rounds || checked !== members) return;
 
-    const latencies = new Map<Dialer, number>();
+    const latencies = new Map<Outbound, number>();
     checked.forEach((member, index) => {
       const result = results[index];
       if (result?.status === "fulfilled") latencies.set(member, result.value);
@@ -284,8 +284,8 @@ function checked(
     get current() {
       return current;
     },
-    update(dialers) {
-      members = nonEmpty(dialers);
+    update(outbounds) {
+      members = nonEmpty(outbounds);
       if (!members.some((member) => member.equals(current))) current = members[0];
       check().catch((error) => k.log("warn", `group check failed: ${String(error)}`));
     },
@@ -297,46 +297,46 @@ function checked(
 }
 
 /** Group members; a group always has a current member. */
-type Members = readonly [Dialer, ...Dialer[]];
+type Members = readonly [Outbound, ...Outbound[]];
 
-function nonEmpty(dialers: readonly Dialer[]): Members {
-  const [first, ...rest] = dialers;
-  if (first === undefined) throw new Error("a group needs at least one dialer");
+function nonEmpty(outbounds: readonly Outbound[]): Members {
+  const [first, ...rest] = outbounds;
+  if (first === undefined) throw new Error("a group needs at least one outbound");
   return [first, ...rest];
 }
 
 export interface SubscriptionOptions {
   /**
-   * Loads the subscribed dialers. Each key identifies one dialer and must change
+   * Loads the subscribed outbounds. Each key identifies one outbound and must change
    * whenever its configuration changes.
    */
-  load: () => Promise<ReadonlyMap<string, DialerConfig>>;
+  load: () => Promise<ReadonlyMap<string, OutboundConfig>>;
   /** Time between loads. Updates end at shutdown. */
   interval: Timeout;
-  /** Receives the open dialers after each change, for example `group.update`. */
-  update: (dialers: readonly Dialer[]) => void;
-  /** Deadline for dialers that left the subscription to finish their sessions. */
+  /** Receives the open outbounds after each change, for example `group.update`. */
+  update: (outbounds: readonly Outbound[]) => void;
+  /** Deadline for outbounds that left the subscription to finish their sessions. */
   drain: Timeout;
 }
 
 export interface Subscription {
-  readonly dialers: readonly Dialer[];
+  readonly outbounds: readonly Outbound[];
   /** Load and apply the subscription now. */
   refresh(): Promise<void>;
-  /** Stop periodic updates. Dialers stay open; drain them through `dialers` if needed. */
+  /** Stop periodic updates. Outbounds stay open; drain them through `outbounds` if needed. */
   close(): void;
 }
 
 /**
- * Keeps a set of dialers in sync with a subscription. Dialers for new keys are created
- * and passed to `update` before the dialers of removed keys drain, so routing moves
+ * Keeps a set of outbounds in sync with a subscription. Outbounds for new keys are created
+ * and passed to `update` before the outbounds of removed keys drain, so routing moves
  * away from them first. The first load must succeed; later failures, including a
- * load without any usable dialer, are logged and keep the current dialers.
+ * load without any usable outbound, are logged and keep the current outbounds.
  */
 export async function subscription(options: SubscriptionOptions): Promise<Subscription> {
-  let dialers = new Map<string, Dialer>();
+  let outbounds = new Map<string, Outbound>();
   let closed = false;
-  // Refreshes run one at a time, so each compares against the dialers the last one left.
+  // Refreshes run one at a time, so each compares against the outbounds the last one left.
   let previous = Promise.resolve();
 
   const refresh = () => {
@@ -347,39 +347,39 @@ export async function subscription(options: SubscriptionOptions): Promise<Subscr
 
   const apply = async () => {
     const loaded = await options.load();
-    const next = new Map<string, Dialer>();
+    const next = new Map<string, Outbound>();
     for (const [key, config] of loaded) {
-      const existing = dialers.get(key);
+      const existing = outbounds.get(key);
       if (existing) {
         next.set(key, existing);
         continue;
       }
       try {
-        next.set(key, await k.dialer(config));
+        next.set(key, await k.outbound(config));
       } catch (error) {
-        k.log("warn", `subscription dialer ${key} failed: ${String(error)}`);
+        k.log("warn", `subscription outbound ${key} failed: ${String(error)}`);
       }
     }
 
-    // Routing needs a dialer, so an update without any keeps the current ones.
-    if (next.size === 0) throw new Error("subscription has no usable dialers");
+    // Routing needs an outbound, so an update without any keeps the current ones.
+    if (next.size === 0) throw new Error("subscription has no usable outbounds");
 
-    const removed = [...dialers].filter(([key]) => !next.has(key));
+    const removed = [...outbounds].filter(([key]) => !next.has(key));
     try {
       options.update([...next.values()]);
     } catch (error) {
-      // Routing kept the current dialers, so the new ones were never used.
-      for (const [key, dialer] of next) {
-        if (!dialers.has(key)) dialer.close();
+      // Routing kept the current outbounds, so the new ones were never used.
+      for (const [key, outbound] of next) {
+        if (!outbounds.has(key)) outbound.close();
       }
       throw error;
     }
-    dialers = next;
-    for (const [key, dialer] of removed) {
+    outbounds = next;
+    for (const [key, outbound] of removed) {
       try {
-        dialer.drain({ timeout: options.drain });
+        outbound.drain({ timeout: options.drain });
       } catch (error) {
-        k.log("warn", `subscription dialer ${key} could not drain: ${String(error)}`);
+        k.log("warn", `subscription outbound ${key} could not drain: ${String(error)}`);
       }
     }
   };
@@ -398,8 +398,8 @@ export async function subscription(options: SubscriptionOptions): Promise<Subscr
   });
 
   return {
-    get dialers() {
-      return [...dialers.values()];
+    get outbounds() {
+      return [...outbounds.values()];
     },
     refresh,
     close() {
@@ -415,7 +415,7 @@ export interface AutoRouteOptions {
   inbound: Inbound;
   /**
    * Socket mark of traffic that bypasses the TUN. Set the same `mark` on the
-   * host network carriers of dialers that reach the network directly.
+   * host network carriers of outbounds that reach the network directly.
    */
   mark: number;
   /** Routing table that holds the default route through the TUN. Defaults to 2022. */
