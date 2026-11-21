@@ -1,9 +1,9 @@
 use crate::{
+    padding::PaddingScheme,
     session::{Handle, Session},
     tls, udp, wire,
 };
 use anyhow::{Context, Result, ensure};
-use anytls::core::PaddingFactory;
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use kotoconn_config::AnyTlsOutboundConfig;
@@ -15,22 +15,16 @@ use tokio::{sync::watch, time::Instant};
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 
+/// Dropping the last handle lets an idle session end gracefully, after it
+/// sent everything queued, such as the last stream's FIN.
 struct Slot {
     handle: Arc<Handle>,
-    scope: Scope,
     idle_since: Option<Instant>,
-}
-
-impl Drop for Slot {
-    fn drop(&mut self) {
-        self.scope.close();
-    }
 }
 
 #[derive(Default)]
 struct Pool {
     sessions: BTreeMap<u64, Slot>,
-    idle: Vec<u64>,
     sequence: u64,
     draining: bool,
 }
@@ -43,15 +37,16 @@ impl Pool {
                     .idle_since
                     .is_none_or(|since| since.elapsed() < timeout)
         });
-        self.idle.retain(|id| self.sessions.contains_key(id));
     }
 
+    /// The protocol reuses the newest idle session, so the oldest ones expire.
     fn reuse(&mut self, timeout: Duration) -> Option<Arc<Handle>> {
         self.prune(timeout);
-        let id = self.idle.pop()?;
-        // SAFETY: prune retains only IDs present in sessions, under the pool lock.
-        let slot = self.sessions.get_mut(&id).expect("idle session");
-        debug_assert!(slot.idle_since.is_some());
+        let slot = self
+            .sessions
+            .values_mut()
+            .rev()
+            .find(|slot| slot.idle_since.is_some())?;
         slot.idle_since = None;
         Some(slot.handle.clone())
     }
@@ -62,7 +57,6 @@ impl Pool {
         } else if let Some(slot) = self.sessions.get_mut(&id) {
             debug_assert!(slot.idle_since.is_none());
             slot.idle_since = Some(Instant::now());
-            self.idle.push(id);
         }
     }
 }
@@ -73,7 +67,7 @@ pub struct Client {
     connector: TlsConnector,
     name: ServerName<'static>,
     password: [u8; 32],
-    padding: watch::Sender<PaddingFactory>,
+    padding: watch::Sender<PaddingScheme>,
     pool: Arc<Mutex<Pool>>,
     scope: Scope,
     idle_timeout: Duration,
@@ -95,7 +89,7 @@ impl Client {
             !idle_timeout.is_zero(),
             "AnyTLS idle session timeout must be positive"
         );
-        let (padding, _) = watch::channel(PaddingFactory::default());
+        let (padding, _) = watch::channel(PaddingScheme::default());
         let pool = Arc::new(Mutex::new(Pool::default()));
         let scope = carrier.scope().child();
         let cleaning = Arc::downgrade(&pool);
@@ -189,19 +183,11 @@ impl Client {
                 pool.lock().mark_idle(sequence);
             }
         });
-        let handle = Session::start(
-            tls,
-            &session_scope,
-            self.padding.clone(),
-            None,
-            Some(idle),
-            None,
-        )?;
+        let handle = Session::client(tls, &session_scope, self.padding.clone(), idle)?;
         self.pool.lock().sessions.insert(
             sequence,
             Slot {
                 handle: handle.clone(),
-                scope: session_scope,
                 idle_since: None,
             },
         );
@@ -221,7 +207,6 @@ impl p::OutboundAdapter for Client {
         let mut pool = self.pool.lock();
         pool.draining = true;
         pool.sessions.retain(|_, slot| slot.idle_since.is_none());
-        pool.idle.clear();
         self.cleanup_stop.cancel();
     }
 
@@ -255,48 +240,41 @@ mod tests {
     use super::*;
 
     #[tokio::test(start_paused = true)]
-    async fn reuse_follows_idle_order_even_when_timestamps_match() {
+    async fn reuse_takes_the_newest_idle_session_and_expires_the_rest() {
         let scope = Scope::new();
         let mut pool = Pool::default();
         let mut peers = Vec::new();
         for id in 1..=2 {
             let (io, peer) = tokio::io::duplex(1024);
             peers.push(peer);
-            let session = scope.child();
-            let (padding, _) = watch::channel(PaddingFactory::default());
-            let handle = Session::start(io, &session, padding, None, None, None).unwrap();
-            pool.sessions.insert(
-                id,
-                Slot {
-                    handle,
-                    scope: session,
-                    idle_since: None,
-                },
-            );
+            let (padding, _) = watch::channel(PaddingScheme::default());
+            let handle = Session::client(io, &scope.child(), padding, Box::new(|| {})).unwrap();
+            let slot = Slot {
+                handle,
+                idle_since: None,
+            };
+            pool.sessions.insert(id, slot);
         }
 
         let older = pool.sessions[&1].handle.clone();
         let newer = pool.sessions[&2].handle.clone();
         pool.mark_idle(2);
         pool.mark_idle(1);
-        assert_eq!(pool.sessions[&1].idle_since, pool.sessions[&2].idle_since);
         let timeout = Duration::from_secs(60);
-        assert!(Arc::ptr_eq(&pool.reuse(timeout).unwrap(), &older));
         assert!(Arc::ptr_eq(&pool.reuse(timeout).unwrap(), &newer));
+        assert!(Arc::ptr_eq(&pool.reuse(timeout).unwrap(), &older));
         assert!(pool.reuse(timeout).is_none());
 
         pool.mark_idle(1);
         pool.mark_idle(2);
         newer.closed.cancel();
         assert!(Arc::ptr_eq(&pool.reuse(timeout).unwrap(), &older));
-        assert!(pool.idle.is_empty());
         assert!(!pool.sessions.contains_key(&2));
 
         pool.mark_idle(1);
         tokio::time::advance(timeout).await;
         assert!(pool.reuse(timeout).is_none());
         assert!(pool.sessions.is_empty());
-        assert!(pool.idle.is_empty());
         scope.close();
         scope.wait().await;
     }

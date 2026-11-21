@@ -1,6 +1,7 @@
-//! AnyTLS v2 over verified TLS. The anytls crate owns frame and settings semantics;
-//! this adapter supplies bounded I/O, carrier integration and session lifetimes.
+//! AnyTLS v2 over verified TLS, following the reference anytls-go implementation.
 mod client;
+mod frame;
+mod padding;
 mod server;
 mod session;
 mod stream;

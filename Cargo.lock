@@ -128,20 +128,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
-name = "anytls"
-version = "0.3.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "056f1fd60d65c00e5a8c84da9211a4aa5d6b8961dc44754eebe316061a30cd6f"
-dependencies = [
- "bytes",
- "log",
- "md5",
- "parking_lot",
- "percent-encoding",
- "rand 0.10.2",
-]
-
-[[package]]
 name = "arc-swap"
 version = "1.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1695,13 +1681,14 @@ name = "kotoconn-anytls"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "anytls",
  "bytes",
  "fast-socks5",
  "futures-util",
  "kotoconn-config",
  "kotoconn-protocol",
+ "md-5",
  "parking_lot",
+ "rand 0.9.5",
  "rcgen",
  "rustls",
  "sha2",
@@ -2044,9 +2031,6 @@ name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
-dependencies = [
- "serde_core",
-]
 
 [[package]]
 name = "lru-slab"
@@ -2076,10 +2060,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "md5"
-version = "0.8.1"
+name = "md-5"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ebb8d8732c6a6df3d8f032a82911cfc747e00efb95cc46e8d0acd5b5b88570c"
+checksum = "69b6441f590336821bb897fb28fc622898ccceb1d6cea3fde5ea86b090c4de98"
+dependencies = [
+ "cfg-if",
+ "digest",
+]
 
 [[package]]
 name = "memchr"

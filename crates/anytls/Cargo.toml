@@ -9,19 +9,20 @@ interop-tests = []
 
 [dependencies]
 anyhow.workspace = true
-anytls.workspace = true
 bytes.workspace = true
 fast-socks5.workspace = true
 futures-util = { workspace = true, features = ["sink"] }
 kotoconn-config.workspace = true
 kotoconn-protocol.workspace = true
+md-5.workspace = true
 parking_lot.workspace = true
+rand.workspace = true
 rustls.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "sync", "time", "rt"] }
 tokio-rustls.workspace = true
-tokio-util = { workspace = true, features = ["codec", "rt"] }
+tokio-util = { workspace = true, features = ["io", "rt"] }
 tracing.workspace = true
 webpki-roots.workspace = true
 

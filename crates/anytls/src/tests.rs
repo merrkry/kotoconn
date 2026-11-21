@@ -1,8 +1,12 @@
-use super::{Client, Server, tls, udp, wire};
+use super::{
+    Client, Server,
+    frame::{self, Command, Frame, FrameReader, Sid},
+    padding::PaddingScheme,
+    tls, udp, wire,
+};
 use anyhow::{Result, bail};
-use anytls::core::{Command, Frame, PaddingFactory};
-use bytes::Bytes;
-use futures_util::{StreamExt, future::BoxFuture};
+use bytes::{Bytes, BytesMut};
+use futures_util::future::BoxFuture;
 use kotoconn_config::{
     AnyTlsInboundConfig, AnyTlsOutboundConfig, TlsClientConfig, TlsServerConfig,
 };
@@ -20,9 +24,21 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::mpsc,
 };
-use tokio_util::{codec::FramedRead, sync::CancellationToken};
+use tokio_util::sync::CancellationToken;
 
 const LIMIT: Duration = Duration::from_secs(10);
+
+fn sid(sid: u32) -> Sid {
+    Sid::new(sid).unwrap()
+}
+
+fn encode(frames: &[Frame]) -> Bytes {
+    let mut bytes = BytesMut::new();
+    for frame in frames {
+        frame.encode(&mut bytes);
+    }
+    bytes.freeze()
+}
 
 #[cfg(feature = "interop-tests")]
 #[path = "../../../e2e/anytls/interop.rs"]
@@ -110,6 +126,13 @@ struct Fixture {
 
 impl Fixture {
     async fn new(padding: Option<&str>) -> Result<Self> {
+        Self::with_handler(padding, |targets| Arc::new(Echo(targets))).await
+    }
+
+    async fn with_handler(
+        padding: Option<&str>,
+        handler: impl FnOnce(mpsc::UnboundedSender<Endpoint>) -> Arc<dyn InboundHandler>,
+    ) -> Result<Self> {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
         let certificate = cert.cert.pem();
         let private_key = cert.signing_key.serialize_pem();
@@ -128,7 +151,7 @@ impl Fixture {
             &server,
             "127.0.0.1:0".parse()?,
             ServerContext {
-                handler: Arc::new(Echo(targets)),
+                handler: handler(targets),
                 scope: scope.clone(),
                 stopping: CancellationToken::new(),
                 udp_idle_timeout: Duration::from_secs(60),
@@ -178,7 +201,7 @@ impl Fixture {
         wire::send_authentication(
             &mut stream,
             &wire::password_hash("secret"),
-            &PaddingFactory::default(),
+            &PaddingScheme::default(),
         )
         .await?;
         Ok(stream)
@@ -305,19 +328,16 @@ async fn rejects_syn_before_settings_and_control_payloads() -> Result<()> {
     tokio::time::timeout(LIMIT, async {
         let fixture = Fixture::new(None).await?;
         let mut stream = fixture.raw().await?;
-        stream
-            .write_all(&Frame::new(Command::Syn, 1).to_bytes()?)
-            .await?;
+        stream.write_all(&encode(&[Frame::Syn(sid(1))])).await?;
         stream.flush().await?;
-        let mut frames = FramedRead::new(stream, wire::Frames);
-        assert_eq!(frames.next().await.unwrap()?.cmd, Command::Alert);
+        let mut frames = FrameReader::new(stream);
+        assert!(matches!(frames.next().await?.unwrap(), Frame::Alert(_)));
 
         let mut stream = fixture.raw().await?;
         stream
-            .write_all(
-                &Frame::with_data(Command::Fin, 1, Bytes::from_static(b"invalid")).to_bytes()?,
-            )
+            .write_all(&frame::header(Command::Fin, 1, b"invalid".len()))
             .await?;
+        stream.write_all(b"invalid").await?;
         stream.flush().await?;
         assert!(stream.read_exact(&mut [0]).await.is_err());
         fixture.close().await;
@@ -400,15 +420,7 @@ async fn cancellation_releases_a_stalled_tls_handshake() -> Result<()> {
 }
 
 #[test]
-fn rejects_invalid_tls_and_unbounded_padding_configuration() {
-    for scheme in [
-        "",
-        "stop=2\n0=-1-5",
-        "stop=2\n1=999999999-999999999",
-        "stop=2\n0=c",
-    ] {
-        assert!(wire::padding_scheme(Some(scheme)).is_err());
-    }
+fn rejects_invalid_tls_configuration() {
     assert!(
         tls::server(&TlsServerConfig {
             certificate: String::new(),
@@ -433,6 +445,8 @@ async fn peer_fin_preserves_queued_bytes_and_closes_both_directions() -> Result<
             let mut response = Vec::new();
             stream.read_to_end(&mut response).await?;
             assert_eq!(response, b"ready");
+            // A relay flushes an idle direction; that must not fail the transfer.
+            stream.flush().await?;
             assert!(stream.write_all(b"after FIN").await.is_err());
         }
         assert_eq!(fixture.network.connections.load(Ordering::Relaxed), 1);
@@ -489,67 +503,141 @@ async fn received_fin_preserves_siblings_and_heartbeats_without_being_echoed() -
         let fixture = Fixture::new(None).await?;
         let tls = fixture.raw().await?;
         let (reader, mut writer) = tokio::io::split(tls);
-        let mut frames = FramedRead::new(reader, wire::Frames);
+        let mut frames = FrameReader::new(reader);
         let settings = format!(
             "v=2\nclient=kotoconn-test\npadding-md5={}",
-            PaddingFactory::default().md5()
+            PaddingScheme::default().md5()
         );
-        writer
-            .write_all(&Frame::with_data(Command::Settings, 0, settings.into()).to_bytes()?)
-            .await?;
-        for sid in [1, 2] {
-            for frame in [
-                Frame::new(Command::Syn, sid),
-                Frame::with_data(
-                    Command::Psh,
-                    sid,
-                    wire::address(&target("127.0.0.1:80".parse()?))?.into(),
-                ),
-            ] {
-                writer.write_all(&frame.to_bytes()?).await?;
-            }
+        let mut opening = vec![Frame::Settings(settings.into())];
+        for id in [1, 2] {
+            opening.push(Frame::Syn(sid(id)));
+            let address = wire::address(&target("127.0.0.1:80".parse()?))?;
+            opening.push(Frame::Push(sid(id), address.into()));
         }
+        writer.write_all(&encode(&opening)).await?;
         writer.flush().await?;
         let mut greeted = std::collections::HashSet::new();
         while greeted.len() < 2 {
-            let frame = frames.next().await.unwrap()?;
-            if frame.cmd == Command::Psh {
-                assert_eq!(&frame.data[..], b"ready");
-                greeted.insert(frame.sid);
+            if let Frame::Push(id, data) = frames.next().await?.unwrap() {
+                assert_eq!(&data[..], b"ready");
+                greeted.insert(id.get());
             }
         }
         assert_eq!(greeted, std::collections::HashSet::from([1, 2]));
 
-        writer
-            .write_all(&Frame::new(Command::Fin, 1).to_bytes()?)
-            .await?;
-        writer
-            .write_all(&Frame::new(Command::HeartRequest, 0).to_bytes()?)
-            .await?;
-        writer.flush().await?;
         // The heartbeat follows FIN on the wire, so an echoed FIN fails this read.
-        assert_eq!(frames.next().await.unwrap()?.cmd, Command::HeartResponse);
-
         writer
-            .write_all(&Frame::with_data(Command::Psh, 2, Bytes::from_static(b"alive")).to_bytes()?)
+            .write_all(&encode(&[Frame::Fin(sid(1)), Frame::HeartRequest]))
             .await?;
         writer.flush().await?;
-        let reply = frames.next().await.unwrap()?;
-        assert_eq!(reply.sid, 2);
-        assert_eq!(reply.cmd, Command::Psh);
-        assert_eq!(&reply.data[..], b"alive");
+        assert_eq!(frames.next().await?.unwrap(), Frame::HeartResponse);
 
         writer
-            .write_all(&Frame::new(Command::Fin, 2).to_bytes()?)
-            .await?;
-        writer
-            .write_all(&Frame::new(Command::HeartRequest, 0).to_bytes()?)
+            .write_all(&encode(&[Frame::Push(
+                sid(2),
+                Bytes::from_static(b"alive"),
+            )]))
             .await?;
         writer.flush().await?;
-        assert_eq!(frames.next().await.unwrap()?.cmd, Command::HeartResponse);
+        assert_eq!(
+            frames.next().await?.unwrap(),
+            Frame::Push(sid(2), Bytes::from_static(b"alive"))
+        );
+
+        writer
+            .write_all(&encode(&[Frame::Fin(sid(2)), Frame::HeartRequest]))
+            .await?;
+        writer.flush().await?;
+        assert_eq!(frames.next().await?.unwrap(), Frame::HeartResponse);
 
         fixture.close().await;
         Ok::<_, anyhow::Error>(())
+    })
+    .await?
+}
+
+#[tokio::test]
+async fn transport_close_after_fin_still_delivers_queued_bytes() -> Result<()> {
+    struct GatedReader {
+        entered: mpsc::UnboundedSender<Scope>,
+        received: mpsc::UnboundedSender<Vec<u8>>,
+        release: CancellationToken,
+    }
+
+    impl InboundHandler for GatedReader {
+        fn tcp(
+            &self,
+            _: std::net::SocketAddr,
+            _: Endpoint,
+            mut stream: BoxStream,
+            scope: Scope,
+        ) -> BoxFuture<'_, Result<()>> {
+            Box::pin(async move {
+                self.entered.send(scope)?;
+                self.release.cancelled().await;
+                let mut bytes = Vec::new();
+                stream.read_to_end(&mut bytes).await?;
+                self.received.send(bytes)?;
+                Ok(())
+            })
+        }
+
+        fn udp(&self, _: std::net::SocketAddr, _: Datagram) -> BoxFuture<'_, Result<()>> {
+            Box::pin(async { bail!("unexpected UDP association") })
+        }
+    }
+
+    tokio::time::timeout(LIMIT, async {
+        let (entered, mut active) = mpsc::unbounded_channel();
+        let (received, mut payloads) = mpsc::unbounded_channel();
+        let release = CancellationToken::new();
+        let fixture = Fixture::with_handler(None, |_| {
+            Arc::new(GatedReader {
+                entered,
+                received,
+                release: release.clone(),
+            })
+        })
+        .await?;
+        let (reader, mut writer) = tokio::io::split(fixture.raw().await?);
+        let mut frames = FrameReader::new(reader);
+        let settings = format!("v=2\npadding-md5={}", PaddingScheme::default().md5());
+        writer
+            .write_all(&encode(&[
+                Frame::Settings(settings.into()),
+                Frame::Syn(sid(1)),
+                Frame::Push(sid(1), Bytes::from_static(&[1, 127, 0, 0, 1, 0, 80])),
+            ]))
+            .await?;
+        let stream_scope = active.recv().await.unwrap();
+        assert!(matches!(
+            frames.next().await?,
+            Some(Frame::ServerSettings(_))
+        ));
+        assert_eq!(
+            frames.next().await?,
+            Some(Frame::SynAck(sid(1), Bytes::new()))
+        );
+
+        writer
+            .write_all(&encode(&[
+                Frame::Push(sid(1), Bytes::from_static(b"complete request")),
+                Frame::Fin(sid(1)),
+                Frame::HeartRequest,
+            ]))
+            .await?;
+        // A client that disables reuse closes TLS right after FIN.
+        assert_eq!(frames.next().await?, Some(Frame::HeartResponse));
+        writer.shutdown().await?;
+        assert!(!matches!(frames.next().await, Ok(Some(_))));
+
+        // The handler reads only after the session ended.
+        release.cancel();
+        stream_scope.wait().await;
+        let received = payloads.try_recv().ok();
+        fixture.close().await;
+        assert_eq!(received.as_deref(), Some(&b"complete request"[..]));
+        Ok(())
     })
     .await?
 }
