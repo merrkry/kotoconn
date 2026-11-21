@@ -106,7 +106,9 @@ where
         };
 
         // The peer can reset the connection before its address is read.
-        let local = match stream.local_addr() {
+        // Relayed responses and handshake replies must not wait for the
+        // peer's delayed ACK, matching connected outbound sockets.
+        let local = match stream.set_nodelay(true).and_then(|()| stream.local_addr()) {
             Ok(local) => local,
             Err(error) => {
                 tracing::debug!(%peer, %error, "connection failed after accept");
