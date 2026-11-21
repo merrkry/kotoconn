@@ -1,13 +1,26 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended", "docker:enableMajor", ":maintainLockFilesWeekly"],
+  "extends": ["config:recommended", "docker:enableMajor", ":maintainLockFilesWeekly", "group:all"],
   "timezone": "Asia/Shanghai",
   "commitMessagePrefix": "deps:",
+  "cloneSubmodules": true,
   "packageRules": [
     {
       "description": "Match the local pnpm minimum release age.",
       "matchDatasources": ["npm"],
       "minimumReleaseAge": "7 days"
+    },
+    {
+      "description": "anytls 0.4+ drops the sans-IO session engine and multiplexing that crates/anytls builds on.",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["anytls"],
+      "allowedVersions": "<0.4"
+    },
+    {
+      "description": "The interop reference names anytls-go through a replace directive; the placeholder module has no upstream.",
+      "matchManagers": ["gomod"],
+      "matchPackageNames": ["anytls"],
+      "enabled": false
     }
   ],
   "customManagers": [
