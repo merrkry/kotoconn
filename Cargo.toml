@@ -28,7 +28,6 @@ publish = false
 
 [workspace.dependencies]
 anyhow = "1.0.104"
-anytls = { version = "0.3.17", default-features = false, features = ["core"] }
 base64 = "0.23.0"
 bytes = "1.12.1"
 blake2 = "0.11.0"
@@ -48,6 +47,7 @@ hickory-server = { version = "0.26.3", default-features = false }
 http = "1.5.0"
 httparse = "1.10.1"
 ipnet = "2.12.2"
+md-5 = { version = "0.11.0", default-features = false }
 kotoconn-config = { path = "crates/config" }
 kotoconn-anytls = { path = "crates/anytls" }
 kotoconn-daemon = { path = "crates/daemon" }

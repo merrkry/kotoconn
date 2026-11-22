@@ -1,17 +1,16 @@
-use crate::{session::Session, tls, udp, wire};
+use crate::{padding::PaddingScheme, session::Session, tls, udp, wire};
 use anyhow::Result;
-use anytls::core::PaddingFactory;
 use futures_util::future::BoxFuture;
 use kotoconn_config::AnyTlsInboundConfig;
 use kotoconn_protocol::{self as p, *};
 use std::net::SocketAddr;
-use tokio::{net::TcpListener, sync::watch};
+use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 pub struct Server {
     acceptor: TlsAcceptor,
     password: [u8; 32],
-    padding: PaddingFactory,
+    padding: PaddingScheme,
 }
 
 impl Server {
@@ -19,7 +18,10 @@ impl Server {
         Ok(Self {
             acceptor: tls::server(&options.tls)?,
             password: wire::password_hash(&options.password),
-            padding: wire::padding_scheme(options.padding_scheme.as_deref())?,
+            padding: match &options.padding_scheme {
+                Some(raw) => PaddingScheme::parse(raw.as_bytes())?,
+                None => PaddingScheme::default(),
+            },
         })
     }
 }
@@ -58,12 +60,11 @@ impl p::Server for Server {
                             };
                             let streams = scope.clone();
                             let stopping = context.stopping.clone();
-                            let (padding, _) = watch::channel(padding);
-                            let session = Session::start(
+                            let closed = Session::server(
                                 tls,
                                 &scope,
                                 padding,
-                                Some(Box::new(move |mut stream| {
+                                Box::new(move |mut stream| {
                                     if context.stopping.is_cancelled() {
                                         return Ok(());
                                     }
@@ -96,12 +97,13 @@ impl p::Server for Server {
                                             handler.tcp(peer, destination, stream, work_scope).await
                                         }
                                     })
-                                })),
-                                None,
-                                Some(stopping),
+                                }),
+                                stopping,
                             )?;
-                            session.closed.cancelled().await;
-                            scope.close();
+                            // Streams closed by the peer's FIN still deliver
+                            // their queued bytes; open streams fail when the
+                            // session ends.
+                            closed.cancelled().await;
                             Ok(())
                         }
                     },

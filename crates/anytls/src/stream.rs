@@ -1,8 +1,8 @@
-use crate::session::{Dropped, Message};
-use bytes::Bytes;
-use futures_util::future::BoxFuture;
-use kotoconn_protocol::{Stream, WorkGuard};
+use crate::{frame::Sid, session::Write};
+use bytes::{Buf, Bytes};
+use kotoconn_protocol::{ChunkBuffer, PeerStoppedReading, Stream, WorkGuard, pool::Pool};
 use std::{
+    future::Future,
     io,
     pin::Pin,
     sync::{Arc, OnceLock},
@@ -12,22 +12,27 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::{OwnedSemaphorePermit, mpsc, oneshot},
 };
-use tokio_util::{
-    sync::WaitForCancellationFutureOwned,
-    sync::{CancellationToken, PollSender},
-};
+use tokio_util::sync::{CancellationToken, PollSender, WaitForCancellationFutureOwned};
 
 pub(crate) const CHUNK: usize = 16 * 1024;
 
 pub(crate) struct Received {
     pub bytes: Bytes,
-    pub _credit: OwnedSemaphorePermit,
+    pub credit: OwnedSemaphorePermit,
+}
+
+/// Asks the session to remove a stream and send FIN unless the peer closed it.
+pub(crate) struct Closed {
+    pub sid: Sid,
+    pub _work: Option<WorkGuard>,
+    /// Completes once the FIN reached the transport; dropped if the session
+    /// ends first.
+    pub complete: Option<oneshot::Sender<()>>,
 }
 
 #[derive(Default)]
 pub(crate) struct Status {
     pub closed: CancellationToken,
-    pub accepted: CancellationToken,
     pub error: OnceLock<String>,
 }
 
@@ -50,75 +55,112 @@ impl Status {
     }
 }
 
+/// Received bytes not yet accepted by the reader, holding their receive credit.
+struct Held {
+    bytes: Bytes,
+    _credit: OwnedSemaphorePermit,
+    /// Bytes handed out by `poll_read_chunk` and awaiting `consume_chunk`.
+    lent: usize,
+}
+
 pub(crate) struct LogicalStream {
-    sid: u32,
+    sid: Sid,
     incoming: mpsc::UnboundedReceiver<Received>,
-    pending: Option<Received>,
-    outgoing: PollSender<Message>,
-    dropped: mpsc::UnboundedSender<Dropped>,
+    held: Option<Held>,
+    outgoing: PollSender<Write>,
+    closing: mpsc::UnboundedSender<Closed>,
     work: Option<WorkGuard>,
     status: Arc<Status>,
     closed: Pin<Box<WaitForCancellationFutureOwned>>,
-    flushing: Option<BoxFuture<'static, io::Result<()>>>,
+    pool: Pool,
     shutdown: bool,
+    closing_complete: Option<oneshot::Receiver<()>>,
 }
 
 impl LogicalStream {
-    pub async fn wait_handshake(&mut self) -> io::Result<()> {
-        tokio::select! {
-            biased;
-            _ = self.status.accepted.cancelled() => Ok(()),
-            _ = self.status.closed.cancelled() => Err(self.status.error()),
-        }
-    }
-
     pub fn new(
-        sid: u32,
+        sid: Sid,
         incoming: mpsc::UnboundedReceiver<Received>,
-        outgoing: mpsc::Sender<Message>,
-        dropped: mpsc::UnboundedSender<Dropped>,
+        outgoing: mpsc::Sender<Write>,
+        closing: mpsc::UnboundedSender<Closed>,
         status: Arc<Status>,
         work: Option<WorkGuard>,
     ) -> Self {
         Self {
             sid,
             incoming,
-            pending: None,
+            held: None,
             outgoing: PollSender::new(outgoing),
-            dropped,
+            closing,
             work,
             closed: Box::pin(status.closed.clone().cancelled_owned()),
             status,
-            flushing: None,
+            pool: Pool::shared(),
             shutdown: false,
+            closing_complete: None,
         }
     }
 
-    fn poll_ack(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if let Some(flushing) = &mut self.flushing {
-            let result = ready!(flushing.as_mut().poll(cx));
-            self.flushing = None;
-            result?;
+    /// Received bytes are buffered until the peer's FIN; then end of stream follows.
+    fn poll_held(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<&mut Held>>> {
+        if self.held.is_none() {
+            match ready!(self.incoming.poll_recv(cx)) {
+                Some(Received { bytes, credit }) => {
+                    self.held = Some(Held {
+                        bytes,
+                        _credit: credit,
+                        lent: 0,
+                    });
+                }
+                None if self.status.error.get().is_some() => {
+                    return Poll::Ready(Err(self.status.error()));
+                }
+                None => return Poll::Ready(Ok(None)),
+            }
         }
-        Poll::Ready(Ok(()))
+        Poll::Ready(Ok(self.held.as_mut()))
     }
 
-    fn ack(&mut self, receiver: oneshot::Receiver<io::Result<()>>) {
-        self.flushing = Some(Box::pin(async move {
-            receiver
-                .await
-                .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?
-        }));
+    fn poll_reserve(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            if self.shutdown {
+                return Poll::Ready(Err(self.status.error()));
+            }
+            if self.status.closed.is_cancelled() {
+                return Poll::Ready(Err(match self.status.error.get() {
+                    Some(_) => self.status.error(),
+                    None => PeerStoppedReading::error(),
+                }));
+            }
+            if let Poll::Ready(reserved) = self.outgoing.poll_reserve(cx) {
+                reserved.map_err(|_| self.status.error())?;
+                return Poll::Ready(Ok(()));
+            }
+            // A FIN must reach a writer waiting for queue space as well.
+            ready!(self.closed.as_mut().poll(cx));
+        }
+    }
+
+    /// Requires a slot from `poll_reserve`.
+    fn send(&mut self, data: Bytes) -> io::Result<()> {
+        let write = Write::Push {
+            sid: self.sid,
+            data,
+        };
+        self.outgoing
+            .send_item(write)
+            .map_err(|_| self.status.error())
     }
 }
 
 impl Drop for LogicalStream {
     fn drop(&mut self) {
-        // Only one handle exists per SID; the drop channel contains at most one
-        // entry per admitted stream, independently of data-channel backpressure.
-        let _ = self.dropped.send(Dropped {
+        // At most a shutdown and a drop notice exist per admitted stream, so
+        // this channel stays bounded independently of data backpressure.
+        let _ = self.closing.send(Closed {
             sid: self.sid,
             _work: self.work.take(),
+            complete: None,
         });
     }
 }
@@ -132,93 +174,118 @@ impl AsyncRead for LogicalStream {
         if out.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
-
-        if self.pending.is_none() {
-            match ready!(self.incoming.poll_recv(cx)) {
-                Some(bytes) => self.pending = Some(bytes),
-                None => {
-                    return Poll::Ready(match self.status.error.get() {
-                        Some(_) => Err(self.status.error()),
-                        None => Ok(()),
-                    });
-                }
-            }
-        }
-        // SAFETY: The branch above either installs a received chunk or returns.
-        let pending = self.pending.as_mut().expect("received chunk");
-        let length = out.remaining().min(pending.bytes.len());
-        out.put_slice(&pending.bytes.split_to(length));
-        if pending.bytes.is_empty() {
-            self.pending = None;
+        let Some(held) = ready!(self.poll_held(cx))? else {
+            return Poll::Ready(Ok(()));
+        };
+        debug_assert_eq!(held.lent, 0);
+        let length = out.remaining().min(held.bytes.len());
+        out.put_slice(&held.bytes.split_to(length));
+        if held.bytes.is_empty() {
+            self.held = None;
         }
         Poll::Ready(Ok(()))
     }
 }
 
+/// Writes queue PSH frames behind this stream's earlier frames. The peer's FIN
+/// closes both directions: later writes fail with [`PeerStoppedReading`],
+/// while bytes that arrived before the FIN stay readable.
 impl AsyncWrite for LogicalStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if self.shutdown || self.closed.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(Err(self.status.error()));
-        }
-        ready!(self.poll_ack(cx))?;
         if bytes.is_empty() {
             return Poll::Ready(Ok(0));
         }
-
-        ready!(self.outgoing.poll_reserve(cx)).map_err(|_| self.status.error())?;
+        ready!(self.poll_reserve(cx))?;
         let length = bytes.len().min(CHUNK);
-        let message = Message::Data {
-            sid: self.sid,
-            bytes: Bytes::copy_from_slice(&bytes[..length]),
-        };
-        self.outgoing
-            .send_item(message)
-            .map_err(|_| self.status.error())?;
+        let data = self.pool.copy(&bytes[..length]);
+        self.send(data)?;
         Poll::Ready(Ok(length))
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.flushing.is_none() {
-            if self.status.closed.is_cancelled() {
-                return Poll::Ready(Err(self.status.error()));
-            }
-            ready!(self.outgoing.poll_reserve(cx)).map_err(|_| self.status.error())?;
-            let (send, receive) = oneshot::channel();
-            let message = Message::Flush {
-                sid: self.sid,
-                complete: send,
-            };
-            self.outgoing
-                .send_item(message)
-                .map_err(|_| self.status.error())?;
-            self.ack(receive);
-        }
-        self.poll_ack(cx)
+    /// Like a TCP send buffer: accepted writes already belong to the session
+    /// writer, which flushes whenever it drains its queue. Failing to send them
+    /// surfaces on later writes and on shutdown.
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 
+    /// AnyTLS has no half-close: FIN ends both directions, so replies, and a
+    /// SYNACK rejection, arriving after it have no stream left to reach. The
+    /// reference client closes its stream the same way when its upload ends.
+    /// Completes once FIN and every earlier write reached the transport, or
+    /// the peer closed the stream first.
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        ready!(self.poll_ack(cx))?;
-        if self.shutdown || self.status.closed.is_cancelled() {
-            return Poll::Ready(Ok(()));
+        if !self.shutdown {
+            self.shutdown = true;
+            if !self.status.closed.is_cancelled() {
+                let (complete, completed) = oneshot::channel();
+                let closed = Closed {
+                    sid: self.sid,
+                    _work: None,
+                    complete: Some(complete),
+                };
+                self.closing.send(closed).map_err(|_| self.status.error())?;
+                self.closing_complete = Some(completed);
+            }
         }
-
-        ready!(self.outgoing.poll_reserve(cx)).map_err(|_| self.status.error())?;
-        let (send, receive) = oneshot::channel();
-        let message = Message::Close {
-            sid: self.sid,
-            complete: send,
-        };
-        self.outgoing
-            .send_item(message)
-            .map_err(|_| self.status.error())?;
-        self.shutdown = true;
-        self.ack(receive);
-        self.poll_ack(cx)
+        if let Some(completed) = &mut self.closing_complete {
+            let sent = ready!(Pin::new(completed).poll(cx));
+            self.closing_complete = None;
+            sent.map_err(|_| self.status.error())?;
+        }
+        // A session failure or a rejected handshake leaves an error behind.
+        match self.status.error.get() {
+            Some(_) => Poll::Ready(Err(self.status.error())),
+            None => Poll::Ready(Ok(())),
+        }
     }
 }
 
-impl Stream for LogicalStream {}
+impl Stream for LogicalStream {
+    fn poll_read_chunk(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        _buffer: &mut ChunkBuffer,
+    ) -> Poll<io::Result<Bytes>> {
+        let Some(held) = ready!(self.poll_held(cx))? else {
+            return Poll::Ready(Ok(Bytes::new()));
+        };
+        debug_assert_eq!(held.lent, 0);
+        held.lent = held.bytes.len();
+        Poll::Ready(Ok(held.bytes.clone()))
+    }
+
+    fn consume_chunk(mut self: Pin<&mut Self>, bytes: usize) {
+        let Some(held) = &mut self.held else {
+            debug_assert_eq!(bytes, 0, "consumed bytes that were never read");
+            return;
+        };
+        debug_assert!(bytes <= held.lent);
+        held.lent -= bytes;
+        held.bytes.advance(bytes);
+        if held.bytes.is_empty() {
+            // Dropping the chunk returns its credit to the session reader.
+            debug_assert_eq!(held.lent, 0);
+            self.held = None;
+        }
+    }
+
+    fn poll_write_chunk(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &mut Bytes,
+    ) -> Poll<io::Result<usize>> {
+        if bytes.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        ready!(self.poll_reserve(cx))?;
+        let data = bytes.split_to(bytes.len().min(CHUNK));
+        let length = data.len();
+        self.send(data)?;
+        Poll::Ready(Ok(length))
+    }
+}

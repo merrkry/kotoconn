@@ -35,8 +35,37 @@ impl Default for ChunkBuffer {
     }
 }
 
+/// A write error meaning the peer stopped reading while bytes it sent earlier
+/// may still be readable, as after an AnyTLS FIN. A relay keeps forwarding the
+/// other direction and discards this direction's input until it ends: closing
+/// a source with unread input resets the connection, which can discard the
+/// reply just forwarded to it. As with a half-closed TCP peer, the relay ends
+/// when the source does.
+#[derive(Debug)]
+pub struct PeerStoppedReading;
+
+impl PeerStoppedReading {
+    pub fn error() -> io::Error {
+        io::Error::new(io::ErrorKind::BrokenPipe, Self)
+    }
+
+    pub fn is(error: &io::Error) -> bool {
+        error.get_ref().is_some_and(|inner| inner.is::<Self>())
+    }
+}
+
+impl std::fmt::Display for PeerStoppedReading {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("peer stopped reading")
+    }
+}
+
+impl std::error::Error for PeerStoppedReading {}
+
 /// Chunk writes consume exactly the accepted prefix. Pending never changes the
 /// caller's chunk. Receive credit is returned explicitly after destination acceptance.
+/// Streams that can tell the peer will not read their writes fail them with
+/// [`PeerStoppedReading`]; other write errors fail the whole relay.
 pub trait Stream: AsyncRead + AsyncWrite + Send {
     /// True only after setup when a worker may poll the established byte stream
     /// directly. Codecs can decline and continue using the ordinary chunk relay.
@@ -219,13 +248,22 @@ impl Stream for Prefix {
     }
 }
 
+#[derive(Default, PartialEq, Eq)]
+enum Phase {
+    #[default]
+    Copying,
+    /// The destination stopped reading; the source is read to its end.
+    Draining,
+    Done,
+}
+
 #[derive(Default)]
 struct Direction {
     buffer: ChunkBuffer,
     bytes: Bytes,
     transferred: u64,
     eof: bool,
-    done: bool,
+    phase: Phase,
 }
 
 impl Direction {
@@ -233,11 +271,51 @@ impl Direction {
         &mut self,
         cx: &mut Context<'_>,
         mut reader: Pin<&mut dyn Stream>,
+        writer: Pin<&mut dyn Stream>,
+    ) -> Poll<io::Result<()>> {
+        if self.phase == Phase::Copying {
+            match self.transfer(cx, reader.as_mut(), writer) {
+                Poll::Ready(Err(error)) if PeerStoppedReading::is(&error) => {
+                    reader.as_mut().consume_chunk(self.bytes.len());
+                    self.bytes = Bytes::new();
+                    self.phase = if self.eof {
+                        Phase::Done
+                    } else {
+                        Phase::Draining
+                    };
+                }
+                result => return result,
+            }
+        }
+        if self.phase == Phase::Draining {
+            return self.drain(cx, reader);
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn drain(
+        &mut self,
+        cx: &mut Context<'_>,
+        mut reader: Pin<&mut dyn Stream>,
+    ) -> Poll<io::Result<()>> {
+        for _ in 0..32 {
+            let bytes = ready!(reader.as_mut().poll_read_chunk(cx, &mut self.buffer))?;
+            if bytes.is_empty() {
+                self.phase = Phase::Done;
+                return Poll::Ready(Ok(()));
+            }
+            reader.as_mut().consume_chunk(bytes.len());
+        }
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+
+    fn transfer(
+        &mut self,
+        cx: &mut Context<'_>,
+        mut reader: Pin<&mut dyn Stream>,
         mut writer: Pin<&mut dyn Stream>,
     ) -> Poll<io::Result<()>> {
-        if self.done {
-            return Poll::Ready(Ok(()));
-        }
         for _ in 0..32 {
             if self.bytes.is_empty() && !self.eof {
                 match reader.as_mut().poll_read_chunk(cx, &mut self.buffer) {
@@ -253,7 +331,7 @@ impl Direction {
             }
             if self.eof {
                 ready!(writer.as_mut().poll_shutdown(cx))?;
-                self.done = true;
+                self.phase = Phase::Done;
                 return Poll::Ready(Ok(()));
             }
             let before = self.bytes.len();
@@ -295,4 +373,63 @@ pub async fn relay(a: &mut BoxStream, mut b: BoxStream) -> io::Result<(u64, u64)
         b = peer.expect("declined stream takeover");
     }
     copy_bidirectional(a, &mut b).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A peer that already closed: its reply stays readable, writes are refused.
+    struct Closed(Bytes);
+
+    impl AsyncRead for Closed {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            out: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let length = out.remaining().min(self.0.len());
+            out.put_slice(&self.0.split_to(length));
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for Closed {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(PeerStoppedReading::error()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Stream for Closed {}
+
+    #[tokio::test]
+    async fn a_peer_that_stopped_reading_still_delivers_its_reply() {
+        let (local, mut app) = tokio::io::duplex(64);
+        let mut local: BoxStream = Box::pin(local);
+        let peer: BoxStream = Box::pin(Closed(Bytes::from_static(b"rejected")));
+        let client = async {
+            // The client is still uploading when the reply arrives.
+            app.write_all(&[1; 4096]).await.unwrap();
+            let mut reply = Vec::new();
+            app.read_to_end(&mut reply).await.unwrap();
+            app.shutdown().await.unwrap();
+            reply
+        };
+        let relaying = async { tokio::join!(relay(&mut local, peer), client) };
+        let limit = std::time::Duration::from_secs(10);
+        let (relayed, reply) = tokio::time::timeout(limit, relaying).await.unwrap();
+        assert_eq!(relayed.unwrap(), (0, 8));
+        assert_eq!(reply, b"rejected");
+    }
 }
