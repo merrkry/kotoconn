@@ -9,7 +9,7 @@ use std::{
 };
 use tokio::sync::oneshot;
 
-pub use crate::chunk::{ChunkBuffer, Stream, copy_bidirectional, prefix};
+pub use crate::chunk::{ChunkBuffer, PeerStoppedReading, Stream, copy_bidirectional, prefix};
 pub use crate::scoped::stream_task;
 
 pub type BoxStream = Pin<Box<dyn Stream>>;

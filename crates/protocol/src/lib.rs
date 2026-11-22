@@ -18,8 +18,8 @@ pub use chunk::relay;
 pub use control::{CloseScope, Scope, WorkGuard};
 use futures_util::future::BoxFuture;
 pub use io::{
-    BoxStream, ChunkBuffer, Datagram, DatagramWorker, Packet, Stream, copy_bidirectional,
-    packet_pair, prefix, stream_task,
+    BoxStream, ChunkBuffer, Datagram, DatagramWorker, Packet, PeerStoppedReading, Stream,
+    copy_bidirectional, packet_pair, prefix, stream_task,
 };
 pub use kotoconn_config::{Endpoint, TransportProtocol};
 pub use packet_io::{BoxPacketIo, NativeDatagram, PacketIo, packet_io_task};
