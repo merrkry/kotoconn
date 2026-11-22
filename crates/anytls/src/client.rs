@@ -227,8 +227,6 @@ impl p::OutboundAdapter for Client {
         Box::pin(async move {
             let mut address = wire::address(&udp::sentinel())?;
             address.extend(udp::request(&destination)?);
-            // Send the UoT request before waiting for SYNACK: reference servers
-            // acknowledge only after reading the connected UDP destination.
             let stream = self.open(address.into(), scope.clone()).await?;
             udp::start(stream, Some(destination), scope)
         })

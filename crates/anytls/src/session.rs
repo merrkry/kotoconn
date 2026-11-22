@@ -10,6 +10,7 @@ use std::{collections::HashMap, io::IoSlice, sync::Arc};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
+    time::Instant,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -51,10 +52,11 @@ pub(crate) struct Handle {
 }
 
 impl Handle {
+    /// Returns once SYN is queued, as the reference client does. A rejecting
+    /// SYNACK closes the stream with its error.
     pub async fn open(&self, address: Bytes, work: WorkGuard) -> Result<BoxStream> {
-        // Until the server acknowledges or rejects the stream, a cancelled open,
-        // including a handshake timeout, retires this reserved session: one that
-        // stopped answering SYN must not return to the pool.
+        // Before publication there is no logical stream whose Drop can return
+        // this reserved session to the pool. Cancel it if enqueue is cancelled.
         struct Opening(Option<Scope>);
 
         impl Drop for Opening {
@@ -75,12 +77,9 @@ impl Handle {
             })
             .await
             .map_err(|_| anyhow::anyhow!("AnyTLS session closed"))?;
-
-        let mut stream = receive.await??;
-        let handshake = stream.wait_handshake().await;
         opening.0 = None;
-        handshake?;
-        Ok(Box::pin(stream))
+
+        Ok(Box::pin(receive.await??))
     }
 }
 
@@ -140,6 +139,11 @@ pub(crate) struct Session {
     entries: HashMap<Sid, Entry>,
     receive_credit: Arc<Semaphore>,
     blocked: Option<Blocked>,
+    /// The client's stream still waiting for SYNACK. A server that leaves it
+    /// unanswered has stalled, so the session returns to the pool only once
+    /// SYNACK arrives, which also keeps a single stream awaiting it. While a
+    /// stuck writer holds up the run loop, its write timeout ends the session.
+    unacknowledged: Option<(Sid, Instant)>,
     last_sid: u32,
     closed: mpsc::UnboundedReceiver<Closed>,
     close_sender: mpsc::UnboundedSender<Closed>,
@@ -208,6 +212,7 @@ impl Session {
             entries: HashMap::new(),
             receive_credit: Arc::new(Semaphore::new(RECEIVE_BYTES)),
             blocked: None,
+            unacknowledged: None,
             last_sid: 0,
             closed,
             close_sender,
@@ -254,6 +259,13 @@ impl Session {
                     self.received(frame).await?;
                 }
                 credit = blocked_credit(&self.receive_credit, &self.blocked) => self.deliver(credit),
+                sid = acknowledgement_deadline(self.unacknowledged) => {
+                    let error = "AnyTLS server did not acknowledge the stream";
+                    if let Some(entry) = self.entries.get(&sid) {
+                        entry.status.close(Some(error.into()));
+                    }
+                    bail!(error);
+                }
                 open = next_open(&mut self.role), if !ending => match open {
                     Some(open) => self.open(open).await?,
                     None => ending = true,
@@ -306,6 +318,7 @@ impl Session {
 
     async fn open(&mut self, open: Open) -> Result<()> {
         ensure!(self.entries.is_empty(), "AnyTLS session is busy");
+        debug_assert!(self.unacknowledged.is_none(), "pooled before SYNACK");
         let Role::Client {
             padding, started, ..
         } = &mut self.role
@@ -333,6 +346,7 @@ impl Session {
         let sid = Sid::new(self.last_sid).expect("nonzero stream ID");
         frames.push(Frame::Syn(sid));
         frames.push(Frame::Push(sid, open.address));
+        self.unacknowledged = Some((sid, Instant::now() + crate::HANDSHAKE_TIMEOUT));
 
         // Settings, SYN and the target address form the first counted packet.
         self.send(&frames).await?;
@@ -345,6 +359,7 @@ impl Session {
     fn idle(&self) {
         if let Role::Client { idle, .. } = &self.role
             && self.entries.is_empty()
+            && self.unacknowledged.is_none()
         {
             idle();
         }
@@ -457,14 +472,20 @@ impl Session {
             unreachable!("client frame on a server session");
         };
         match frame {
-            Frame::SynAck(sid, error) if error.is_empty() => {
-                if let Some(entry) = self.entries.get(&sid) {
-                    entry.status.accepted.cancel();
-                }
-            }
             Frame::SynAck(sid, error) => {
-                let error = String::from_utf8_lossy(&error).into_owned();
-                self.close(sid, Some(error), None).await?;
+                // A rejection after a local close has no stream left to fail;
+                // closing already ended both directions.
+                if !error.is_empty() {
+                    let error = String::from_utf8_lossy(&error).into_owned();
+                    self.close(sid, Some(error), None).await?;
+                }
+                if self
+                    .unacknowledged
+                    .is_some_and(|(waiting, _)| waiting == sid)
+                {
+                    self.unacknowledged = None;
+                    self.idle();
+                }
             }
             Frame::UpdatePaddingScheme(raw) => match PaddingScheme::parse(&raw) {
                 // Later records of this session and every later session use it.
@@ -535,6 +556,14 @@ impl Session {
             }
         }
     }
+}
+
+async fn acknowledgement_deadline(unacknowledged: Option<(Sid, Instant)>) -> Sid {
+    let Some((sid, deadline)) = unacknowledged else {
+        return std::future::pending().await;
+    };
+    tokio::time::sleep_until(deadline).await;
+    sid
 }
 
 /// Pending unless a frame waits for credit.
@@ -830,17 +859,50 @@ mod tests {
         .await?
     }
 
+    #[tokio::test]
+    async fn a_session_returns_to_the_pool_only_after_synack() -> Result<()> {
+        tokio::time::timeout(LIMIT, async {
+            let (transport, peer) = tokio::io::duplex(4096);
+            let (reader, mut writer) = tokio::io::split(peer);
+            let mut frames = FrameReader::new(reader);
+            let scope = Scope::new();
+            let (padding, _) = watch::channel(PaddingScheme::parse(b"stop=1")?);
+            let (idled, mut idle) = mpsc::unbounded_channel();
+            let notify = Box::new(move || idled.send(()).unwrap());
+            let session = Session::client(transport, &scope.child(), padding, notify)?;
+            let address = Bytes::from_static(&[1, 127, 0, 0, 1, 0, 80]);
+            let mut stream = session.open(address, scope.track()?).await?;
+
+            // A short connection closes before the server answers SYN.
+            stream.shutdown().await?;
+            let sid = Sid::new(1).unwrap();
+            assert!(matches!(frames.next().await?, Some(Frame::Settings(_))));
+            assert_eq!(frames.next().await?, Some(Frame::Syn(sid)));
+            assert!(matches!(frames.next().await?, Some(Frame::Push(_, _))));
+            assert_eq!(frames.next().await?, Some(Frame::Fin(sid)));
+            assert!(idle.try_recv().is_err());
+
+            let mut reply = BytesMut::new();
+            Frame::SynAck(sid, Bytes::new()).encode(&mut reply);
+            writer.write_all(&reply).await?;
+            idle.recv().await.unwrap();
+            Ok(())
+        })
+        .await?
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn an_abandoned_synack_wait_retires_the_session() -> Result<()> {
+    async fn an_unacknowledged_stream_retires_the_session() -> Result<()> {
         let (transport, _peer) = tokio::io::duplex(4096);
         let scope = Scope::new();
-        let session_scope = scope.child();
         let (padding, _) = watch::channel(PaddingScheme::default());
-        let session = Session::client(transport, &session_scope, padding, Box::new(|| {}))?;
+        let session = Session::client(transport, &scope.child(), padding, Box::new(|| {}))?;
         let address = Bytes::from_static(&[1, 127, 0, 0, 1, 0, 80]);
-        let opening = session.open(address, scope.track()?);
-        assert!(tokio::time::timeout(LIMIT, opening).await.is_err());
-        assert!(session_scope.is_closed());
+        let mut stream = session.open(address, scope.track()?).await?;
+
+        // The peer never answers SYN; the paused clock reaches the deadline.
+        assert!(stream.read(&mut [0]).await.is_err());
+        session.closed.cancelled().await;
         Ok(())
     }
 
@@ -858,6 +920,7 @@ mod tests {
             entries: HashMap::new(),
             receive_credit: Arc::new(Semaphore::new(RECEIVE_BYTES)),
             blocked: None,
+            unacknowledged: None,
             last_sid: 0,
             closed,
             close_sender,
@@ -908,13 +971,12 @@ mod tests {
         assert!(waiting.as_mut().poll(&mut cx).is_pending());
         session.received(Frame::Fin(sid)).await.unwrap();
         assert!(wakes.0.load(std::sync::atomic::Ordering::Relaxed) > 0);
-        // Dropped like any write after FIN while the reply is unread.
-        waiting.await.unwrap();
+        let error = waiting.await.unwrap_err();
+        assert!(kotoconn_protocol::PeerStoppedReading::is(&error));
 
         let mut received = Vec::new();
         stream.read_to_end(&mut received).await.unwrap();
         assert_eq!(received, b"reply");
-        assert!(stream.write_all(b"after the reply").await.is_err());
     }
 
     #[tokio::test]
@@ -971,13 +1033,18 @@ mod tests {
 
             let (local, mut app) = tokio::io::duplex(64);
             let mut local: BoxStream = Box::pin(local);
-            app.write_all(b"pending request body").await?;
-            app.shutdown().await?;
-            kotoconn_protocol::relay(&mut local, stream).await?;
-            drop(local);
-            let mut response = Vec::new();
-            app.read_to_end(&mut response).await?;
-            assert_eq!(response, b"request rejected");
+            let client = async {
+                // Still uploading; the relay must drain this to deliver the reply.
+                app.write_all(&[1; 4096]).await?;
+                let mut response = Vec::new();
+                app.read_to_end(&mut response).await?;
+                app.shutdown().await?;
+                Ok::<_, anyhow::Error>(response)
+            };
+            let (relayed, response) =
+                tokio::join!(kotoconn_protocol::relay(&mut local, stream), client);
+            relayed?;
+            assert_eq!(response?, b"request rejected");
             Ok(())
         })
         .await?

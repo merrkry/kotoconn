@@ -307,15 +307,19 @@ async fn rejects_wrong_password_untrusted_certificate_and_wrong_name() -> Result
                 _ => options.tls.server_name = Some("wrong.invalid".into()),
             }
             let client = Client::new(&options, fixture.network.clone(), fixture.network.clone())?;
-            assert!(
-                p::OutboundAdapter::tcp(
-                    &client,
-                    target("127.0.0.1:80".parse()?),
-                    fixture.scope.child(),
-                )
-                .await
-                .is_err()
-            );
+            let opened = p::OutboundAdapter::tcp(
+                &client,
+                target("127.0.0.1:80".parse()?),
+                fixture.scope.child(),
+            )
+            .await;
+            // The server drops a wrong password without replying, after the
+            // client already returned the stream.
+            let failed = match opened {
+                Err(_) => true,
+                Ok(mut stream) => stream.read(&mut [0]).await.is_err(),
+            };
+            assert!(failed, "{kind}");
         }
         fixture.close().await;
         Ok::<_, anyhow::Error>(())
@@ -445,9 +449,8 @@ async fn peer_fin_preserves_queued_bytes_and_closes_both_directions() -> Result<
             let mut response = Vec::new();
             stream.read_to_end(&mut response).await?;
             assert_eq!(response, b"ready");
-            // A relay flushes an idle direction; that must not fail the transfer.
-            stream.flush().await?;
-            assert!(stream.write_all(b"after FIN").await.is_err());
+            let error = stream.write_all(b"after FIN").await.unwrap_err();
+            assert!(p::PeerStoppedReading::is(&error));
         }
         assert_eq!(fixture.network.connections.load(Ordering::Relaxed), 1);
         drop(client);

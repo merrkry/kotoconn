@@ -103,15 +103,14 @@ async fn rust_client_interoperates_with_official_go_server() -> Result<()> {
                 assert_eq!(reply.payload, payload);
             }
         }
-        assert!(
-            p::OutboundAdapter::tcp(
-                &client,
-                target("127.0.0.1:1".parse()?),
-                fixture.scope.child()
-            )
-            .await
-            .is_err()
-        );
+        // The official server reports its failed outbound connection in SYNACK.
+        let mut refused = p::OutboundAdapter::tcp(
+            &client,
+            target("127.0.0.1:1".parse()?),
+            fixture.scope.child(),
+        )
+        .await?;
+        assert!(refused.read(&mut [0]).await.is_err());
         assert!(fixture.network.connections.load(Ordering::Relaxed) >= 2);
         drop(active);
         drop(client);

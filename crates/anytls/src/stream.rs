@@ -1,6 +1,6 @@
 use crate::{frame::Sid, session::Write};
 use bytes::{Buf, Bytes};
-use kotoconn_protocol::{ChunkBuffer, Stream, WorkGuard, pool::Pool};
+use kotoconn_protocol::{ChunkBuffer, PeerStoppedReading, Stream, WorkGuard, pool::Pool};
 use std::{
     future::Future,
     io,
@@ -33,7 +33,6 @@ pub(crate) struct Closed {
 #[derive(Default)]
 pub(crate) struct Status {
     pub closed: CancellationToken,
-    pub accepted: CancellationToken,
     pub error: OnceLock<String>,
 }
 
@@ -64,11 +63,6 @@ struct Held {
     lent: usize,
 }
 
-enum Slot {
-    Reserved,
-    Discard,
-}
-
 pub(crate) struct LogicalStream {
     sid: Sid,
     incoming: mpsc::UnboundedReceiver<Received>,
@@ -84,14 +78,6 @@ pub(crate) struct LogicalStream {
 }
 
 impl LogicalStream {
-    pub async fn wait_handshake(&mut self) -> io::Result<()> {
-        tokio::select! {
-            biased;
-            _ = self.status.accepted.cancelled() => Ok(()),
-            _ = self.status.closed.cancelled() => Err(self.status.error()),
-        }
-    }
-
     pub fn new(
         sid: Sid,
         incoming: mpsc::UnboundedReceiver<Received>,
@@ -135,22 +121,20 @@ impl LogicalStream {
         Poll::Ready(Ok(self.held.as_mut()))
     }
 
-    fn poll_reserve(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Slot>> {
+    fn poll_reserve(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         loop {
             if self.shutdown {
                 return Poll::Ready(Err(self.status.error()));
             }
             if self.status.closed.is_cancelled() {
-                let peer_closed = self.status.error.get().is_none();
-                let unread = self.held.is_some() || !self.incoming.is_empty();
-                if peer_closed && unread {
-                    return Poll::Ready(Ok(Slot::Discard));
-                }
-                return Poll::Ready(Err(self.status.error()));
+                return Poll::Ready(Err(match self.status.error.get() {
+                    Some(_) => self.status.error(),
+                    None => PeerStoppedReading::error(),
+                }));
             }
             if let Poll::Ready(reserved) = self.outgoing.poll_reserve(cx) {
                 reserved.map_err(|_| self.status.error())?;
-                return Poll::Ready(Ok(Slot::Reserved));
+                return Poll::Ready(Ok(()));
             }
             // A FIN must reach a writer waiting for queue space as well.
             ready!(self.closed.as_mut().poll(cx));
@@ -204,11 +188,8 @@ impl AsyncRead for LogicalStream {
 }
 
 /// Writes queue PSH frames behind this stream's earlier frames. The peer's FIN
-/// closes both directions, so nothing written afterwards is ever read, yet
-/// bytes that arrived before it stay readable. Until the reader drains those,
-/// writes are accepted and dropped: failing them aborts a relay copying both
-/// ways before it forwards the bytes, and blocking them deadlocks a caller
-/// that reads only after its write completes. Later writes fail.
+/// closes both directions: later writes fail with [`PeerStoppedReading`],
+/// while bytes that arrived before the FIN stay readable.
 impl AsyncWrite for LogicalStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -218,9 +199,7 @@ impl AsyncWrite for LogicalStream {
         if bytes.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        if let Slot::Discard = ready!(self.poll_reserve(cx))? {
-            return Poll::Ready(Ok(bytes.len()));
-        }
+        ready!(self.poll_reserve(cx))?;
         let length = bytes.len().min(CHUNK);
         let data = self.pool.copy(&bytes[..length]);
         self.send(data)?;
@@ -234,6 +213,9 @@ impl AsyncWrite for LogicalStream {
         Poll::Ready(Ok(()))
     }
 
+    /// AnyTLS has no half-close: FIN ends both directions, so replies, and a
+    /// SYNACK rejection, arriving after it have no stream left to reach. The
+    /// reference client closes its stream the same way when its upload ends.
     /// Completes once FIN and every earlier write reached the transport, or
     /// the peer closed the stream first.
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -300,11 +282,7 @@ impl Stream for LogicalStream {
         if bytes.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        if let Slot::Discard = ready!(self.poll_reserve(cx))? {
-            let length = bytes.len();
-            bytes.clear();
-            return Poll::Ready(Ok(length));
-        }
+        ready!(self.poll_reserve(cx))?;
         let data = bytes.split_to(bytes.len().min(CHUNK));
         let length = data.len();
         self.send(data)?;
