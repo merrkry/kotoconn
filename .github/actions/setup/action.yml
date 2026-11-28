@@ -7,9 +7,9 @@ inputs:
 runs:
   using: composite
   steps:
-    - uses: jdx/mise-action@v4
+    - uses: jdx/mise-action@v5
       with:
-        version: 2026.11.12
+        version: 2026.11.14
     - name: Locate dependency stores
       id: stores
       shell: bash
@@ -19,7 +19,7 @@ runs:
         echo "cargo=${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_OUTPUT"
         echo "go-mod=$(mise exec -- go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
         echo "go-build=$(mise exec -- go env GOCACHE)" >> "$GITHUB_OUTPUT"
-    - uses: actions/cache@v5
+    - uses: actions/cache@v6
       with:
         path: |
           ${{ steps.stores.outputs.pnpm }}
@@ -30,7 +30,7 @@ runs:
         key: deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml') }}-${{ hashFiles('Cargo.lock', 'pnpm-lock.yaml', 'uv.lock', 'e2e/anytls/reference/go.mod', 'e2e/anytls/reference/go.sum') }}
         restore-keys: |
           deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml') }}-
-    - uses: actions/cache@v5
+    - uses: actions/cache@v6
       with:
         path: |
           target/debug

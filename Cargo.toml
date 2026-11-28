@@ -64,15 +64,15 @@ kotoconn-socks5 = { path = "crates/socks5" }
 kotoconn-tun = { path = "crates/tun" }
 kotoconn-typescript = { path = "crates/typescript" }
 moka = { version = "0.12.16", default-features = false, features = ["sync"] }
-oxc = { version = "0.149.0", default-features = false }
-parking_lot = "0.12.5"
-rand = "0.9.5"
+oxc = { version = "0.160.0", default-features = false }
+parking_lot = "0.13.0"
+rand = "0.10.0"
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 quinn-proto = { version = "0.11.18", default-features = false }
 rustls = { version = "0.23.44", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 sha2 = "0.11.0"
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
-rquickjs = "0.13.0"
+rquickjs = "0.15.0"
 rustix = "1.1.4"
 serde_json = "1.0.151"
 shadowsocks = { version = "1.25.0", default-features = false }
