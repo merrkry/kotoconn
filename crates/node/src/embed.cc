@@ -8,7 +8,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -23,8 +22,9 @@ typedef void (*kotoconn_node_exit)(int code, void* data);
 namespace {
 
 std::once_flag initialized;
-std::unique_ptr<node::MultiIsolatePlatform> platform;
-std::vector<std::string> initialization_errors;
+// Never freed: environments on other threads may still use it while the process exits.
+node::MultiIsolatePlatform* platform = nullptr;
+std::vector<std::string>* initialization_errors = nullptr;
 
 void Initialize() {
   // The embedder owns signals, stdio and NODE_OPTIONS.
@@ -36,17 +36,17 @@ void Initialize() {
                    node::ProcessInitializationFlags::kNoPrintHelpOrVersionOutput;
   auto result = node::InitializeOncePerProcess(
       {"kotoconn"}, static_cast<node::ProcessInitializationFlags::Flags>(flags));
-  initialization_errors = result->errors();
+  initialization_errors = new std::vector<std::string>(result->errors());
   if (result->early_return() != 0) {
-    if (initialization_errors.empty()) {
-      initialization_errors.push_back("Node.js initialization failed with exit code " +
+    if (initialization_errors->empty()) {
+      initialization_errors->push_back("Node.js initialization failed with exit code " +
                                       std::to_string(result->exit_code()));
     }
     return;
   }
 
-  platform = node::MultiIsolatePlatform::Create(4);
-  v8::V8::InitializePlatform(platform.get());
+  platform = node::MultiIsolatePlatform::Create(4).release();
+  v8::V8::InitializePlatform(platform);
   v8::V8::Initialize();
 }
 
@@ -65,7 +65,7 @@ extern "C" {
 // Reports each initialization error and returns false when initialization failed.
 EXPORT bool kotoconn_node_initialize(kotoconn_node_message on_error, void* data) {
   std::call_once(initialized, Initialize);
-  for (const auto& error : initialization_errors) on_error(error.c_str(), data);
+  for (const auto& error : *initialization_errors) on_error(error.c_str(), data);
   return platform != nullptr;
 }
 
@@ -101,7 +101,7 @@ EXPORT int kotoconn_node_run(const char* const* argv, size_t argc, const char* b
   auto flags = static_cast<node::EnvironmentFlags::Flags>(
       node::EnvironmentFlags::kNoCreateInspector | node::EnvironmentFlags::kNoGlobalSearchPaths |
       node::EnvironmentFlags::kTrackUnmanagedFds);
-  auto setup = node::CommonEnvironmentSetup::Create(platform.get(), &errors, args, exec_args, flags);
+  auto setup = node::CommonEnvironmentSetup::Create(platform, &errors, args, exec_args, flags);
   if (!setup) {
     for (const auto& error : errors) on_error(error.c_str(), data);
     return -1;
