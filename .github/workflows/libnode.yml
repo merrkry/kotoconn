@@ -93,8 +93,7 @@ jobs:
           tar -xJf "node-v$VERSION.tar.xz"
           docker run --rm -v "$PWD:/work" -w "/work/node-v$VERSION" \
             -e SONAME -e ASSET "$IMAGE" bash -euo pipefail -c '
-              export PATH="/opt/python/cp312-cp312/bin:$PATH"
-              ./configure --shared --without-npm --without-corepack
+              ./configure --shared --without-npm
               make -j"$(nproc)"
               built="$(find out/Release -name "$SONAME" -type f -print -quit)"
               test -n "$built" || { echo "configure did not build $SONAME"; exit 1; }
