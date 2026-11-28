@@ -20,12 +20,12 @@ services:
       - ${CASE_DIR}/gateway:/config:ro
     profiles: [nested]
   peer:
-    image: ghcr.io/sagernet/sing-box:v1.14.4@sha256:988b3b5369524452a1ff3ae7ee6d9c2afc675d2d820501d18d20b3ba230a11ad
+    image: ghcr.io/sagernet/sing-box:v1.14.6@sha256:faec54e198d2cc3717bf6c4fb6b8bc5cddfc3ef0c3495c0cdaf579fac2967c3d
     command: [run, -c, /config/peer.json]
     volumes:
       - ${CASE_DIR}:/config:ro
   entry:
-    image: ghcr.io/sagernet/sing-box:v1.14.4@sha256:988b3b5369524452a1ff3ae7ee6d9c2afc675d2d820501d18d20b3ba230a11ad
+    image: ghcr.io/sagernet/sing-box:v1.14.6@sha256:faec54e198d2cc3717bf6c4fb6b8bc5cddfc3ef0c3495c0cdaf579fac2967c3d
     command: [run, -c, /config/entry.json]
     volumes:
       - ${CASE_DIR}:/config:ro

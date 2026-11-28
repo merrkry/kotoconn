@@ -1,4 +1,4 @@
-FROM docker.io/library/debian:bookworm-slim@sha256:a3bba7dc7dbcc1f37c2856c51fc9a7fac96608f50cb87b1b4e4d8b8c85ae988e AS runtime
+FROM docker.io/library/debian:bookworm-slim@sha256:311f7a192fd9a92b165a86b32fa3aae9005b11849bfb1db2d4fd784559ee464f AS runtime
 
 # Rust compilation is a moon dependency. This image only packages its outputs.
 FROM runtime AS app
@@ -14,7 +14,7 @@ COPY target/anytls-interop/anytls-tests /usr/local/bin/anytls-tests
 COPY target/anytls-interop/anytls-go-peer /usr/local/bin/anytls-go-peer
 ENTRYPOINT ["anytls-tests"]
 
-FROM ghcr.io/astral-sh/uv:0.13.6 AS uv
+FROM ghcr.io/astral-sh/uv:0.13.10 AS uv
 
 FROM runtime AS test-runtime
 COPY --from=uv /uv /usr/local/bin/uv
