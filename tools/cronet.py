@@ -1,12 +1,9 @@
 """Fetch the checksummed SagerNet Cronet library. Never build Chromium."""
 
-import hashlib
 import os
-import shutil
-import ssl
-import tempfile
-import urllib.request
 from pathlib import Path
+
+import fetch
 
 ROOT = Path(__file__).resolve().parent.parent
 VERSION = "v150.0.7871.63-2"
@@ -44,11 +41,6 @@ ASSETS = {
 }
 
 
-def digest(path: Path) -> str:
-    with path.open("rb") as source:
-        return hashlib.file_digest(source, "sha256").hexdigest()
-
-
 def library(target: str) -> Path | None:
     if "-linux-" not in target:
         return None
@@ -57,40 +49,12 @@ def library(target: str) -> Path | None:
         raise ValueError(f"no pinned SagerNet Cronet shared library for {target}")
 
     asset, expected = ASSETS[architecture]
-    directory = ROOT / "target" / "cronet" / VERSION / target
-    directory.mkdir(parents=True, exist_ok=True)
-    destination = directory / "libcronet.so"
-    if destination.is_file() and digest(destination) == expected:
-        # Repair caches created with NamedTemporaryFile's owner-only mode.
-        destination.chmod(0o644)
-        return destination
-
     url = (
         "https://github.com/SagerNet/cronet-go/releases/download/"
         f"{VERSION}/libcronet-linux-{asset}.so"
     )
-    print(f"Fetching {url}", flush=True)
-    context = ssl.create_default_context()
-    # Managed Python uses /etc/ssl/cert.pem; Debian stores its bundle here.
-    bundle = Path("/etc/ssl/certs/ca-certificates.crt")
-    if ssl.get_default_verify_paths().cafile is None and bundle.is_file():
-        context.load_verify_locations(bundle)
-
-    # Unique staging files and atomic replacement permit concurrent invocations.
-    with tempfile.NamedTemporaryFile(dir=directory, delete=False) as output:
-        temporary = Path(output.name)
-        try:
-            with urllib.request.urlopen(url, timeout=60, context=context) as response:
-                shutil.copyfileobj(response, output)
-            output.close()
-            if digest(temporary) != expected:
-                raise ValueError(f"SHA-256 mismatch for {url}")
-            # Containers may load this file as a different UID without DAC_OVERRIDE.
-            temporary.chmod(0o644)
-            temporary.replace(destination)
-        finally:
-            temporary.unlink(missing_ok=True)
-    return destination
+    destination = ROOT / "target" / "cronet" / VERSION / target / "libcronet.so"
+    return fetch.pinned(url, expected, destination)
 
 
 def environment(target: str) -> dict[str, str]:

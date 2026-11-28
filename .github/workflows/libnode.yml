@@ -1,0 +1,145 @@
+name: libnode
+
+# Builds the shared Node.js library and the embedding shim that tools/libnode.py
+# pins, and publishes the missing ones as release assets. Published assets are
+# never replaced, so their pinned digests stay valid.
+on:
+  push:
+    paths:
+      - .github/workflows/libnode.yml
+      - crates/node/src/embed.cc
+      - tools/libnode.py
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+
+jobs:
+  release:
+    name: Prepare the release
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          version="$(python3 tools/libnode.py version)"
+          tag="libnode-v$version"
+          if ! gh release view "$tag" > /dev/null 2>&1; then
+            gh release create "$tag" --latest=false --target "$GITHUB_SHA" \
+              --title "libnode $version" \
+              --notes "Node.js $version shared library and kotoconn embedding shims for glibc 2.28, built by the libnode workflow."
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build for ${{ matrix.architecture }}
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x86_64
+            runner: ubuntu-24.04
+          - architecture: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.release.outputs.tag }}
+      # glibc 2.28, the baseline of tools/rust.py, with a current GCC.
+      IMAGE: quay.io/pypa/manylinux_2_28_${{ matrix.architecture }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Find missing assets
+        id: plan
+        run: |
+          {
+            echo "version=$(python3 tools/libnode.py version)"
+            echo "soname=$(python3 tools/libnode.py soname)"
+            mapfile -t assets < <(python3 tools/libnode.py assets "${{ matrix.architecture }}")
+            echo "libnode=${assets[0]}"
+            echo "shim=${assets[1]}"
+          } >> "$GITHUB_OUTPUT"
+          gh release view "$TAG" --json assets --jq '.assets[].name' > published
+      - name: Build libnode
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+          SONAME: ${{ steps.plan.outputs.soname }}
+          ASSET: ${{ steps.plan.outputs.libnode }}
+        run: |
+          mkdir -p out
+          if grep -qxF "$ASSET" published; then
+            gh release download "$TAG" --pattern "$ASSET" --dir out
+            exit 0
+          fi
+
+          curl -fsSLO "https://nodejs.org/dist/v$VERSION/node-v$VERSION.tar.xz"
+          curl -fsSL "https://nodejs.org/dist/v$VERSION/SHASUMS256.txt" \
+            | grep "  node-v$VERSION.tar.xz\$" | sha256sum --check
+          tar -xJf "node-v$VERSION.tar.xz"
+          docker run --rm -v "$PWD:/work" -w "/work/node-v$VERSION" \
+            -e SONAME -e ASSET "$IMAGE" bash -euo pipefail -c '
+              export PATH="/opt/python/cp312-cp312/bin:$PATH"
+              ./configure --shared --without-npm --without-corepack
+              make -j"$(nproc)"
+              built="$(find out/Release -name "$SONAME" -type f -print -quit)"
+              test -n "$built" || { echo "configure did not build $SONAME"; exit 1; }
+              strip --strip-unneeded "$built"
+              xz -T0 -c "$built" > "/work/out/$ASSET"
+            '
+          gh release upload "$TAG" "out/$ASSET"
+      - name: Build the shim
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+          SONAME: ${{ steps.plan.outputs.soname }}
+          LIBNODE: ${{ steps.plan.outputs.libnode }}
+          ASSET: ${{ steps.plan.outputs.shim }}
+        run: |
+          if grep -qxF "$ASSET" published; then
+            echo "$ASSET is already published"
+            exit 0
+          fi
+
+          curl -fsSLO "https://nodejs.org/dist/v$VERSION/node-v$VERSION-headers.tar.gz"
+          curl -fsSL "https://nodejs.org/dist/v$VERSION/SHASUMS256.txt" \
+            | grep "  node-v$VERSION-headers.tar.gz\$" | sha256sum --check
+          tar -xzf "node-v$VERSION-headers.tar.gz"
+          xz -dc "out/$LIBNODE" > "out/$SONAME"
+          docker run --rm -v "$PWD:/work" -w /work -e VERSION -e SONAME -e ASSET "$IMAGE" \
+            bash -euo pipefail -c '
+              g++ -std=c++20 -O2 -fPIC -shared -fvisibility=hidden -fvisibility-inlines-hidden -Wall -Wextra -Werror \
+                -isystem "node-v$VERSION/include/node" crates/node/src/embed.cc \
+                -Lout -l:"$SONAME" -Wl,-soname,libkotoconn_node.so -Wl,--no-undefined \
+                -o "out/$ASSET"
+              strip --strip-unneeded "out/$ASSET"
+            '
+          gh release upload "$TAG" "out/$ASSET"
+      - name: Report digests
+        env:
+          LIBNODE: ${{ steps.plan.outputs.libnode }}
+          SHIM: ${{ steps.plan.outputs.shim }}
+        run: |
+          if [ ! -f "out/$SHIM" ]; then
+            gh release download "$TAG" --pattern "$SHIM" --dir out
+          fi
+          {
+            echo "### ${{ matrix.architecture }}"
+            echo '```'
+            sha256sum "out/$LIBNODE" "out/$SHIM"
+            echo "shim source: $(python3 tools/libnode.py shim-id)"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
